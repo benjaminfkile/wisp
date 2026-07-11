@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/benjaminfkile/wisp/internal/contract"
@@ -45,6 +47,7 @@ func (b *broker) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /contracts", b.create)
 	mux.HandleFunc("GET /contracts/{id}", b.get)
 	mux.HandleFunc("DELETE /contracts/{id}", b.release)
+	mux.HandleFunc("POST /contracts/{id}/exec", b.exec)
 }
 
 // createRequest is the POST /contracts body (see docs/DESIGN.md §4).
@@ -224,6 +227,92 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, b.statusOf(c))
+}
+
+// execRequest is the POST /contracts/:id/exec body (see docs/DESIGN.md §5). The
+// command is run through a shell so clients can send compound commands like
+// "cd /repo && git diff"; per docs/DESIGN.md each exec is a fresh process with
+// no shared cwd/env between calls.
+type execRequest struct {
+	Command string `json:"command"`
+}
+
+// execResponse is the machine-readable outcome of a sync exec: fully buffered
+// stdout and stderr plus the process exit code (a non-zero exit code is a
+// successful HTTP response, not an error).
+type execResponse struct {
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	ExitCode int    `json:"exit_code"`
+}
+
+// exec handles POST /contracts/:id/exec: it runs {command} to completion inside
+// the contract's container via Runtime.ExecSync and returns stdout/stderr/exit.
+//
+// Each exec is a fresh process: Wisp runs the command with a new `/bin/sh -c`
+// invocation, so there is no shared cwd or environment between calls (see
+// docs/DESIGN.md §5, "Each exec is a fresh process"). Clients that need state to
+// persist across steps send a single compound command.
+//
+// The call requires the contract's bearer token (Authorization: Bearer <token>)
+// and rejects execs against a contract that is not ready (409), unknown (404),
+// or presented without a valid token (401).
+func (b *broker) exec(w http.ResponseWriter, r *http.Request) {
+	c, err := b.store.Get(r.PathValue("id"))
+	if errors.Is(err, contract.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "contract not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not read contract")
+		return
+	}
+
+	if !bearerMatches(r, c.Token) {
+		writeError(w, http.StatusUnauthorized, "missing or invalid bearer token")
+		return
+	}
+
+	if c.State != contract.StateReady {
+		writeError(w, http.StatusConflict, "contract not ready")
+		return
+	}
+
+	var req execRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Command == "" {
+		writeError(w, http.StatusBadRequest, "command must not be empty")
+		return
+	}
+
+	res, err := b.rt.ExecSync(r.Context(), c.ContainerID, []string{"/bin/sh", "-c", req.Command})
+	if err != nil {
+		b.logger.Error("exec in container", "contract_id", c.ID, "error", err)
+		writeError(w, http.StatusInternalServerError, "exec failed")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, execResponse{
+		Stdout:   res.Stdout,
+		Stderr:   res.Stderr,
+		ExitCode: res.ExitCode,
+	})
+}
+
+// bearerMatches reports whether the request carries an Authorization: Bearer
+// header whose token equals want. The comparison is constant-time to avoid
+// leaking the token through timing (see docs/DESIGN.md §8).
+func bearerMatches(r *http.Request, want string) bool {
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if len(h) <= len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
+		return false
+	}
+	got := h[len(prefix):]
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 // statusOf builds the status response for c, clamping time remaining at zero for

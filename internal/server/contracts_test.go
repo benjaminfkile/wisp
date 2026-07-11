@@ -36,6 +36,125 @@ func do(t *testing.T, h http.Handler, method, path, body string) *httptest.Respo
 	return rec
 }
 
+// doAuth performs an HTTP request with an Authorization: Bearer header.
+func doAuth(t *testing.T, h http.Handler, method, path, token, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, path, r)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// createContract creates a ready contract and returns its create response.
+func createContract(t *testing.T, h http.Handler, body string) createResponse {
+	t.Helper()
+	rec := do(t, h, http.MethodPost, "/contracts", body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var resp createResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	return resp
+}
+
+func TestExecReturnsResult(t *testing.T) {
+	h, store, fake := testServer(t)
+	fake.ExecHandler = func(id string, cmd []string) (runtime.ExecResult, error) {
+		return runtime.ExecResult{Stdout: "hello\n", Stderr: "warn\n", ExitCode: 3}, nil
+	}
+
+	created := createContract(t, h, `{"ttl_seconds":3600,"preset":"coding"}`)
+
+	rec := doAuth(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec",
+		created.Token, `{"command":"echo hello"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	var resp execResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Stdout != "hello\n" || resp.Stderr != "warn\n" || resp.ExitCode != 3 {
+		t.Errorf("exec response = %+v, want {hello warn 3}", resp)
+	}
+
+	// The command was run through a fresh shell against the contract's container.
+	c, _ := store.Get(created.ContractID)
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatalf("container not tracked")
+	}
+	last := fc.Execs[len(fc.Execs)-1]
+	if len(last) != 3 || last[0] != "/bin/sh" || last[1] != "-c" || last[2] != "echo hello" {
+		t.Errorf("exec cmd = %v, want [/bin/sh -c echo hello]", last)
+	}
+}
+
+func TestExecUnknownContract(t *testing.T) {
+	h, _, _ := testServer(t)
+	rec := doAuth(t, h, http.MethodPost, "/contracts/nope/exec", "anytoken", `{"command":"ls"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestExecMissingToken(t *testing.T) {
+	h, _, _ := testServer(t)
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	// No Authorization header at all.
+	rec := do(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec", `{"command":"ls"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("missing-token status = %d, want 401", rec.Code)
+	}
+}
+
+func TestExecBadToken(t *testing.T) {
+	h, _, _ := testServer(t)
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	rec := doAuth(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec",
+		created.Token+"garbage", `{"command":"ls"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("bad-token status = %d, want 401", rec.Code)
+	}
+}
+
+func TestExecNotReady(t *testing.T) {
+	h, store, _ := testServer(t)
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	// Release the contract so it is no longer ready.
+	if _, err := store.UpdateState(created.ContractID, contract.StateReleased); err != nil {
+		t.Fatalf("UpdateState: %v", err)
+	}
+
+	rec := doAuth(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec",
+		created.Token, `{"command":"ls"}`)
+	if rec.Code != http.StatusConflict {
+		t.Errorf("not-ready status = %d, want 409", rec.Code)
+	}
+}
+
+func TestExecEmptyCommand(t *testing.T) {
+	h, _, _ := testServer(t)
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	rec := doAuth(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec",
+		created.Token, `{"command":""}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("empty-command status = %d, want 400", rec.Code)
+	}
+}
+
 func TestCreateBootsAndReturns(t *testing.T) {
 	h, store, fake := testServer(t)
 

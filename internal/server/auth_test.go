@@ -10,7 +10,7 @@ import (
 
 	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/contract"
-	"github.com/benjaminfkile/wisp/internal/preset"
+	"github.com/benjaminfkile/wisp/internal/policy"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
@@ -19,12 +19,12 @@ func tokenServer(t *testing.T, appToken string) http.Handler {
 	t.Helper()
 	store := contract.NewStore()
 	fake := runtime.NewFake()
-	return New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, preset.Builtin(), bus.New(nil), appToken)
+	return New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, policy.Default(), bus.New(nil), appToken)
 }
 
 func TestCreateRequiresAppToken(t *testing.T) {
 	h := tokenServer(t, "app-secret")
-	body := `{"ttl_seconds":3600,"preset":"coding"}`
+	body := `{"ttl_seconds":3600}`
 
 	// No Authorization header at all.
 	if rec := do(t, h, http.MethodPost, "/contracts", body); rec.Code != http.StatusUnauthorized {
@@ -46,7 +46,7 @@ func TestCreateRequiresAppToken(t *testing.T) {
 // any credential (the localhost-friendly default, see docs/DESIGN.md §8).
 func TestCreateWithoutAppTokenIsOpen(t *testing.T) {
 	h := tokenServer(t, "")
-	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":3600,"preset":"coding"}`)
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":3600}`)
 	if rec.Code != http.StatusCreated {
 		t.Errorf("open create status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
 	}
@@ -59,7 +59,7 @@ func TestAppTokenAndContractTokenAreDistinct(t *testing.T) {
 	h := tokenServer(t, "app-secret")
 
 	rec := doAuth(t, h, http.MethodPost, "/contracts", "app-secret",
-		`{"ttl_seconds":3600,"preset":"coding"}`)
+		`{"ttl_seconds":3600}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
 	}

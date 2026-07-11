@@ -14,7 +14,7 @@ import (
 
 	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/contract"
-	"github.com/benjaminfkile/wisp/internal/preset"
+	"github.com/benjaminfkile/wisp/internal/policy"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
@@ -22,7 +22,7 @@ import (
 // to the contract that owns it (see runtime.CreateOptions.Labels).
 const contractLabel = "wisp.contract"
 
-// bytesPerMB converts a preset's MemoryMB (mebibytes) to the byte limit the
+// bytesPerMB converts a request's memory_mb (mebibytes) to the byte limit the
 // runtime expects.
 const bytesPerMB = 1024 * 1024
 
@@ -30,10 +30,10 @@ const bytesPerMB = 1024 * 1024
 // lifecycle of a contract: create + boot + run userdata on POST, report status
 // on GET, and release (kill + mark released) on DELETE.
 type broker struct {
-	store   *contract.Store
-	rt      runtime.Runtime
-	presets *preset.Set
-	logger  *slog.Logger
+	store  *contract.Store
+	rt     runtime.Runtime
+	pol    *policy.Config
+	logger *slog.Logger
 
 	// bus is the event bus Wisp publishes contract lifecycle events on and
 	// which the /events endpoints ingest into and subscribe from (see
@@ -48,17 +48,21 @@ type broker struct {
 	now func() time.Time
 }
 
-// newBroker constructs a broker over the given store, runtime, preset set, and
-// event bus. appToken gates contract creation and the bus; an empty value
+// newBroker constructs a broker over the given store, runtime, launch policy,
+// and event bus. appToken gates contract creation and the bus; an empty value
 // disables that gate.
-func newBroker(store *contract.Store, rt runtime.Runtime, presets *preset.Set, b *bus.Bus, logger *slog.Logger, appToken string) *broker {
-	return &broker{store: store, rt: rt, presets: presets, bus: b, logger: logger, appToken: appToken, now: time.Now}
+func newBroker(store *contract.Store, rt runtime.Runtime, pol *policy.Config, b *bus.Bus, logger *slog.Logger, appToken string) *broker {
+	return &broker{store: store, rt: rt, pol: pol, bus: b, logger: logger, appToken: appToken, now: time.Now}
 }
 
 // routes registers the contract lifecycle endpoints on mux. Creating a contract
 // is gated by the app-level token; the per-contract token gates /exec and
 // /shell inside their handlers (see docs/DESIGN.md §8).
 func (b *broker) routes(mux *http.ServeMux) {
+	// GET /images is a public discovery document (like /healthz): any consumer
+	// may learn the allow-list, default image, and limits without a token, so it
+	// is registered without the app-token gate (see docs/DESIGN.md §7, §8).
+	mux.HandleFunc("GET /images", b.images)
 	mux.HandleFunc("POST /contracts", b.requireAppToken(b.create))
 	mux.HandleFunc("GET /contracts/{id}", b.get)
 	mux.HandleFunc("DELETE /contracts/{id}", b.release)
@@ -84,11 +88,25 @@ func (b *broker) requireAppToken(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// createRequest is the POST /contracts body (see docs/DESIGN.md §4).
+// resourcesRequest is the optional per-request resource shaping. Each value is
+// clamped down to the operator's configured maximum when that maximum is set; a
+// zero value means "no request" (the runtime imposes no cap for that dimension).
+type resourcesRequest struct {
+	CPUs     float64 `json:"cpus"`
+	MemoryMB int     `json:"memory_mb"`
+	Pids     int     `json:"pids"`
+}
+
+// createRequest is the POST /contracts body (see docs/DESIGN.md §4, §7). The
+// client picks an allowed image and shapes the network / resources; userdata
+// owns the container's contents. There is no preset — wisp is domain-blind.
 type createRequest struct {
-	TTLSeconds int    `json:"ttl_seconds"`
-	Preset     string `json:"preset"`
-	Userdata   string `json:"userdata"`
+	TTLSeconds int              `json:"ttl_seconds"`
+	Image      string           `json:"image"`
+	Network    string           `json:"network"`
+	Resources  resourcesRequest `json:"resources"`
+	Userdata   string           `json:"userdata"`
+	Meta       map[string]any   `json:"meta"`
 }
 
 // createResponse is returned on a successful create.
@@ -100,14 +118,28 @@ type createResponse struct {
 
 // statusResponse is returned by GET /contracts/:id and DELETE /contracts/:id.
 type statusResponse struct {
-	ContractID          string `json:"contract_id"`
-	Status              string `json:"status"`
-	TTLSecondsRemaining int    `json:"ttl_seconds_remaining"`
+	ContractID          string         `json:"contract_id"`
+	Status              string         `json:"status"`
+	TTLSecondsRemaining int            `json:"ttl_seconds_remaining"`
+	Meta                map[string]any `json:"meta,omitempty"`
 }
 
-// create handles POST /contracts: it records a contract, boots a container from
-// the preset's base image, runs the userdata script, transitions
-// provisioning→ready, and returns the id, token, and final status.
+// launchSpec is the launch configuration resolved from a create request against
+// the operator policy: the image to boot, the clamped resources, and the network
+// the container runs on.
+type launchSpec struct {
+	image    string
+	cpus     float64
+	memoryMB int
+	pids     int
+	network  string
+}
+
+// create handles POST /contracts: it validates the requested image and network
+// against the operator policy, clamps the TTL and resources to the configured
+// limits, records a contract, boots a container from the resolved image, runs
+// the userdata script, transitions provisioning→ready, and returns the id,
+// token, and final status (see docs/DESIGN.md §4, §7).
 func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 	var req createRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -119,25 +151,43 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve the named preset. An empty name selects the bare default; an
-	// unknown name is a client error (400). The preset caps the contract: the
-	// base image and limits come from it and the requested TTL is clamped down
-	// to the preset's maximum (see docs/DESIGN.md §7).
-	name := req.Preset
-	if name == "" {
-		name = preset.DefaultName
+	// Resolve the image: an omitted image selects the policy default; any other
+	// image must be in the allow-list, else it is a client error (400).
+	image := req.Image
+	if image == "" {
+		image = b.pol.DefaultImage
 	}
-	p, err := b.presets.Lookup(name)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "unknown preset: "+name)
+	if !b.pol.AllowsImage(image) {
+		writeError(w, http.StatusBadRequest, "image not allowed: "+image)
 		return
 	}
 
-	ttl := p.ClampTTL(time.Duration(req.TTLSeconds) * time.Second)
+	// Resolve the network: an omitted network selects the policy default; any
+	// other network must be one the operator permits, else a client error (400).
+	network := req.Network
+	if network == "" {
+		network = b.pol.DefaultNetwork()
+	}
+	if !b.pol.AllowsNetwork(network) {
+		writeError(w, http.StatusBadRequest, "network not allowed: "+network)
+		return
+	}
+
+	// The policy caps the contract: the requested TTL and resources are clamped
+	// down to any configured maximum (see docs/DESIGN.md §7).
+	ttl := b.pol.ClampTTL(time.Duration(req.TTLSeconds) * time.Second)
+	spec := launchSpec{
+		image:    image,
+		cpus:     b.pol.ClampCPUs(req.Resources.CPUs),
+		memoryMB: b.pol.ClampMemoryMB(req.Resources.MemoryMB),
+		pids:     b.pol.ClampPids(req.Resources.Pids),
+		network:  network,
+	}
 
 	c, err := b.store.Create(contract.CreateParams{
-		TTL:    ttl,
-		Preset: p.Name,
+		TTL:   ttl,
+		Image: image,
+		Meta:  req.Meta,
 	})
 	if err != nil {
 		// The only error Create returns for a positive TTL is ErrInvalidTTL,
@@ -151,7 +201,7 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 	// satellite can start watching for its contract.ready (see docs/DESIGN.md §6).
 	b.publishLifecycle(eventContractCreated, c)
 
-	c, err = b.provision(r.Context(), c, p, req.Userdata)
+	c, err = b.provision(r.Context(), c, spec, req.Userdata)
 	if err != nil {
 		b.logger.Error("provision contract", "contract_id", c.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "provisioning failed")
@@ -165,22 +215,54 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// images handles GET /images: the unauthenticated discovery document any
+// consumer can read to learn what it may request (see docs/DESIGN.md §7).
+func (b *broker) images(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, imagesResponse{
+		Images:  b.pol.Allow,
+		Default: b.pol.DefaultImage,
+		Limits: limitsResponse{
+			MaxTTLSeconds: b.pol.Limits.MaxTTLSeconds,
+			MaxCPUs:       b.pol.Limits.MaxCPUs,
+			MaxMemoryMB:   b.pol.Limits.MaxMemoryMB,
+			PidsLimit:     b.pol.Limits.PidsLimit,
+			Networks:      b.pol.Limits.Networks,
+		},
+	})
+}
+
+// imagesResponse is the GET /images discovery document.
+type imagesResponse struct {
+	Images  []string       `json:"images"`
+	Default string         `json:"default"`
+	Limits  limitsResponse `json:"limits"`
+}
+
+// limitsResponse mirrors policy.Limits in the discovery document's JSON shape.
+type limitsResponse struct {
+	MaxTTLSeconds int      `json:"max_ttl_seconds"`
+	MaxCPUs       float64  `json:"max_cpus"`
+	MaxMemoryMB   int      `json:"max_memory_mb"`
+	PidsLimit     int      `json:"pids_limit"`
+	Networks      []string `json:"networks"`
+}
+
 // provision boots the container for c, runs its userdata, and drives the
 // contract from requested through provisioning to ready. On any failure it
 // destroys the container and marks the contract expired, returning the error.
-func (b *broker) provision(ctx context.Context, c contract.Contract, p preset.Preset, userdata string) (contract.Contract, error) {
+func (b *broker) provision(ctx context.Context, c contract.Contract, spec launchSpec, userdata string) (contract.Contract, error) {
 	if _, err := b.store.UpdateState(c.ID, contract.StateProvisioning); err != nil {
 		return c, err
 	}
 
-	// Pull the base image on demand so a contract is never blocked from using an
-	// allowed image just because it is not in `docker images` yet.
-	if err := b.rt.EnsureImage(ctx, p.Image); err != nil {
+	// Pull the resolved image on demand so a contract is never blocked from using
+	// an allowed image just because it is not in `docker images` yet.
+	if err := b.rt.EnsureImage(ctx, spec.image); err != nil {
 		b.fail(ctx, c.ID, "")
 		return c, err
 	}
 
-	cid, err := b.rt.Create(ctx, p.Image, createOptions(p, c.ID))
+	cid, err := b.rt.Create(ctx, spec.image, createOptions(spec, c.ID))
 	if err != nil {
 		b.fail(ctx, c.ID, "")
 		return c, err
@@ -475,6 +557,7 @@ func (b *broker) statusOf(c contract.Contract) statusResponse {
 		ContractID:          c.ID,
 		Status:              string(c.State),
 		TTLSecondsRemaining: remaining,
+		Meta:                c.Meta,
 	}
 }
 
@@ -487,25 +570,26 @@ func (b *broker) statusOf(c contract.Contract) statusResponse {
 // SIGTERM, so release / `docker stop` reaps the container promptly.
 var keepAliveCmd = []string{"tail", "-f", "/dev/null"}
 
-// createOptions translates a preset's launch configuration into the runtime's
+// createOptions translates a resolved launch spec into the runtime's
 // CreateOptions: the resource caps and network policy applied to the container,
 // plus the label correlating it back to its contract. It always sets the
 // keep-alive command so the container outlives its provisioning step.
-func createOptions(p preset.Preset, contractID string) runtime.CreateOptions {
+func createOptions(spec launchSpec, contractID string) runtime.CreateOptions {
 	opts := runtime.CreateOptions{
 		Labels: map[string]string{contractLabel: contractID},
 		// Run the keep-alive as the container's main process so it stays up for
 		// the whole contract; all real work happens via exec/shell (see keepAliveCmd).
 		Cmd: keepAliveCmd,
 		Resources: runtime.Resources{
-			NanoCPUs:    int64(p.CPUs * 1e9),
-			MemoryBytes: int64(p.MemoryMB) * bytesPerMB,
-			PidsLimit:   int64(p.PidsLimit),
+			NanoCPUs:    int64(spec.cpus * 1e9),
+			MemoryBytes: int64(spec.memoryMB) * bytesPerMB,
+			PidsLimit:   int64(spec.pids),
 		},
 	}
-	// Only NetworkNone maps to an explicit Docker network mode today; egress
-	// and open both boot on the runtime's default network (see preset docs).
-	if p.Network == preset.NetworkNone {
+	// Only "none" maps to an explicit Docker network mode today; "egress" and
+	// "open" both boot on the runtime's default network. Egress is not yet
+	// separately enforced (see policy.NetworkEgress).
+	if spec.network == policy.NetworkNone {
 		opts.NetworkMode = "none"
 	}
 	return opts

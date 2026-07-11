@@ -19,7 +19,7 @@ import (
 	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/config"
 	"github.com/benjaminfkile/wisp/internal/contract"
-	"github.com/benjaminfkile/wisp/internal/preset"
+	"github.com/benjaminfkile/wisp/internal/policy"
 	"github.com/benjaminfkile/wisp/internal/reaper"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 	"github.com/benjaminfkile/wisp/internal/server"
@@ -34,9 +34,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	presets, err := preset.Load(cfg.PresetsFile)
+	pol, err := policy.Load(cfg.ImageConfigFile)
 	if err != nil {
-		logger.Error("load presets", "error", err)
+		logger.Error("load policy config", "error", err)
 		os.Exit(1)
 	}
 
@@ -47,7 +47,7 @@ func main() {
 	}
 	defer func() { _ = rt.Close() }()
 
-	if err := run(logger, cfg, rt, presets); err != nil {
+	if err := run(logger, cfg, rt, pol); err != nil {
 		logger.Error("server exited", "error", err)
 		os.Exit(1)
 	}
@@ -55,7 +55,7 @@ func main() {
 
 // run starts the HTTP server and blocks until an interrupt triggers a graceful
 // shutdown.
-func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, presets *preset.Set) error {
+func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, pol *policy.Config) error {
 	store := contract.NewStore()
 
 	// The event bus is shared: the HTTP surface publishes contract.created /
@@ -65,7 +65,7 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, presets *pr
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           server.New(logger, store, rt, presets, eventBus, cfg.AppToken),
+		Handler:           server.New(logger, store, rt, pol, eventBus, cfg.AppToken),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

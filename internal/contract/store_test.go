@@ -2,6 +2,7 @@ package contract
 
 import (
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -10,7 +11,7 @@ import (
 func TestStoreCreateGet(t *testing.T) {
 	s := NewStore()
 
-	c, err := s.Create(CreateParams{TTL: time.Hour, Preset: "coding"})
+	c, err := s.Create(CreateParams{TTL: time.Hour, Image: "wisp-base"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -23,8 +24,8 @@ func TestStoreCreateGet(t *testing.T) {
 	if c.State != StateRequested {
 		t.Errorf("State = %q, want requested", c.State)
 	}
-	if c.Preset != "coding" {
-		t.Errorf("Preset = %q, want coding", c.Preset)
+	if c.Image != "wisp-base" {
+		t.Errorf("Image = %q, want wisp-base", c.Image)
 	}
 	if c.TTL != time.Hour {
 		t.Errorf("TTL = %v, want 1h", c.TTL)
@@ -37,7 +38,7 @@ func TestStoreCreateGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if got != c {
+	if !reflect.DeepEqual(got, c) {
 		t.Errorf("Get = %+v, want %+v", got, c)
 	}
 }

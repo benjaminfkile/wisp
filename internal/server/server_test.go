@@ -10,12 +10,12 @@ import (
 
 	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/contract"
-	"github.com/benjaminfkile/wisp/internal/preset"
+	"github.com/benjaminfkile/wisp/internal/policy"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
 func TestHealthz(t *testing.T) {
-	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), contract.NewStore(), runtime.NewFake(), preset.Builtin(), bus.New(nil), "")
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), contract.NewStore(), runtime.NewFake(), policy.Default(), bus.New(nil), "")
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -39,7 +39,7 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestHealthzRejectsPost(t *testing.T) {
-	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), contract.NewStore(), runtime.NewFake(), preset.Builtin(), bus.New(nil), "")
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), contract.NewStore(), runtime.NewFake(), policy.Default(), bus.New(nil), "")
 
 	req := httptest.NewRequest(http.MethodPost, "/healthz", nil)
 	rec := httptest.NewRecorder()

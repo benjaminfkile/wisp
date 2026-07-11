@@ -23,7 +23,7 @@ func testServer(t *testing.T) (http.Handler, *contract.Store, *runtime.Fake) {
 	t.Helper()
 	store := contract.NewStore()
 	fake := runtime.NewFake()
-	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, preset.Builtin())
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, preset.Builtin(), "")
 	return h, store, fake
 }
 
@@ -658,7 +658,7 @@ func TestCreateAppliesPresetImageAndLimits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("preset.Load: %v", err)
 	}
-	h = New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, presets)
+	h = New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, presets, "")
 
 	created := createContract(t, h, `{"ttl_seconds":600,"preset":"tiny"}`)
 	c, _ := store.Get(created.ContractID)

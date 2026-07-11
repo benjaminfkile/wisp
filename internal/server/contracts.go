@@ -34,22 +34,45 @@ type broker struct {
 	presets *preset.Set
 	logger  *slog.Logger
 
+	// appToken is the app-level bearer credential gating contract creation. An
+	// empty value disables the gate (see docs/DESIGN.md §8).
+	appToken string
+
 	// now is the clock used to compute time remaining; injectable for tests.
 	now func() time.Time
 }
 
 // newBroker constructs a broker over the given store, runtime, and preset set.
-func newBroker(store *contract.Store, rt runtime.Runtime, presets *preset.Set, logger *slog.Logger) *broker {
-	return &broker{store: store, rt: rt, presets: presets, logger: logger, now: time.Now}
+// appToken gates contract creation; an empty value disables that gate.
+func newBroker(store *contract.Store, rt runtime.Runtime, presets *preset.Set, logger *slog.Logger, appToken string) *broker {
+	return &broker{store: store, rt: rt, presets: presets, logger: logger, appToken: appToken, now: time.Now}
 }
 
-// routes registers the contract lifecycle endpoints on mux.
+// routes registers the contract lifecycle endpoints on mux. Creating a contract
+// is gated by the app-level token; the per-contract token gates /exec and
+// /shell inside their handlers (see docs/DESIGN.md §8).
 func (b *broker) routes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /contracts", b.create)
+	mux.HandleFunc("POST /contracts", b.requireAppToken(b.create))
 	mux.HandleFunc("GET /contracts/{id}", b.get)
 	mux.HandleFunc("DELETE /contracts/{id}", b.release)
 	mux.HandleFunc("POST /contracts/{id}/exec", b.exec)
 	mux.HandleFunc("GET /contracts/{id}/shell", b.shell)
+}
+
+// requireAppToken wraps next so it runs only when the request carries the
+// app-level bearer token (Authorization: Bearer <token>). When the configured
+// app token is empty the gate is disabled and every request passes through —
+// the localhost-friendly default (see docs/DESIGN.md §8). Otherwise a missing or
+// mismatched token is rejected with 401 before next runs. The comparison is
+// constant-time (see bearerMatches).
+func (b *broker) requireAppToken(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if b.appToken != "" && !bearerMatches(r, b.appToken) {
+			writeError(w, http.StatusUnauthorized, "missing or invalid app token")
+			return
+		}
+		next(w, r)
+	}
 }
 
 // createRequest is the POST /contracts body (see docs/DESIGN.md §4).

@@ -7,10 +7,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/benjaminfkile/wisp/internal/contract"
+	"github.com/benjaminfkile/wisp/internal/preset"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
@@ -20,7 +23,7 @@ func testServer(t *testing.T) (http.Handler, *contract.Store, *runtime.Fake) {
 	t.Helper()
 	store := contract.NewStore()
 	fake := runtime.NewFake()
-	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake)
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, preset.Builtin())
 	return h, store, fake
 }
 
@@ -412,8 +415,8 @@ func TestCreateBootsAndReturns(t *testing.T) {
 	if !fc.Started {
 		t.Error("container not started")
 	}
-	if fc.Image != defaultBaseImage {
-		t.Errorf("image = %q, want %q", fc.Image, defaultBaseImage)
+	if fc.Image != "wisp-base" {
+		t.Errorf("image = %q, want %q", fc.Image, "wisp-base")
 	}
 	if fc.Opts.Labels[contractLabel] != c.ID {
 		t.Errorf("label %s = %q, want %q", contractLabel, fc.Opts.Labels[contractLabel], c.ID)
@@ -581,6 +584,103 @@ func TestCreateRuntimeCreateError(t *testing.T) {
 	all := store.List()
 	if len(all) != 1 || all[0].State != contract.StateExpired {
 		t.Errorf("contract state = %v, want a single expired contract", all)
+	}
+}
+
+func TestCreateUnknownPreset(t *testing.T) {
+	h, store, _ := testServer(t)
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"preset":"nonexistent"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	// An unknown preset is rejected before any contract is recorded.
+	if n := len(store.List()); n != 0 {
+		t.Errorf("stored contracts = %d, want 0 after rejected preset", n)
+	}
+}
+
+func TestCreateEmptyPresetUsesDefault(t *testing.T) {
+	h, store, fake := testServer(t)
+	created := createContract(t, h, `{"ttl_seconds":60}`)
+
+	c, _ := store.Get(created.ContractID)
+	if c.Preset != preset.DefaultName {
+		t.Errorf("preset = %q, want %q", c.Preset, preset.DefaultName)
+	}
+	// The bare default has no network, mapping to Docker's "none" mode.
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	if fc.Opts.NetworkMode != "none" {
+		t.Errorf("network mode = %q, want none", fc.Opts.NetworkMode)
+	}
+}
+
+func TestCreateClampsTTLToPresetMax(t *testing.T) {
+	h, store, _ := testServer(t)
+	// The built-in "probe" preset caps TTL at 15 minutes; request an hour.
+	created := createContract(t, h, `{"ttl_seconds":3600,"preset":"probe"}`)
+
+	c, err := store.Get(created.ContractID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if want := 15 * time.Minute; c.TTL != want {
+		t.Errorf("clamped TTL = %v, want %v", c.TTL, want)
+	}
+	if got := c.ExpiresAt.Sub(c.CreatedAt); got != 15*time.Minute {
+		t.Errorf("lease window = %v, want 15m", got)
+	}
+}
+
+func TestCreateBelowPresetMaxKeepsRequestedTTL(t *testing.T) {
+	h, store, _ := testServer(t)
+	// 5 minutes is under the "probe" cap, so it survives unchanged.
+	created := createContract(t, h, `{"ttl_seconds":300,"preset":"probe"}`)
+	c, _ := store.Get(created.ContractID)
+	if want := 5 * time.Minute; c.TTL != want {
+		t.Errorf("TTL = %v, want %v", c.TTL, want)
+	}
+}
+
+func TestCreateAppliesPresetImageAndLimits(t *testing.T) {
+	h, store, fake := testServer(t)
+	// A file-backed preset lets us assert exact, distinctive limits reach the
+	// runtime rather than depending on a built-in's numbers.
+	dir := t.TempDir()
+	path := dir + "/presets.json"
+	if err := os.WriteFile(path, []byte(`{"presets":{"tiny":{
+		"image":"tiny-image","max_ttl_seconds":600,"cpus":0.5,"memory_mb":256,"pids":64,"network":"open"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	presets, err := preset.Load(path)
+	if err != nil {
+		t.Fatalf("preset.Load: %v", err)
+	}
+	h = New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, presets)
+
+	created := createContract(t, h, `{"ttl_seconds":600,"preset":"tiny"}`)
+	c, _ := store.Get(created.ContractID)
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	if fc.Image != "tiny-image" {
+		t.Errorf("image = %q, want tiny-image", fc.Image)
+	}
+	if want := int64(0.5 * 1e9); fc.Opts.Resources.NanoCPUs != want {
+		t.Errorf("NanoCPUs = %d, want %d", fc.Opts.Resources.NanoCPUs, want)
+	}
+	if want := int64(256 * 1024 * 1024); fc.Opts.Resources.MemoryBytes != want {
+		t.Errorf("MemoryBytes = %d, want %d", fc.Opts.Resources.MemoryBytes, want)
+	}
+	if fc.Opts.Resources.PidsLimit != 64 {
+		t.Errorf("PidsLimit = %d, want 64", fc.Opts.Resources.PidsLimit)
+	}
+	// An "open" network preset leaves NetworkMode empty (the runtime default).
+	if fc.Opts.NetworkMode != "" {
+		t.Errorf("network mode = %q, want empty for open", fc.Opts.NetworkMode)
 	}
 }
 

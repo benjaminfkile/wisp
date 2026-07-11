@@ -13,34 +13,34 @@ import (
 	"time"
 
 	"github.com/benjaminfkile/wisp/internal/contract"
+	"github.com/benjaminfkile/wisp/internal/preset"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
-
-// defaultBaseImage is the bare base image booted when a preset does not resolve
-// to a more specific image. Permission presets (a later task, see
-// docs/DESIGN.md §7) will map preset names to images and resource limits; until
-// then every contract boots from this single bare base.
-const defaultBaseImage = "wisp-base"
 
 // contractLabel is the container label Wisp uses to correlate a container back
 // to the contract that owns it (see runtime.CreateOptions.Labels).
 const contractLabel = "wisp.contract"
 
+// bytesPerMB converts a preset's MemoryMB (mebibytes) to the byte limit the
+// runtime expects.
+const bytesPerMB = 1024 * 1024
+
 // broker wires the contract model to the Runtime over HTTP. It owns the
 // lifecycle of a contract: create + boot + run userdata on POST, report status
 // on GET, and release (kill + mark released) on DELETE.
 type broker struct {
-	store  *contract.Store
-	rt     runtime.Runtime
-	logger *slog.Logger
+	store   *contract.Store
+	rt      runtime.Runtime
+	presets *preset.Set
+	logger  *slog.Logger
 
 	// now is the clock used to compute time remaining; injectable for tests.
 	now func() time.Time
 }
 
-// newBroker constructs a broker over the given store and runtime.
-func newBroker(store *contract.Store, rt runtime.Runtime, logger *slog.Logger) *broker {
-	return &broker{store: store, rt: rt, logger: logger, now: time.Now}
+// newBroker constructs a broker over the given store, runtime, and preset set.
+func newBroker(store *contract.Store, rt runtime.Runtime, presets *preset.Set, logger *slog.Logger) *broker {
+	return &broker{store: store, rt: rt, presets: presets, logger: logger, now: time.Now}
 }
 
 // routes registers the contract lifecycle endpoints on mux.
@@ -87,9 +87,25 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the named preset. An empty name selects the bare default; an
+	// unknown name is a client error (400). The preset caps the contract: the
+	// base image and limits come from it and the requested TTL is clamped down
+	// to the preset's maximum (see docs/DESIGN.md §7).
+	name := req.Preset
+	if name == "" {
+		name = preset.DefaultName
+	}
+	p, err := b.presets.Lookup(name)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "unknown preset: "+name)
+		return
+	}
+
+	ttl := p.ClampTTL(time.Duration(req.TTLSeconds) * time.Second)
+
 	c, err := b.store.Create(contract.CreateParams{
-		TTL:    time.Duration(req.TTLSeconds) * time.Second,
-		Preset: req.Preset,
+		TTL:    ttl,
+		Preset: p.Name,
 	})
 	if err != nil {
 		// The only error Create returns for a positive TTL is ErrInvalidTTL,
@@ -99,7 +115,7 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err = b.provision(r.Context(), c, req.Userdata)
+	c, err = b.provision(r.Context(), c, p, req.Userdata)
 	if err != nil {
 		b.logger.Error("provision contract", "contract_id", c.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "provisioning failed")
@@ -116,15 +132,12 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 // provision boots the container for c, runs its userdata, and drives the
 // contract from requested through provisioning to ready. On any failure it
 // destroys the container and marks the contract expired, returning the error.
-func (b *broker) provision(ctx context.Context, c contract.Contract, userdata string) (contract.Contract, error) {
+func (b *broker) provision(ctx context.Context, c contract.Contract, p preset.Preset, userdata string) (contract.Contract, error) {
 	if _, err := b.store.UpdateState(c.ID, contract.StateProvisioning); err != nil {
 		return c, err
 	}
 
-	image := b.imageFor(c.Preset)
-	cid, err := b.rt.Create(ctx, image, runtime.CreateOptions{
-		Labels: map[string]string{contractLabel: c.ID},
-	})
+	cid, err := b.rt.Create(ctx, p.Image, createOptions(p, c.ID))
 	if err != nil {
 		b.fail(ctx, c.ID, "")
 		return c, err
@@ -416,8 +429,22 @@ func (b *broker) statusOf(c contract.Contract) statusResponse {
 	}
 }
 
-// imageFor resolves a preset name to its base image. Until presets land (a
-// later task) every preset resolves to the bare default base image.
-func (b *broker) imageFor(preset string) string {
-	return defaultBaseImage
+// createOptions translates a preset's launch configuration into the runtime's
+// CreateOptions: the resource caps and network policy applied to the container,
+// plus the label correlating it back to its contract.
+func createOptions(p preset.Preset, contractID string) runtime.CreateOptions {
+	opts := runtime.CreateOptions{
+		Labels: map[string]string{contractLabel: contractID},
+		Resources: runtime.Resources{
+			NanoCPUs:    int64(p.CPUs * 1e9),
+			MemoryBytes: int64(p.MemoryMB) * bytesPerMB,
+			PidsLimit:   int64(p.PidsLimit),
+		},
+	}
+	// Only NetworkNone maps to an explicit Docker network mode today; egress
+	// and open both boot on the runtime's default network (see preset docs).
+	if p.Network == preset.NetworkNone {
+		opts.NetworkMode = "none"
+	}
+	return opts
 }

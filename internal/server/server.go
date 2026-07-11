@@ -11,19 +11,22 @@ import (
 	"time"
 
 	"github.com/benjaminfkile/wisp/internal/contract"
+	"github.com/benjaminfkile/wisp/internal/preset"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
 // New builds the root http.Handler for the daemon, registering all routes. The
 // contract lifecycle endpoints are wired to store and rt; rt is the container
-// backend (the real Docker runtime in production, the fake in tests).
+// backend (the real Docker runtime in production, the fake in tests). presets is
+// the set of named launch configurations contracts reference by name (see
+// docs/DESIGN.md §7).
 //
 // The returned handler is stdlib-only (net/http ServeMux); richer routing can
 // be layered in later tasks.
-func New(logger *slog.Logger, store *contract.Store, rt runtime.Runtime) http.Handler {
+func New(logger *slog.Logger, store *contract.Store, rt runtime.Runtime, presets *preset.Set) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
-	newBroker(store, rt, logger).routes(mux)
+	newBroker(store, rt, presets, logger).routes(mux)
 	return requestLogger(logger, mux)
 }
 

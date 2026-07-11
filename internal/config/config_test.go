@@ -18,6 +18,26 @@ func TestLoadDefault(t *testing.T) {
 	}
 }
 
+func TestLoadPresetsFile(t *testing.T) {
+	t.Setenv("WISP_PRESETS_FILE", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.PresetsFile != "" {
+		t.Errorf("PresetsFile = %q, want empty by default", cfg.PresetsFile)
+	}
+
+	t.Setenv("WISP_PRESETS_FILE", "/etc/wisp/presets.json")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.PresetsFile != "/etc/wisp/presets.json" {
+		t.Errorf("PresetsFile = %q, want the env value", cfg.PresetsFile)
+	}
+}
+
 func TestLoadAddrOverride(t *testing.T) {
 	t.Setenv("WISP_ADDR", "0.0.0.0:9000")
 	t.Setenv("WISP_PORT", "1234")

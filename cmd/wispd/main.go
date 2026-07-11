@@ -18,6 +18,7 @@ import (
 
 	"github.com/benjaminfkile/wisp/internal/config"
 	"github.com/benjaminfkile/wisp/internal/contract"
+	"github.com/benjaminfkile/wisp/internal/preset"
 	"github.com/benjaminfkile/wisp/internal/reaper"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 	"github.com/benjaminfkile/wisp/internal/server"
@@ -32,6 +33,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	presets, err := preset.Load(cfg.PresetsFile)
+	if err != nil {
+		logger.Error("load presets", "error", err)
+		os.Exit(1)
+	}
+
 	rt, err := runtime.NewDockerRuntime()
 	if err != nil {
 		logger.Error("init docker runtime", "error", err)
@@ -39,7 +46,7 @@ func main() {
 	}
 	defer func() { _ = rt.Close() }()
 
-	if err := run(logger, cfg, rt); err != nil {
+	if err := run(logger, cfg, rt, presets); err != nil {
 		logger.Error("server exited", "error", err)
 		os.Exit(1)
 	}
@@ -47,11 +54,11 @@ func main() {
 
 // run starts the HTTP server and blocks until an interrupt triggers a graceful
 // shutdown.
-func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime) error {
+func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, presets *preset.Set) error {
 	store := contract.NewStore()
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           server.New(logger, store, rt),
+		Handler:           server.New(logger, store, rt, presets),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

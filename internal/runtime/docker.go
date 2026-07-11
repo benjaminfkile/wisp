@@ -49,7 +49,18 @@ func (d *DockerRuntime) Create(ctx context.Context, image string, opts CreateOpt
 		WorkingDir: opts.WorkingDir,
 		Labels:     opts.Labels,
 	}
-	resp, err := d.cli.ContainerCreate(ctx, cfg, &container.HostConfig{}, nil, nil, "")
+	host := &container.HostConfig{
+		NetworkMode: container.NetworkMode(opts.NetworkMode),
+		Resources: container.Resources{
+			NanoCPUs: opts.Resources.NanoCPUs,
+			Memory:   opts.Resources.MemoryBytes,
+		},
+	}
+	if opts.Resources.PidsLimit > 0 {
+		pids := opts.Resources.PidsLimit
+		host.Resources.PidsLimit = &pids
+	}
+	resp, err := d.cli.ContainerCreate(ctx, cfg, host, nil, nil, "")
 	if err != nil {
 		return "", fmt.Errorf("runtime: create container: %w", err)
 	}

@@ -43,6 +43,27 @@ type CreateOptions struct {
 	// Labels are opaque key/value tags attached to the container. Wisp uses
 	// these to correlate containers back to contracts on reconciliation.
 	Labels map[string]string
+
+	// Resources caps the container's CPU, memory, and process count. The zero
+	// value imposes no limits.
+	Resources Resources
+
+	// NetworkMode selects the container's network. Empty uses the runtime's
+	// default network; "none" disconnects the container from all networks.
+	NetworkMode string
+}
+
+// Resources caps a container's resource usage. A zero field means "no limit"
+// for that dimension.
+type Resources struct {
+	// NanoCPUs limits CPU in units of 1e-9 CPUs (e.g. 1.5 cores = 1_500_000_000).
+	NanoCPUs int64
+
+	// MemoryBytes is the hard memory limit in bytes.
+	MemoryBytes int64
+
+	// PidsLimit is the maximum number of processes allowed in the container.
+	PidsLimit int64
 }
 
 // ExecResult is the outcome of a synchronous exec: fully buffered stdout and

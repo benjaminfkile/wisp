@@ -34,6 +34,13 @@ type Config struct {
 	// PresetsFile is an optional path to a JSON presets config file overlaid on
 	// the built-in presets (see docs/DESIGN.md §7). Empty means built-ins only.
 	PresetsFile string
+
+	// AppToken is the app-level bearer credential gating contract creation (and
+	// the event bus). When empty, the app-level gate is disabled: any caller may
+	// create contracts — the localhost-friendly default, since the OS user
+	// boundary is the outer defense (see docs/DESIGN.md §8). Set it to require an
+	// Authorization: Bearer <token> on POST /contracts.
+	AppToken string
 }
 
 // Load reads configuration from the process environment, applying defaults.
@@ -45,12 +52,14 @@ type Config struct {
 //	WISP_REAP_INTERVAL_SECONDS reaper scan interval in seconds (positive integer).
 //	WISP_EXPIRING_LEAD_SECONDS expiring-warning lead time in seconds (positive integer).
 //	WISP_PRESETS_FILE          path to a JSON presets config file (optional).
+//	WISP_APP_TOKEN             app-level bearer token gating contract creation (optional).
 func Load() (Config, error) {
 	cfg := Config{
 		Addr:         defaultAddr,
 		ReapInterval: defaultReapInterval,
 		ExpiringLead: defaultExpiringLead,
 		PresetsFile:  os.Getenv("WISP_PRESETS_FILE"),
+		AppToken:     os.Getenv("WISP_APP_TOKEN"),
 	}
 
 	switch {

@@ -58,7 +58,7 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, presets *pr
 	store := contract.NewStore()
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           server.New(logger, store, rt, presets),
+		Handler:           server.New(logger, store, rt, presets, cfg.AppToken),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

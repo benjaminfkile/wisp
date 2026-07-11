@@ -14,7 +14,7 @@ import (
 )
 
 func TestHealthz(t *testing.T) {
-	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), contract.NewStore(), runtime.NewFake(), preset.Builtin())
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), contract.NewStore(), runtime.NewFake(), preset.Builtin(), "")
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -38,7 +38,7 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestHealthzRejectsPost(t *testing.T) {
-	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), contract.NewStore(), runtime.NewFake(), preset.Builtin())
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), contract.NewStore(), runtime.NewFake(), preset.Builtin(), "")
 
 	req := httptest.NewRequest(http.MethodPost, "/healthz", nil)
 	rec := httptest.NewRecorder()

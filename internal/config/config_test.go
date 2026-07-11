@@ -38,6 +38,26 @@ func TestLoadPresetsFile(t *testing.T) {
 	}
 }
 
+func TestLoadAppToken(t *testing.T) {
+	t.Setenv("WISP_APP_TOKEN", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AppToken != "" {
+		t.Errorf("AppToken = %q, want empty by default", cfg.AppToken)
+	}
+
+	t.Setenv("WISP_APP_TOKEN", "s3cret")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AppToken != "s3cret" {
+		t.Errorf("AppToken = %q, want the env value", cfg.AppToken)
+	}
+}
+
 func TestLoadAddrOverride(t *testing.T) {
 	t.Setenv("WISP_ADDR", "0.0.0.0:9000")
 	t.Setenv("WISP_PORT", "1234")

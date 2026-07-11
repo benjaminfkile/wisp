@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/contract"
 	"github.com/benjaminfkile/wisp/internal/preset"
 	"github.com/benjaminfkile/wisp/internal/runtime"
@@ -34,18 +35,24 @@ type broker struct {
 	presets *preset.Set
 	logger  *slog.Logger
 
-	// appToken is the app-level bearer credential gating contract creation. An
-	// empty value disables the gate (see docs/DESIGN.md §8).
+	// bus is the event bus Wisp publishes contract lifecycle events on and
+	// which the /events endpoints ingest into and subscribe from (see
+	// docs/DESIGN.md §6).
+	bus *bus.Bus
+
+	// appToken is the app-level bearer credential gating contract creation and
+	// the event bus. An empty value disables the gate (see docs/DESIGN.md §8).
 	appToken string
 
 	// now is the clock used to compute time remaining; injectable for tests.
 	now func() time.Time
 }
 
-// newBroker constructs a broker over the given store, runtime, and preset set.
-// appToken gates contract creation; an empty value disables that gate.
-func newBroker(store *contract.Store, rt runtime.Runtime, presets *preset.Set, logger *slog.Logger, appToken string) *broker {
-	return &broker{store: store, rt: rt, presets: presets, logger: logger, appToken: appToken, now: time.Now}
+// newBroker constructs a broker over the given store, runtime, preset set, and
+// event bus. appToken gates contract creation and the bus; an empty value
+// disables that gate.
+func newBroker(store *contract.Store, rt runtime.Runtime, presets *preset.Set, b *bus.Bus, logger *slog.Logger, appToken string) *broker {
+	return &broker{store: store, rt: rt, presets: presets, bus: b, logger: logger, appToken: appToken, now: time.Now}
 }
 
 // routes registers the contract lifecycle endpoints on mux. Creating a contract
@@ -57,6 +64,8 @@ func (b *broker) routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /contracts/{id}", b.release)
 	mux.HandleFunc("POST /contracts/{id}/exec", b.exec)
 	mux.HandleFunc("GET /contracts/{id}/shell", b.shell)
+	mux.HandleFunc("POST /events", b.requireAppToken(b.publishEvent))
+	mux.HandleFunc("GET /events", b.subscribeEvents)
 }
 
 // requireAppToken wraps next so it runs only when the request carries the
@@ -138,6 +147,10 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// contract.created announces the new lease before provisioning begins, so a
+	// satellite can start watching for its contract.ready (see docs/DESIGN.md §6).
+	b.publishLifecycle(eventContractCreated, c)
+
 	c, err = b.provision(r.Context(), c, p, req.Userdata)
 	if err != nil {
 		b.logger.Error("provision contract", "contract_id", c.ID, "error", err)
@@ -191,6 +204,9 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, p preset.Pr
 		b.fail(ctx, c.ID, cid)
 		return c, err
 	}
+	// contract.ready tells clients the container is provisioned and they may
+	// exec / open shells freely (see docs/DESIGN.md §4, §6).
+	b.publishLifecycle(eventContractReady, c)
 	return c, nil
 }
 
@@ -264,6 +280,9 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not release contract")
 		return
 	}
+	// contract.released announces the client-initiated teardown (see
+	// docs/DESIGN.md §6). The reaper announces contract.expiring / contract.expired.
+	b.publishLifecycle(eventContractReleased, c)
 	writeJSON(w, http.StatusOK, b.statusOf(c))
 }
 

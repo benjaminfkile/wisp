@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/benjaminfkile/wisp/internal/config"
+	"github.com/benjaminfkile/wisp/internal/contract"
+	"github.com/benjaminfkile/wisp/internal/runtime"
 	"github.com/benjaminfkile/wisp/internal/server"
 )
 
@@ -29,7 +31,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(logger, cfg); err != nil {
+	rt, err := runtime.NewDockerRuntime()
+	if err != nil {
+		logger.Error("init docker runtime", "error", err)
+		os.Exit(1)
+	}
+	defer func() { _ = rt.Close() }()
+
+	if err := run(logger, cfg, rt); err != nil {
 		logger.Error("server exited", "error", err)
 		os.Exit(1)
 	}
@@ -37,10 +46,11 @@ func main() {
 
 // run starts the HTTP server and blocks until an interrupt triggers a graceful
 // shutdown.
-func run(logger *slog.Logger, cfg config.Config) error {
+func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime) error {
+	store := contract.NewStore()
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           server.New(logger),
+		Handler:           server.New(logger, store, rt),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

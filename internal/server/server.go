@@ -52,6 +52,15 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// Flush forwards to the wrapped ResponseWriter's Flush so streaming handlers
+// (the streaming exec endpoint) can push output to the client through the
+// logging middleware. If the underlying writer is not a Flusher this is a no-op.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // requestLogger emits one structured log line per request.
 func requestLogger(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

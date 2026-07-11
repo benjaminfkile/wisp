@@ -74,6 +74,112 @@ func TestFakeCreateStartExecKill(t *testing.T) {
 	}
 }
 
+func TestFakeExecStreamEmitsChunks(t *testing.T) {
+	ctx := context.Background()
+	f := NewFake()
+	f.StreamHandler = func(id string, cmd []string, emit func(ExecChunk) error) (int, error) {
+		if err := emit(ExecChunk{Stream: StreamStdout, Data: []byte("one\n")}); err != nil {
+			return 0, err
+		}
+		if err := emit(ExecChunk{Stream: StreamStderr, Data: []byte("warn\n")}); err != nil {
+			return 0, err
+		}
+		if err := emit(ExecChunk{Stream: StreamStdout, Data: []byte("two\n")}); err != nil {
+			return 0, err
+		}
+		return 7, nil
+	}
+	id, _ := f.Create(ctx, "img", CreateOptions{})
+	if err := f.Start(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []ExecChunk
+	code, err := f.ExecStream(ctx, id, []string{"/bin/sh", "-c", "run"}, func(c ExecChunk) error {
+		// Copy the data: the chunk's bytes are owned by the receiver.
+		got = append(got, ExecChunk{Stream: c.Stream, Data: append([]byte(nil), c.Data...)})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ExecStream: %v", err)
+	}
+	if code != 7 {
+		t.Errorf("exit code = %d, want 7", code)
+	}
+	want := []ExecChunk{
+		{Stream: StreamStdout, Data: []byte("one\n")},
+		{Stream: StreamStderr, Data: []byte("warn\n")},
+		{Stream: StreamStdout, Data: []byte("two\n")},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("chunks = %v, want %v", got, want)
+	}
+
+	// The streamed command was recorded like any other exec.
+	c, _ := f.Container(id)
+	if !reflect.DeepEqual(c.Execs, [][]string{{"/bin/sh", "-c", "run"}}) {
+		t.Errorf("recorded execs = %v", c.Execs)
+	}
+}
+
+func TestFakeExecStreamEmitErrorStops(t *testing.T) {
+	ctx := context.Background()
+	sentinel := errors.New("client gone")
+	f := NewFake()
+	emitted := 0
+	f.StreamHandler = func(id string, cmd []string, emit func(ExecChunk) error) (int, error) {
+		for i := 0; i < 5; i++ {
+			if err := emit(ExecChunk{Stream: StreamStdout, Data: []byte("x")}); err != nil {
+				return 0, err
+			}
+		}
+		return 0, nil
+	}
+	id, _ := f.Create(ctx, "img", CreateOptions{})
+	_ = f.Start(ctx, id)
+
+	_, err := f.ExecStream(ctx, id, []string{"run"}, func(c ExecChunk) error {
+		emitted++
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Errorf("ExecStream err = %v, want sentinel", err)
+	}
+	if emitted != 1 {
+		t.Errorf("emit called %d times, want 1 (stop on first error)", emitted)
+	}
+}
+
+func TestFakeExecStreamNilHandler(t *testing.T) {
+	ctx := context.Background()
+	f := NewFake()
+	id, _ := f.Create(ctx, "img", CreateOptions{})
+	_ = f.Start(ctx, id)
+	code, err := f.ExecStream(ctx, id, []string{"true"}, func(ExecChunk) error {
+		t.Fatal("emit called with nil handler")
+		return nil
+	})
+	if err != nil || code != 0 {
+		t.Errorf("ExecStream = (%d, %v), want (0, nil)", code, err)
+	}
+}
+
+func TestFakeExecStreamNotRunning(t *testing.T) {
+	ctx := context.Background()
+	f := NewFake()
+
+	// Unknown container.
+	if _, err := f.ExecStream(ctx, "nope", []string{"x"}, func(ExecChunk) error { return nil }); !errors.Is(err, ErrNotFound) {
+		t.Errorf("ExecStream unknown err = %v, want ErrNotFound", err)
+	}
+
+	// Created but not started.
+	id, _ := f.Create(ctx, "img", CreateOptions{})
+	if _, err := f.ExecStream(ctx, id, []string{"x"}, func(ExecChunk) error { return nil }); !errors.Is(err, ErrNotRunning) {
+		t.Errorf("ExecStream before Start err = %v, want ErrNotRunning", err)
+	}
+}
+
 func TestFakeExecHandlerExitCodeAndStderr(t *testing.T) {
 	ctx := context.Background()
 	f := NewFake()

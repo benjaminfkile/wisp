@@ -108,3 +108,65 @@ func (d *DockerRuntime) ExecSync(ctx context.Context, id string, cmd []string) (
 		ExitCode: inspect.ExitCode,
 	}, nil
 }
+
+// ExecStream implements Runtime. Like ExecSync it creates and attaches to an
+// exec, but instead of buffering it demultiplexes the Docker stream into
+// stdout/stderr chunks and forwards each to emit as it arrives, so the caller
+// sees output live. It returns the exec's exit code once the command completes.
+func (d *DockerRuntime) ExecStream(ctx context.Context, id string, cmd []string, emit func(ExecChunk) error) (int, error) {
+	execID, err := d.cli.ContainerExecCreate(ctx, id, types.ExecConfig{
+		Cmd:          cmd,
+		AttachStdout: true,
+		AttachStderr: true,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("runtime: exec create on %s: %w", id, err)
+	}
+
+	attach, err := d.cli.ContainerExecAttach(ctx, execID.ID, types.ExecStartCheck{})
+	if err != nil {
+		return 0, fmt.Errorf("runtime: exec attach on %s: %w", id, err)
+	}
+	defer attach.Close()
+
+	stdout := &chunkWriter{stream: StreamStdout, emit: emit}
+	stderr := &chunkWriter{stream: StreamStderr, emit: emit}
+	// Docker multiplexes stdout and stderr onto one stream; stdcopy splits it,
+	// writing each frame's payload to the matching writer as it is read. The
+	// chunkWriters turn those writes into emitted chunks.
+	if _, err := stdcopy.StdCopy(stdout, stderr, attach.Reader); err != nil {
+		return 0, fmt.Errorf("runtime: exec read on %s: %w", id, err)
+	}
+	if stdout.err != nil {
+		return 0, stdout.err
+	}
+	if stderr.err != nil {
+		return 0, stderr.err
+	}
+
+	inspect, err := d.cli.ContainerExecInspect(ctx, execID.ID)
+	if err != nil {
+		return 0, fmt.Errorf("runtime: exec inspect on %s: %w", id, err)
+	}
+	return inspect.ExitCode, nil
+}
+
+// chunkWriter is an io.Writer that turns each Write into an emitted ExecChunk.
+// stdcopy reuses its read buffer across frames, so each Write copies its bytes
+// before handing them off. The first emit error is captured in err and returned
+// to stdcopy to halt the copy.
+type chunkWriter struct {
+	stream string
+	emit   func(ExecChunk) error
+	err    error
+}
+
+func (w *chunkWriter) Write(p []byte) (int, error) {
+	buf := make([]byte, len(p))
+	copy(buf, p)
+	if err := w.emit(ExecChunk{Stream: w.stream, Data: buf}); err != nil {
+		w.err = err
+		return 0, err
+	}
+	return len(p), nil
+}

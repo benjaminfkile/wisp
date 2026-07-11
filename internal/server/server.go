@@ -6,15 +6,21 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/benjaminfkile/wisp/internal/contract"
+	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
-// New builds the root http.Handler for the daemon, registering all routes.
+// New builds the root http.Handler for the daemon, registering all routes. The
+// contract lifecycle endpoints are wired to store and rt; rt is the container
+// backend (the real Docker runtime in production, the fake in tests).
 //
-// The returned handler is stdlib-only (net/http ServeMux) so the scaffold has
-// no third-party dependencies; richer routing can be layered in later tasks.
-func New(logger *slog.Logger) http.Handler {
+// The returned handler is stdlib-only (net/http ServeMux); richer routing can
+// be layered in later tasks.
+func New(logger *slog.Logger, store *contract.Store, rt runtime.Runtime) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
+	newBroker(store, rt, logger).routes(mux)
 	return requestLogger(logger, mux)
 }
 
@@ -28,6 +34,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeError writes a JSON error body {"error": msg} with the given status.
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
 }
 
 // statusRecorder captures the response status for logging.

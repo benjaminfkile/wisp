@@ -176,7 +176,7 @@ func TestLifecycleEventsEmitted(t *testing.T) {
 	conn := dialEvents(t, srv, "")
 	defer conn.Close()
 
-	created := createContract(t, h, `{"ttl_seconds":3600,"preset":"coding"}`)
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
 
 	if got := readEvent(t, conn); got.Type != eventContractCreated {
 		t.Fatalf("first event = %q, want %q", got.Type, eventContractCreated)

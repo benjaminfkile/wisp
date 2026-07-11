@@ -18,23 +18,23 @@ func TestLoadDefault(t *testing.T) {
 	}
 }
 
-func TestLoadPresetsFile(t *testing.T) {
-	t.Setenv("WISP_PRESETS_FILE", "")
+func TestLoadImageConfigFile(t *testing.T) {
+	t.Setenv("WISP_CONFIG", "")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.PresetsFile != "" {
-		t.Errorf("PresetsFile = %q, want empty by default", cfg.PresetsFile)
+	if cfg.ImageConfigFile != "" {
+		t.Errorf("ImageConfigFile = %q, want empty by default", cfg.ImageConfigFile)
 	}
 
-	t.Setenv("WISP_PRESETS_FILE", "/etc/wisp/presets.json")
+	t.Setenv("WISP_CONFIG", "/etc/wisp/config.json")
 	cfg, err = Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.PresetsFile != "/etc/wisp/presets.json" {
-		t.Errorf("PresetsFile = %q, want the env value", cfg.PresetsFile)
+	if cfg.ImageConfigFile != "/etc/wisp/config.json" {
+		t.Errorf("ImageConfigFile = %q, want the env value", cfg.ImageConfigFile)
 	}
 }
 

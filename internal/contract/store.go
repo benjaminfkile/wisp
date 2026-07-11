@@ -19,8 +19,12 @@ type CreateParams struct {
 	// TTL is the requested lease duration. Must be positive.
 	TTL time.Duration
 
-	// Preset is the named launch configuration. Opaque to the store.
-	Preset string
+	// Image is the base image the container will boot from. Opaque to the store.
+	Image string
+
+	// Meta is arbitrary client-supplied metadata echoed back on status reads.
+	// Opaque to the store.
+	Meta map[string]any
 }
 
 // ErrInvalidTTL is returned by Create when the requested TTL is not positive.
@@ -76,7 +80,8 @@ func (s *Store) Create(p CreateParams) (Contract, error) {
 	c := &Contract{
 		ID:        s.newID(),
 		TTL:       p.TTL,
-		Preset:    p.Preset,
+		Image:     p.Image,
+		Meta:      p.Meta,
 		State:     StateRequested,
 		CreatedAt: created,
 		ExpiresAt: created.Add(p.TTL),

@@ -1,0 +1,13 @@
+{
+  "images": {
+    "allow": ["wisp-base"],
+    "default": "wisp-base"
+  },
+  "limits": {
+    "max_ttl_seconds": 0,
+    "max_cpus": 0,
+    "max_memory_mb": 0,
+    "pids_limit": 0,
+    "networks": ["none", "open"]
+  }
+}

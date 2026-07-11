@@ -31,9 +31,11 @@ type Config struct {
 	// expiring warning state, giving the client time to exfiltrate work.
 	ExpiringLead time.Duration
 
-	// PresetsFile is an optional path to a JSON presets config file overlaid on
-	// the built-in presets (see docs/DESIGN.md §7). Empty means built-ins only.
-	PresetsFile string
+	// ImageConfigFile is an optional path to a JSON policy config file defining
+	// the image allow-list, default image, and limits (see docs/DESIGN.md §7).
+	// Empty means the built-in defaults (allow-list of just the bare base image,
+	// no resource/TTL caps).
+	ImageConfigFile string
 
 	// AppToken is the app-level bearer credential gating contract creation (and
 	// the event bus). When empty, the app-level gate is disabled: any caller may
@@ -51,15 +53,15 @@ type Config struct {
 //	WISP_PORT                  port only; combined with 127.0.0.1 when WISP_ADDR is unset.
 //	WISP_REAP_INTERVAL_SECONDS reaper scan interval in seconds (positive integer).
 //	WISP_EXPIRING_LEAD_SECONDS expiring-warning lead time in seconds (positive integer).
-//	WISP_PRESETS_FILE          path to a JSON presets config file (optional).
+//	WISP_CONFIG                path to a JSON image allow-list + limits config (optional).
 //	WISP_APP_TOKEN             app-level bearer token gating contract creation (optional).
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:         defaultAddr,
-		ReapInterval: defaultReapInterval,
-		ExpiringLead: defaultExpiringLead,
-		PresetsFile:  os.Getenv("WISP_PRESETS_FILE"),
-		AppToken:     os.Getenv("WISP_APP_TOKEN"),
+		Addr:            defaultAddr,
+		ReapInterval:    defaultReapInterval,
+		ExpiringLead:    defaultExpiringLead,
+		ImageConfigFile: os.Getenv("WISP_CONFIG"),
+		AppToken:        os.Getenv("WISP_APP_TOKEN"),
 	}
 
 	switch {

@@ -8,24 +8,24 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/contract"
-	"github.com/benjaminfkile/wisp/internal/preset"
+	"github.com/benjaminfkile/wisp/internal/policy"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
 // testServer builds a handler wired to a fresh store and fake runtime, returning
-// all three so tests can drive the API and inspect backend state.
+// all three so tests can drive the API and inspect backend state. It uses the
+// built-in default policy (allow-list of just the bare base image, no caps).
 func testServer(t *testing.T) (http.Handler, *contract.Store, *runtime.Fake) {
 	t.Helper()
 	store := contract.NewStore()
 	fake := runtime.NewFake()
-	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, preset.Builtin(), bus.New(nil), "")
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, policy.Default(), bus.New(nil), "")
 	return h, store, fake
 }
 
@@ -76,7 +76,7 @@ func TestExecReturnsResult(t *testing.T) {
 		return runtime.ExecResult{Stdout: "hello\n", Stderr: "warn\n", ExitCode: 3}, nil
 	}
 
-	created := createContract(t, h, `{"ttl_seconds":3600,"preset":"coding"}`)
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
 
 	rec := doAuth(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec",
 		created.Token, `{"command":"echo hello"}`)
@@ -172,7 +172,7 @@ func TestExecStreamFlushesIncrementally(t *testing.T) {
 		return 5, nil
 	}
 
-	created := createContract(t, h, `{"ttl_seconds":3600,"preset":"coding"}`)
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
 
 	req := httptest.NewRequest(http.MethodPost, "/contracts/"+created.ContractID+"/exec?stream=1",
 		strings.NewReader(`{"command":"run"}`))
@@ -374,7 +374,7 @@ func TestCreateBootsAndReturns(t *testing.T) {
 	h, store, fake := testServer(t)
 
 	rec := do(t, h, http.MethodPost, "/contracts",
-		`{"ttl_seconds":3600,"preset":"coding","userdata":"#!/bin/sh\necho hi"}`)
+		`{"ttl_seconds":3600,"userdata":"#!/bin/sh\necho hi"}`)
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
@@ -434,7 +434,7 @@ func TestCreateBootsAndReturns(t *testing.T) {
 func TestGetReflectsState(t *testing.T) {
 	h, _, _ := testServer(t)
 
-	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":3600,"preset":"coding"}`)
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":3600}`)
 	var created createResponse
 	_ = json.Unmarshal(rec.Body.Bytes(), &created)
 
@@ -460,7 +460,7 @@ func TestGetReflectsState(t *testing.T) {
 func TestCreateNoUserdataSkipsExec(t *testing.T) {
 	h, store, fake := testServer(t)
 
-	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"preset":"probe"}`)
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", rec.Code)
 	}
@@ -480,7 +480,7 @@ func TestCreateNoUserdataSkipsExec(t *testing.T) {
 func TestDeleteReleases(t *testing.T) {
 	h, store, fake := testServer(t)
 
-	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":3600,"preset":"coding"}`)
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":3600}`)
 	var created createResponse
 	_ = json.Unmarshal(rec.Body.Bytes(), &created)
 	c, _ := store.Get(created.ContractID)
@@ -535,7 +535,7 @@ func TestDeleteIdempotent(t *testing.T) {
 
 func TestCreateInvalidTTL(t *testing.T) {
 	h, _, _ := testServer(t)
-	for _, body := range []string{`{"ttl_seconds":0}`, `{"ttl_seconds":-5}`, `{"preset":"coding"}`} {
+	for _, body := range []string{`{"ttl_seconds":0}`, `{"ttl_seconds":-5}`, `{"image":"wisp-base"}`} {
 		rec := do(t, h, http.MethodPost, "/contracts", body)
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("POST %s status = %d, want 400", body, rec.Code)
@@ -578,14 +578,14 @@ func TestCreateUserdataFailure(t *testing.T) {
 func TestCreateEnsuresImageBeforeCreate(t *testing.T) {
 	h, store, fake := testServer(t)
 
-	created := createContract(t, h, `{"ttl_seconds":3600,"preset":"coding"}`)
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
 
 	c, err := store.Get(created.ContractID)
 	if err != nil {
 		t.Fatalf("store.Get: %v", err)
 	}
 
-	// Provisioning pulled the preset's base image on demand before booting.
+	// Provisioning pulled the resolved image on demand before booting.
 	ensured := fake.Ensured()
 	if len(ensured) != 1 || ensured[0] != "wisp-base" {
 		t.Errorf("ensured images = %v, want [wisp-base]", ensured)
@@ -634,27 +634,70 @@ func TestCreateRuntimeCreateError(t *testing.T) {
 	}
 }
 
-func TestCreateUnknownPreset(t *testing.T) {
+// policyServer builds a handler wired to a fresh store and fake runtime over an
+// explicit policy, returning the handler plus the backend so a test can drive
+// the API and inspect launched containers.
+func policyServer(t *testing.T, pol *policy.Config) (http.Handler, *contract.Store, *runtime.Fake) {
+	t.Helper()
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, pol, bus.New(nil), "")
+	return h, store, fake
+}
+
+func TestCreateImageNotAllowed(t *testing.T) {
 	h, store, _ := testServer(t)
-	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"preset":"nonexistent"}`)
+	// The default policy allows only "wisp-base"; any other image is a 400.
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"image":"not-allowed"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
 	}
-	// An unknown preset is rejected before any contract is recorded.
+	// A disallowed image is rejected before any contract is recorded.
 	if n := len(store.List()); n != 0 {
-		t.Errorf("stored contracts = %d, want 0 after rejected preset", n)
+		t.Errorf("stored contracts = %d, want 0 after rejected image", n)
 	}
 }
 
-func TestCreateEmptyPresetUsesDefault(t *testing.T) {
+func TestCreateNetworkNotAllowed(t *testing.T) {
+	h, store, _ := testServer(t)
+	// The default policy allows only none+open; egress is not permitted -> 400.
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"network":"egress"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if n := len(store.List()); n != 0 {
+		t.Errorf("stored contracts = %d, want 0 after rejected network", n)
+	}
+}
+
+func TestCreateDefaultImageAndNetwork(t *testing.T) {
 	h, store, fake := testServer(t)
+	// Omitting image and network resolves to the policy defaults: the base image
+	// and "open" (which leaves Docker's network mode at the runtime default).
 	created := createContract(t, h, `{"ttl_seconds":60}`)
 
 	c, _ := store.Get(created.ContractID)
-	if c.Preset != preset.DefaultName {
-		t.Errorf("preset = %q, want %q", c.Preset, preset.DefaultName)
+	if c.Image != "wisp-base" {
+		t.Errorf("image = %q, want wisp-base", c.Image)
 	}
-	// The bare default has no network, mapping to Docker's "none" mode.
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	if fc.Image != "wisp-base" {
+		t.Errorf("container image = %q, want wisp-base", fc.Image)
+	}
+	// The default network is "open", so no explicit Docker network mode is set.
+	if fc.Opts.NetworkMode != "" {
+		t.Errorf("network mode = %q, want empty for open", fc.Opts.NetworkMode)
+	}
+}
+
+func TestCreateNoneNetworkMapsToDockerNone(t *testing.T) {
+	h, store, fake := testServer(t)
+	// Explicitly requesting "none" maps to Docker's "none" network mode.
+	created := createContract(t, h, `{"ttl_seconds":60,"network":"none"}`)
+	c, _ := store.Get(created.ContractID)
 	fc, ok := fake.Container(c.ContainerID)
 	if !ok {
 		t.Fatal("container not tracked")
@@ -664,11 +707,16 @@ func TestCreateEmptyPresetUsesDefault(t *testing.T) {
 	}
 }
 
-func TestCreateClampsTTLToPresetMax(t *testing.T) {
-	h, store, _ := testServer(t)
-	// The built-in "probe" preset caps TTL at 15 minutes; request an hour.
-	created := createContract(t, h, `{"ttl_seconds":3600,"preset":"probe"}`)
+func TestCreateClampsTTLToLimit(t *testing.T) {
+	// A policy with a 15-minute TTL cap clamps a longer requested lease.
+	pol := &policy.Config{
+		Allow:        []string{"wisp-base"},
+		DefaultImage: "wisp-base",
+		Limits:       policy.Limits{MaxTTLSeconds: 900, Networks: []string{"none", "open"}},
+	}
+	h, store, _ := policyServer(t, pol)
 
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
 	c, err := store.Get(created.ContractID)
 	if err != nil {
 		t.Fatalf("store.Get: %v", err)
@@ -681,33 +729,39 @@ func TestCreateClampsTTLToPresetMax(t *testing.T) {
 	}
 }
 
-func TestCreateBelowPresetMaxKeepsRequestedTTL(t *testing.T) {
-	h, store, _ := testServer(t)
-	// 5 minutes is under the "probe" cap, so it survives unchanged.
-	created := createContract(t, h, `{"ttl_seconds":300,"preset":"probe"}`)
+func TestCreateBelowTTLLimitKeepsRequested(t *testing.T) {
+	pol := &policy.Config{
+		Allow:        []string{"wisp-base"},
+		DefaultImage: "wisp-base",
+		Limits:       policy.Limits{MaxTTLSeconds: 900, Networks: []string{"none", "open"}},
+	}
+	h, store, _ := policyServer(t, pol)
+	// 5 minutes is under the cap, so it survives unchanged.
+	created := createContract(t, h, `{"ttl_seconds":300}`)
 	c, _ := store.Get(created.ContractID)
 	if want := 5 * time.Minute; c.TTL != want {
 		t.Errorf("TTL = %v, want %v", c.TTL, want)
 	}
 }
 
-func TestCreateAppliesPresetImageAndLimits(t *testing.T) {
-	h, store, fake := testServer(t)
-	// A file-backed preset lets us assert exact, distinctive limits reach the
-	// runtime rather than depending on a built-in's numbers.
-	dir := t.TempDir()
-	path := dir + "/presets.json"
-	if err := os.WriteFile(path, []byte(`{"presets":{"tiny":{
-		"image":"tiny-image","max_ttl_seconds":600,"cpus":0.5,"memory_mb":256,"pids":64,"network":"open"}}}`), 0o600); err != nil {
-		t.Fatal(err)
+func TestCreateAppliesRequestedImageAndResources(t *testing.T) {
+	// A policy allowing a second image with resource caps lets us assert that the
+	// requested image and (clamped) resources reach the runtime.
+	pol := &policy.Config{
+		Allow:        []string{"wisp-base", "tiny-image"},
+		DefaultImage: "wisp-base",
+		Limits: policy.Limits{
+			MaxCPUs:     0.5,
+			MaxMemoryMB: 256,
+			PidsLimit:   64,
+			Networks:    []string{"none", "open"},
+		},
 	}
-	presets, err := preset.Load(path)
-	if err != nil {
-		t.Fatalf("preset.Load: %v", err)
-	}
-	h = New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, presets, bus.New(nil), "")
+	h, store, fake := policyServer(t, pol)
 
-	created := createContract(t, h, `{"ttl_seconds":600,"preset":"tiny"}`)
+	// Request more than the caps allow; each dimension is clamped down.
+	created := createContract(t, h,
+		`{"ttl_seconds":600,"image":"tiny-image","network":"open","resources":{"cpus":4,"memory_mb":8192,"pids":9999}}`)
 	c, _ := store.Get(created.ContractID)
 	fc, ok := fake.Container(c.ContainerID)
 	if !ok {
@@ -717,17 +771,83 @@ func TestCreateAppliesPresetImageAndLimits(t *testing.T) {
 		t.Errorf("image = %q, want tiny-image", fc.Image)
 	}
 	if want := int64(0.5 * 1e9); fc.Opts.Resources.NanoCPUs != want {
-		t.Errorf("NanoCPUs = %d, want %d", fc.Opts.Resources.NanoCPUs, want)
+		t.Errorf("NanoCPUs = %d, want %d (clamped)", fc.Opts.Resources.NanoCPUs, want)
 	}
 	if want := int64(256 * 1024 * 1024); fc.Opts.Resources.MemoryBytes != want {
-		t.Errorf("MemoryBytes = %d, want %d", fc.Opts.Resources.MemoryBytes, want)
+		t.Errorf("MemoryBytes = %d, want %d (clamped)", fc.Opts.Resources.MemoryBytes, want)
 	}
 	if fc.Opts.Resources.PidsLimit != 64 {
-		t.Errorf("PidsLimit = %d, want 64", fc.Opts.Resources.PidsLimit)
+		t.Errorf("PidsLimit = %d, want 64 (clamped)", fc.Opts.Resources.PidsLimit)
 	}
-	// An "open" network preset leaves NetworkMode empty (the runtime default).
+	// An "open" network leaves NetworkMode empty (the runtime default).
 	if fc.Opts.NetworkMode != "" {
 		t.Errorf("network mode = %q, want empty for open", fc.Opts.NetworkMode)
+	}
+}
+
+func TestCreateEchoesMetaOnStatus(t *testing.T) {
+	h, _, _ := testServer(t)
+	created := createContract(t, h, `{"ttl_seconds":60,"meta":{"job":"build-42"}}`)
+
+	rec := do(t, h, http.MethodGet, "/contracts/"+created.ContractID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200", rec.Code)
+	}
+	var got statusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Meta["job"] != "build-42" {
+		t.Errorf("meta = %v, want job=build-42 echoed back", got.Meta)
+	}
+}
+
+func TestImagesDiscovery(t *testing.T) {
+	pol := &policy.Config{
+		Allow:        []string{"wisp-base", "custom"},
+		DefaultImage: "wisp-base",
+		Limits: policy.Limits{
+			MaxTTLSeconds: 900,
+			MaxCPUs:       2,
+			MaxMemoryMB:   1024,
+			PidsLimit:     256,
+			Networks:      []string{"none", "open", "egress"},
+		},
+	}
+	h, _, _ := policyServer(t, pol)
+
+	// GET /images is unauthenticated even when an app token is set.
+	rec := do(t, h, http.MethodGet, "/images", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got imagesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Images) != 2 || got.Images[0] != "wisp-base" || got.Images[1] != "custom" {
+		t.Errorf("images = %v, want [wisp-base custom]", got.Images)
+	}
+	if got.Default != "wisp-base" {
+		t.Errorf("default = %q, want wisp-base", got.Default)
+	}
+	if got.Limits.MaxTTLSeconds != 900 || got.Limits.MaxCPUs != 2 || got.Limits.MaxMemoryMB != 1024 || got.Limits.PidsLimit != 256 {
+		t.Errorf("limits = %+v, want the policy limits", got.Limits)
+	}
+	if len(got.Limits.Networks) != 3 {
+		t.Errorf("networks = %v, want none+open+egress", got.Limits.Networks)
+	}
+}
+
+func TestImagesUnauthenticatedWithAppToken(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, policy.Default(), bus.New(nil), "app-secret")
+
+	// No Authorization header: /images is public like /healthz.
+	rec := do(t, h, http.MethodGet, "/images", "")
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 without a token", rec.Code)
 	}
 }
 

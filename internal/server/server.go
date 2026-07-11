@@ -12,15 +12,15 @@ import (
 
 	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/contract"
-	"github.com/benjaminfkile/wisp/internal/preset"
+	"github.com/benjaminfkile/wisp/internal/policy"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
 // New builds the root http.Handler for the daemon, registering all routes. The
 // contract lifecycle endpoints are wired to store and rt; rt is the container
-// backend (the real Docker runtime in production, the fake in tests). presets is
-// the set of named launch configurations contracts reference by name (see
-// docs/DESIGN.md §7).
+// backend (the real Docker runtime in production, the fake in tests). pol is the
+// operator's launch policy — the image allow-list, default image, and limits a
+// create request is validated and clamped against (see docs/DESIGN.md §7).
 //
 // appToken is the app-level bearer credential gating contract creation (see
 // docs/DESIGN.md §8). An empty appToken disables that gate — the
@@ -34,10 +34,10 @@ import (
 //
 // The returned handler is stdlib-only (net/http ServeMux); richer routing can
 // be layered in later tasks.
-func New(logger *slog.Logger, store *contract.Store, rt runtime.Runtime, presets *preset.Set, eventBus *bus.Bus, appToken string) http.Handler {
+func New(logger *slog.Logger, store *contract.Store, rt runtime.Runtime, pol *policy.Config, eventBus *bus.Bus, appToken string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
-	newBroker(store, rt, presets, eventBus, logger, appToken).routes(mux)
+	newBroker(store, rt, pol, eventBus, logger, appToken).routes(mux)
 	return requestLogger(logger, mux)
 }
 

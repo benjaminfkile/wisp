@@ -59,10 +59,12 @@ A contract is the unit of everything. Requesting one:
 ```
 POST /contracts
 {
-  "ttl_seconds": 3600,
-  "preset": "coding",             // named launch config (§7)
+  "ttl_seconds": 3600,            // required, > 0; clamped to limits.max_ttl_seconds (§7)
+  "image": "wisp-base",           // optional; defaults to images.default, must be allow-listed (§7)
+  "network": "open",              // optional; one of limits.networks (§7)
+  "resources": { "cpus": 2, "memory_mb": 4096, "pids": 1024 },  // optional; clamped to limits (§7)
   "userdata": "#!/bin/sh\napt-get install -y git ...",   // provisioning, runs at boot
-  "meta": { ... }                 // opaque client tags, echoed back
+  "meta": { ... }                 // opaque client tags, echoed back on status reads
 }
 → 201 { "contract_id": "...", "token": "...", "status": "provisioning" }
 ```
@@ -125,26 +127,51 @@ A separate, dumb pub/sub layer for **coordination between satellites**. Wisp is 
 The bus kicks work off and announces lifecycle. The actual work happens over a contract's live
 session, never as bus round-trips.
 
-## 7. Permission presets
+## 7. Image allow-list + limits (operator config)
 
-A **preset** is a named bundle of launch configuration, referenced by name when creating a
-contract so clients don't pass raw Docker knobs:
+Wisp is **domain-blind** (§2, §3): it has no opinionated, tool-aware presets. Instead the operator
+owns a small, data-driven **config** — an image **allow-list**, a **default image**, and optional
+**limits** — and the client picks an allowed image and shapes network / resources **per request**.
+Userdata owns everything *inside* the container.
 
-- base image (the bare default, **or a custom pre-baked image** the client supplies — see below)
-- resource limits (CPU, memory, pids)
-- network policy (none / egress-only / open)
-- which secrets/mounts are available
-- max TTL allowed
-- the flags the Claude session starts with (e.g. `--dangerously-skip-permissions`)
+The config is a JSON file whose path comes from `WISP_CONFIG`. When unset, Wisp uses safe built-in
+defaults (allow-list of just the bare base image, networks `none` + `open`, no resource/TTL caps).
 
-Example: a `coding` preset = read-write, network on, git-cred mount allowed; a `probe` preset =
-no network, tighter limits, no secrets.
+```jsonc
+{
+  "images": { "allow": ["wisp-base"], "default": "wisp-base" },
+  "limits": {
+    "max_ttl_seconds": 0,   // 0 / omitted ⇒ no cap
+    "max_cpus": 0,          // fraction of host cores; 0 ⇒ no cap
+    "max_memory_mb": 0,     // 0 ⇒ no cap
+    "pids_limit": 0,        // 0 ⇒ no cap
+    "networks": ["none", "open"]   // which of none/open/egress a client may request
+  }
+}
+```
 
-**Cold-start escape hatch.** Installing a toolchain (e.g. Node + Claude Code) on every contract
-costs provisioning time. To skip it, a client builds its own image `FROM wisp-base` with its tools
-baked in and points a preset at it. That image is just preset *configuration* — Wisp still never
-knows what's inside. So: bare-and-generic by default, warm-and-ready by choice, and the
-"Claude-ready" image is data, never part of Wisp.
+On load Wisp validates: the allow-list is non-empty, the default image is in it, and every network
+is one of `none` / `open` / `egress`. An example lives at `examples/wisp.config.json`.
+
+At create time (§4) the client sends `image`, `network`, and `resources`:
+
+- **image** — optional; defaults to `images.default`. Must be in the allow-list, else `400`.
+- **network** — optional; defaults to `open` when allowed, else the first configured network. Must
+  be one of `limits.networks`, else `400`. `none` disconnects the container from all networks;
+  `open` and `egress` both boot on the runtime's default network today (egress is not yet separately
+  enforced).
+- **resources** — optional `{cpus, memory_mb, pids}`; each value is **clamped down** to the matching
+  configured maximum when that maximum is set.
+- **ttl_seconds** — required; clamped down to `limits.max_ttl_seconds` when set.
+
+Any consumer can discover what it may request via the unauthenticated `GET /images` (§10), which
+returns `{ images, default, limits }`.
+
+**Cold-start escape hatch.** Installing a toolchain on every contract costs provisioning time. To
+skip it, a client builds its own image `FROM wisp-base` with its tools baked in and the operator
+adds that tag to the allow-list. That image is just data — Wisp still never knows what's inside.
+So: bare-and-generic by default, warm-and-ready by choice; the pre-baked image is configuration,
+never part of Wisp.
 
 ## 8. Auth & security
 
@@ -156,7 +183,8 @@ knows what's inside. So: bare-and-generic by default, warm-and-ready by choice, 
 - **Creating contracts / using the bus** requires an app-level credential (per-satellite token).
 - Wisp binds `127.0.0.1` by default; the OS user remains the outer boundary. Tokens gate the
   inner, cross-app surface.
-- The preset caps blast radius (network, secrets, TTL) per contract.
+- The operator config (image allow-list + limits) caps blast radius (image, network, TTL,
+  resources) per contract; `GET /images` is the one unauthenticated discovery endpoint.
 
 ## 9. Architecture & stack
 
@@ -201,6 +229,7 @@ WS     /contracts/:id/shell           interactive PTY console
 
 POST   /events                        publish an event to the bus
 WS     /events                        subscribe (with filter)
+GET    /images                        allow-list + default + limits (unauthenticated, §7)
 GET    /healthz                       liveness
 
 Auth: Authorization: Bearer <contract token> on contract-scoped calls;
@@ -212,9 +241,10 @@ Auth: Authorization: Bearer <contract token> on contract-scoped calls;
 The old task-runner/scheduler/hierarchy stops being part of core and becomes one satellite:
 
 1. Satellite gets a unit of work (however it decides — its own queue, a bus event, a human).
-2. `POST /contracts { ttl_seconds: 3600, preset: "coding", userdata: "install node + claude code +
-   git, configure credentials, clone <repo>, checkout <branch>" }` — or use a preset whose image
-   already has the toolchain baked in, and userdata just clones + checks out.
+2. `POST /contracts { ttl_seconds: 3600, image: "wisp-base", network: "open", userdata: "install
+   node + claude code + git, configure credentials, clone <repo>, checkout <branch>" }` — or request
+   an allow-listed image that already has the toolchain baked in, and userdata just clones + checks
+   out.
 3. On `contract.ready`, it drives the coding session on a **streaming exec**:
    `claude -p "<the task>" --dangerously-skip-permissions`.
 4. While that streams, it **watches latency** and periodically fires a **sync exec**
@@ -241,7 +271,7 @@ use case needs it now.
 - **Each exec is a fresh process** — no shared cwd/env between calls. Clients send compound commands
   (`cd X && …`) or Wisp pins a per-contract working dir.
 - **Bare ≠ empty** — the base must include a shell + package manager (e.g. `debian-slim`/`alpine`)
-  or "install it yourself" is impossible; and the preset must allow network egress for installs.
+  or "install it yourself" is impossible; and the requested network must allow egress for installs.
 - **Provisioning race** — reject/queue execs until `ready`; surface userdata failures.
 - **TTL is a hard kill** — emit `contract.expiring` with enough lead time; clients must exfiltrate
   before then.
@@ -254,7 +284,7 @@ use case needs it now.
 
 - Does `/exec` also return a declared **output file** on release, or is "push it yourself" enough?
 - Event bus delivery guarantees: fire-and-forget vs at-least-once with replay?
-- Preset definition: static config files vs a management API?
+- Image allow-list + limits config: static file (`WISP_CONFIG`, today) vs a management API?
 - Pooling: keep a warm base container ready to cut cold-start, or always cold?
 - Multi-host later (one Wisp fanning across several Docker hosts), or strictly single-host?
 

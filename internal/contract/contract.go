@@ -111,9 +111,13 @@ type Contract struct {
 	// TTL is the requested lease duration. ExpiresAt is CreatedAt + TTL.
 	TTL time.Duration
 
-	// Preset is the named launch configuration used to boot the container
-	// (see docs/DESIGN.md §7). Opaque to this package.
-	Preset string
+	// Image is the base image the container was booted from (see
+	// docs/DESIGN.md §7). Opaque to this package.
+	Image string
+
+	// Meta is arbitrary client-supplied metadata echoed back on status reads.
+	// Opaque to Wisp.
+	Meta map[string]any
 
 	// State is the current lifecycle state.
 	State State

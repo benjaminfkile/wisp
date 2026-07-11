@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/contract"
 	"github.com/benjaminfkile/wisp/internal/preset"
 	"github.com/benjaminfkile/wisp/internal/runtime"
@@ -18,7 +19,7 @@ func tokenServer(t *testing.T, appToken string) http.Handler {
 	t.Helper()
 	store := contract.NewStore()
 	fake := runtime.NewFake()
-	return New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, preset.Builtin(), appToken)
+	return New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, preset.Builtin(), bus.New(nil), appToken)
 }
 
 func TestCreateRequiresAppToken(t *testing.T) {

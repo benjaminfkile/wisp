@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/config"
 	"github.com/benjaminfkile/wisp/internal/contract"
 	"github.com/benjaminfkile/wisp/internal/preset"
@@ -56,9 +57,15 @@ func main() {
 // shutdown.
 func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, presets *preset.Set) error {
 	store := contract.NewStore()
+
+	// The event bus is shared: the HTTP surface publishes contract.created /
+	// .ready / .released and serves /events, while the reaper publishes
+	// contract.expiring / .expired through the same bus (see docs/DESIGN.md §6).
+	eventBus := bus.New(logger)
+
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           server.New(logger, store, rt, presets, cfg.AppToken),
+		Handler:           server.New(logger, store, rt, presets, eventBus, cfg.AppToken),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -66,11 +73,13 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, presets *pr
 	defer stop()
 
 	// The TTL reaper reconciles tracked contracts on boot and then drives
-	// expiring/expired transitions on a ticker until shutdown.
+	// expiring/expired transitions on a ticker until shutdown. Its lifecycle
+	// hook republishes those transitions onto the event bus.
 	rp := reaper.New(store, rt, reaper.Options{
 		Lead:     cfg.ExpiringLead,
 		Interval: cfg.ReapInterval,
 		Logger:   logger,
+		Notify:   server.LifecycleNotify(eventBus, logger),
 	})
 	go rp.Run(ctx)
 

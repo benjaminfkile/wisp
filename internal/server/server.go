@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/contract"
 	"github.com/benjaminfkile/wisp/internal/preset"
 	"github.com/benjaminfkile/wisp/internal/runtime"
@@ -26,12 +27,17 @@ import (
 // localhost-friendly default. Contract-scoped calls (/exec, /shell) are always
 // gated by the per-contract token regardless of appToken.
 //
+// eventBus is the in-process pub/sub bus backing the /events endpoints and the
+// channel contract lifecycle events are published on (see docs/DESIGN.md §6). It
+// is shared with the reaper so its expiring/expired transitions reach the same
+// subscribers (main wires that via LifecycleNotify).
+//
 // The returned handler is stdlib-only (net/http ServeMux); richer routing can
 // be layered in later tasks.
-func New(logger *slog.Logger, store *contract.Store, rt runtime.Runtime, presets *preset.Set, appToken string) http.Handler {
+func New(logger *slog.Logger, store *contract.Store, rt runtime.Runtime, presets *preset.Set, eventBus *bus.Bus, appToken string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
-	newBroker(store, rt, presets, logger, appToken).routes(mux)
+	newBroker(store, rt, presets, eventBus, logger, appToken).routes(mux)
 	return requestLogger(logger, mux)
 }
 

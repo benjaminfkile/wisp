@@ -11,6 +11,9 @@
 *.test
 *.out
 
+# Runtime logs
+*.log
+
 # Go workspace files
 go.work
 go.work.sum

@@ -471,12 +471,25 @@ func (b *broker) statusOf(c contract.Contract) statusResponse {
 	}
 }
 
+// keepAliveCmd is the command Wisp runs as a container's main (PID 1) process.
+// A Wisp container is a persistent sandbox that clients drive via exec/shell for
+// the contract's lifetime — the main process does no work, it just blocks so the
+// container stays running. Without it, a bare base image's own default command
+// (e.g. Alpine's /bin/sh) exits immediately and the container stops before any
+// exec can attach, which surfaces as "container is not running". `tail` exits on
+// SIGTERM, so release / `docker stop` reaps the container promptly.
+var keepAliveCmd = []string{"tail", "-f", "/dev/null"}
+
 // createOptions translates a preset's launch configuration into the runtime's
 // CreateOptions: the resource caps and network policy applied to the container,
-// plus the label correlating it back to its contract.
+// plus the label correlating it back to its contract. It always sets the
+// keep-alive command so the container outlives its provisioning step.
 func createOptions(p preset.Preset, contractID string) runtime.CreateOptions {
 	opts := runtime.CreateOptions{
 		Labels: map[string]string{contractLabel: contractID},
+		// Run the keep-alive as the container's main process so it stays up for
+		// the whole contract; all real work happens via exec/shell (see keepAliveCmd).
+		Cmd: keepAliveCmd,
 		Resources: runtime.Resources{
 			NanoCPUs:    int64(p.CPUs * 1e9),
 			MemoryBytes: int64(p.MemoryMB) * bytesPerMB,

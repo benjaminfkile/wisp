@@ -15,7 +15,7 @@ type FakeContainer struct {
 	Started bool
 	Killed  bool
 	// Execs is the ordered list of commands run against this container via
-	// ExecSync.
+	// ExecSync or ExecStream.
 	Execs [][]string
 }
 
@@ -23,6 +23,12 @@ type FakeContainer struct {
 // target container id and command and returns the synthetic result. When nil,
 // the Fake returns an empty, exit-code-0 result.
 type ExecFunc func(id string, cmd []string) (ExecResult, error)
+
+// StreamFunc lets a test define how the Fake responds to a streaming exec. It
+// receives the target container id and command plus an emit callback to push
+// output chunks, and returns the process exit code. When nil, ExecStream emits
+// nothing and returns exit code 0.
+type StreamFunc func(id string, cmd []string, emit func(ExecChunk) error) (int, error)
 
 // Fake is an in-memory Runtime for tests. It never talks to a Docker daemon.
 // The zero value is ready to use; it is safe for concurrent use.
@@ -35,6 +41,11 @@ type Fake struct {
 	// read under the Fake's lock so tests should not mutate it concurrently
 	// with runtime calls.
 	ExecHandler ExecFunc
+
+	// StreamHandler, when set, produces streaming exec output. Set it before
+	// use; it is read under the Fake's lock so tests should not mutate it
+	// concurrently with runtime calls.
+	StreamHandler StreamFunc
 
 	// CreateErr, StartErr, KillErr, when set, are returned by the
 	// corresponding method to let tests exercise error paths.
@@ -121,6 +132,30 @@ func (f *Fake) ExecSync(ctx context.Context, id string, cmd []string) (ExecResul
 		return ExecResult{}, nil
 	}
 	return handler(id, cmd)
+}
+
+// ExecStream implements Runtime. The container must exist and be running
+// (started, not killed). The configured StreamHandler drives the emitted
+// chunks; with no handler it emits nothing and reports exit code 0.
+func (f *Fake) ExecStream(ctx context.Context, id string, cmd []string, emit func(ExecChunk) error) (int, error) {
+	f.mu.Lock()
+	c, ok := f.containers[id]
+	if !ok {
+		f.mu.Unlock()
+		return 0, ErrNotFound
+	}
+	if !c.Started || c.Killed {
+		f.mu.Unlock()
+		return 0, ErrNotRunning
+	}
+	c.Execs = append(c.Execs, cmd)
+	handler := f.StreamHandler
+	f.mu.Unlock()
+
+	if handler == nil {
+		return 0, nil
+	}
+	return handler(id, cmd, emit)
 }
 
 // Container returns a snapshot-safe reference to a tracked container and whether

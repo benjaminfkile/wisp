@@ -52,6 +52,21 @@ type ExecResult struct {
 	ExitCode int
 }
 
+// ExecChunk is one incremental piece of output from a streaming exec. Stream is
+// the origin of the bytes, either "stdout" or "stderr"; Data is the bytes
+// produced since the previous chunk. Data is owned by the receiver: streaming
+// implementations must not retain or mutate it after emitting.
+type ExecChunk struct {
+	Stream string
+	Data   []byte
+}
+
+// Stream names carried by ExecChunk.Stream.
+const (
+	StreamStdout = "stdout"
+	StreamStderr = "stderr"
+)
+
 // Runtime abstracts the container backend. Implementations must be safe for
 // concurrent use by multiple goroutines.
 type Runtime interface {
@@ -71,6 +86,15 @@ type Runtime interface {
 	// its buffered stdout, stderr, and exit code. A non-zero exit code is
 	// reported via ExecResult.ExitCode, not as an error.
 	ExecSync(ctx context.Context, id string, cmd []string) (ExecResult, error)
+
+	// ExecStream runs cmd inside a running container and delivers its output
+	// incrementally: emit is called once per chunk as bytes are produced, so a
+	// caller can watch a long-running command live. emit is invoked from a
+	// single goroutine (chunks never overlap). If emit returns an error,
+	// ExecStream stops and returns that error. On success it returns the
+	// process exit code once the command completes; a non-zero exit code is not
+	// an error.
+	ExecStream(ctx context.Context, id string, cmd []string, emit func(ExecChunk) error) (int, error)
 }
 
 // Ensure both implementations satisfy the interface at compile time.

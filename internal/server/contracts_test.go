@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -95,6 +96,215 @@ func TestExecReturnsResult(t *testing.T) {
 	last := fc.Execs[len(fc.Execs)-1]
 	if len(last) != 3 || last[0] != "/bin/sh" || last[1] != "-c" || last[2] != "echo hello" {
 		t.Errorf("exec cmd = %v, want [/bin/sh -c echo hello]", last)
+	}
+}
+
+// flushRecorder is a ResponseWriter that records a snapshot of the body written
+// so far on every Flush(), letting a test assert output was flushed
+// incrementally rather than all at once at the end.
+type flushRecorder struct {
+	header    http.Header
+	status    int
+	buf       bytes.Buffer
+	flushes   []string // body snapshot at each Flush
+	failWrite bool     // when true, Write returns an error (simulates a dead client)
+}
+
+func newFlushRecorder() *flushRecorder {
+	return &flushRecorder{header: make(http.Header), status: http.StatusOK}
+}
+
+func (f *flushRecorder) Header() http.Header { return f.header }
+
+func (f *flushRecorder) Write(p []byte) (int, error) {
+	if f.failWrite {
+		return 0, io.ErrClosedPipe
+	}
+	return f.buf.Write(p)
+}
+
+func (f *flushRecorder) WriteHeader(status int) { f.status = status }
+
+func (f *flushRecorder) Flush() {
+	f.flushes = append(f.flushes, f.buf.String())
+}
+
+// sseEvents splits an SSE body into (event, data) pairs.
+func sseEvents(t *testing.T, body string) []struct{ Event, Data string } {
+	t.Helper()
+	var out []struct{ Event, Data string }
+	for _, block := range strings.Split(strings.TrimSpace(body), "\n\n") {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+		var ev struct{ Event, Data string }
+		for _, line := range strings.Split(block, "\n") {
+			switch {
+			case strings.HasPrefix(line, "event: "):
+				ev.Event = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: "):
+				ev.Data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+func TestExecStreamFlushesIncrementally(t *testing.T) {
+	h, _, fake := testServer(t)
+	fake.StreamHandler = func(id string, cmd []string, emit func(runtime.ExecChunk) error) (int, error) {
+		if err := emit(runtime.ExecChunk{Stream: runtime.StreamStdout, Data: []byte("line one\n")}); err != nil {
+			return 0, err
+		}
+		if err := emit(runtime.ExecChunk{Stream: runtime.StreamStderr, Data: []byte("a warning\n")}); err != nil {
+			return 0, err
+		}
+		if err := emit(runtime.ExecChunk{Stream: runtime.StreamStdout, Data: []byte("line two\n")}); err != nil {
+			return 0, err
+		}
+		return 5, nil
+	}
+
+	created := createContract(t, h, `{"ttl_seconds":3600,"preset":"coding"}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/contracts/"+created.ContractID+"/exec?stream=1",
+		strings.NewReader(`{"command":"run"}`))
+	req.Header.Set("Authorization", "Bearer "+created.Token)
+	rec := newFlushRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.status)
+	}
+	if ct := rec.header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	// Output was flushed incrementally: the header flush plus one flush per
+	// chunk plus the terminal exit flush, each snapshot strictly longer than the
+	// last (the body grew between flushes rather than being emitted all at once).
+	if len(rec.flushes) < 5 {
+		t.Fatalf("flushes = %d, want at least 5 (header + 3 chunks + exit)", len(rec.flushes))
+	}
+	for i := 1; i < len(rec.flushes); i++ {
+		if len(rec.flushes[i]) < len(rec.flushes[i-1]) {
+			t.Errorf("flush %d snapshot shorter than previous; body did not grow monotonically", i)
+		}
+	}
+	// The first chunk was visible to the client before the last chunk was written.
+	firstChunkFlush := -1
+	for i, snap := range rec.flushes {
+		if strings.Contains(snap, "line one") {
+			firstChunkFlush = i
+			break
+		}
+	}
+	if firstChunkFlush < 0 {
+		t.Fatal("first chunk never appeared in a flush")
+	}
+	if strings.Contains(rec.flushes[firstChunkFlush], "line two") {
+		t.Error("first and last chunks appeared in the same flush; output was not streamed incrementally")
+	}
+
+	events := sseEvents(t, rec.buf.String())
+	if len(events) != 4 {
+		t.Fatalf("events = %d, want 4 (3 chunks + exit): %q", len(events), rec.buf.String())
+	}
+	wantChunks := []execStreamChunk{
+		{Stream: "stdout", Data: "line one\n"},
+		{Stream: "stderr", Data: "a warning\n"},
+		{Stream: "stdout", Data: "line two\n"},
+	}
+	for i, want := range wantChunks {
+		if events[i].Event != "chunk" {
+			t.Errorf("event %d = %q, want chunk", i, events[i].Event)
+		}
+		var got execStreamChunk
+		if err := json.Unmarshal([]byte(events[i].Data), &got); err != nil {
+			t.Fatalf("decode chunk %d: %v", i, err)
+		}
+		if got != want {
+			t.Errorf("chunk %d = %+v, want %+v", i, got, want)
+		}
+	}
+	last := events[len(events)-1]
+	if last.Event != "exit" {
+		t.Errorf("final event = %q, want exit", last.Event)
+	}
+	var exit execStreamExit
+	if err := json.Unmarshal([]byte(last.Data), &exit); err != nil {
+		t.Fatalf("decode exit: %v", err)
+	}
+	if exit.ExitCode != 5 {
+		t.Errorf("exit_code = %d, want 5", exit.ExitCode)
+	}
+}
+
+func TestExecStreamRequiresToken(t *testing.T) {
+	h, _, fake := testServer(t)
+	called := false
+	fake.StreamHandler = func(id string, cmd []string, emit func(runtime.ExecChunk) error) (int, error) {
+		called = true
+		return 0, nil
+	}
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	// Missing token: rejected before streaming begins.
+	rec := do(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec?stream=1", `{"command":"ls"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("no-token stream status = %d, want 401", rec.Code)
+	}
+	// Bad token: also rejected.
+	rec = doAuth(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec?stream=1",
+		created.Token+"x", `{"command":"ls"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("bad-token stream status = %d, want 401", rec.Code)
+	}
+	if called {
+		t.Error("stream handler ran despite missing/invalid token")
+	}
+}
+
+func TestExecStreamClientDisconnect(t *testing.T) {
+	h, _, fake := testServer(t)
+	emitCount := 0
+	fake.StreamHandler = func(id string, cmd []string, emit func(runtime.ExecChunk) error) (int, error) {
+		for i := 0; i < 5; i++ {
+			if err := emit(runtime.ExecChunk{Stream: runtime.StreamStdout, Data: []byte("x")}); err != nil {
+				return 0, err
+			}
+			emitCount++
+		}
+		return 0, nil
+	}
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/contracts/"+created.ContractID+"/exec?stream=1",
+		strings.NewReader(`{"command":"run"}`))
+	req.Header.Set("Authorization", "Bearer "+created.Token)
+	rec := newFlushRecorder()
+	rec.failWrite = true // simulate a client that has gone away
+	h.ServeHTTP(rec, req)
+
+	// The failed write propagates through emit, so the exec stops early rather
+	// than draining all five chunks.
+	if emitCount != 0 {
+		t.Errorf("emitCount = %d, want 0 (stopped on first failed write)", emitCount)
+	}
+}
+
+func TestExecStreamNotReady(t *testing.T) {
+	h, store, _ := testServer(t)
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+	if _, err := store.UpdateState(created.ContractID, contract.StateReleased); err != nil {
+		t.Fatalf("UpdateState: %v", err)
+	}
+	rec := doAuth(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec?stream=1",
+		created.Token, `{"command":"ls"}`)
+	if rec.Code != http.StatusConflict {
+		t.Errorf("not-ready stream status = %d, want 409", rec.Code)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -246,8 +247,26 @@ type execResponse struct {
 	ExitCode int    `json:"exit_code"`
 }
 
-// exec handles POST /contracts/:id/exec: it runs {command} to completion inside
-// the contract's container via Runtime.ExecSync and returns stdout/stderr/exit.
+// execStreamChunk is one Server-Sent Event payload carrying a slice of live
+// output. Stream is "stdout" or "stderr"; Data is the bytes produced since the
+// previous chunk (JSON-escaped, so embedded newlines survive SSE framing).
+type execStreamChunk struct {
+	Stream string `json:"stream"`
+	Data   string `json:"data"`
+}
+
+// execStreamExit is the terminal SSE payload of a streaming exec: the process
+// exit code, sent once the command completes.
+type execStreamExit struct {
+	ExitCode int `json:"exit_code"`
+}
+
+// exec handles POST /contracts/:id/exec: it runs {command} inside the
+// contract's container. By default (sync mode) it runs the command to
+// completion via Runtime.ExecSync and returns stdout/stderr/exit as one JSON
+// body. With ?stream=1 it instead streams output live as Server-Sent Events
+// (see execStream), so a caller can watch a long-running command's output as it
+// is produced.
 //
 // Each exec is a fresh process: Wisp runs the command with a new `/bin/sh -c`
 // invocation, so there is no shared cwd or environment between calls (see
@@ -256,7 +275,8 @@ type execResponse struct {
 //
 // The call requires the contract's bearer token (Authorization: Bearer <token>)
 // and rejects execs against a contract that is not ready (409), unknown (404),
-// or presented without a valid token (401).
+// or presented without a valid token (401). These checks are identical in both
+// modes: the stream flag only changes how a successful exec's output is framed.
 func (b *broker) exec(w http.ResponseWriter, r *http.Request) {
 	c, err := b.store.Get(r.PathValue("id"))
 	if errors.Is(err, contract.ErrNotFound) {
@@ -288,6 +308,11 @@ func (b *broker) exec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Query().Get("stream") == "1" {
+		b.execStream(w, r, c, req.Command)
+		return
+	}
+
 	res, err := b.rt.ExecSync(r.Context(), c.ContainerID, []string{"/bin/sh", "-c", req.Command})
 	if err != nil {
 		b.logger.Error("exec in container", "contract_id", c.ID, "error", err)
@@ -300,6 +325,65 @@ func (b *broker) exec(w http.ResponseWriter, r *http.Request) {
 		Stderr:   res.Stderr,
 		ExitCode: res.ExitCode,
 	})
+}
+
+// execStream runs command in streaming mode and writes the output live to w as
+// Server-Sent Events. Each output chunk is a `chunk` event whose data is an
+// execStreamChunk; the command's exit code arrives as a final `exit` event with
+// an execStreamExit payload. Every event is flushed immediately so the client
+// sees output as it is produced rather than all at once at the end.
+//
+// The 200 status and SSE headers are committed before the first byte of output,
+// so a runtime failure mid-stream cannot change the status code; it is instead
+// surfaced as an `error` event and logged. A client that disconnects makes a
+// flush write fail, which propagates back through emit to stop the exec.
+func (b *broker) execStream(w http.ResponseWriter, r *http.Request, c contract.Contract, command string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		// No streaming transport available (should not happen for net/http).
+		writeError(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	emit := func(chunk runtime.ExecChunk) error {
+		if err := writeSSE(w, "chunk", execStreamChunk{
+			Stream: chunk.Stream,
+			Data:   string(chunk.Data),
+		}); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	exitCode, err := b.rt.ExecStream(r.Context(), c.ContainerID, []string{"/bin/sh", "-c", command}, emit)
+	if err != nil {
+		b.logger.Error("stream exec in container", "contract_id", c.ID, "error", err)
+		_ = writeSSE(w, "error", map[string]string{"error": "exec failed"})
+		flusher.Flush()
+		return
+	}
+
+	_ = writeSSE(w, "exit", execStreamExit{ExitCode: exitCode})
+	flusher.Flush()
+}
+
+// writeSSE encodes payload as JSON and writes it as a single named Server-Sent
+// Event. JSON escaping keeps the payload on one `data:` line even when it
+// contains newlines, so multi-line output survives SSE framing intact.
+func writeSSE(w http.ResponseWriter, event string, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+	return err
 }
 
 // bearerMatches reports whether the request carries an Authorization: Bearer

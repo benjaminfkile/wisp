@@ -2,8 +2,11 @@
 package server
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -59,6 +62,19 @@ func (r *statusRecorder) Flush() {
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack forwards to the wrapped ResponseWriter's Hijacker so the shell
+// endpoint can upgrade to a WebSocket through the logging middleware. Without
+// this, the wrapper would mask the underlying http.Hijacker and gorilla's
+// Upgrade would fail with "bad handshake". If the underlying writer is not a
+// Hijacker (e.g. httptest.ResponseRecorder), it returns an error.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("server: response writer does not support hijacking")
+	}
+	return hj.Hijack()
 }
 
 // requestLogger emits one structured log line per request.

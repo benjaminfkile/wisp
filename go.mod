@@ -2,7 +2,10 @@ module github.com/benjaminfkile/wisp
 
 go 1.22
 
-require github.com/docker/docker v25.0.6+incompatible
+require (
+	github.com/docker/docker v25.0.6+incompatible
+	github.com/gorilla/websocket v1.5.3
+)
 
 require (
 	github.com/Microsoft/go-winio v0.4.14 // indirect

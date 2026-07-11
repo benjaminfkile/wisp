@@ -49,6 +49,7 @@ func (b *broker) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /contracts/{id}", b.get)
 	mux.HandleFunc("DELETE /contracts/{id}", b.release)
 	mux.HandleFunc("POST /contracts/{id}/exec", b.exec)
+	mux.HandleFunc("GET /contracts/{id}/shell", b.shell)
 }
 
 // createRequest is the POST /contracts body (see docs/DESIGN.md §4).

@@ -15,6 +15,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"io"
 )
 
 // ErrNotFound is returned when an operation references a container id that the
@@ -95,6 +96,15 @@ type Runtime interface {
 	// process exit code once the command completes; a non-zero exit code is not
 	// an error.
 	ExecStream(ctx context.Context, id string, cmd []string, emit func(ExecChunk) error) (int, error)
+
+	// ExecShell starts an interactive exec with a TTY inside a running
+	// container and returns its hijacked duplex byte stream: reads deliver the
+	// shell's combined output, writes deliver keystrokes to the shell's stdin,
+	// and Close tears the exec down. Because the exec has a TTY, the output is a
+	// single raw stream (not the multiplexed stdout/stderr of ExecSync), exactly
+	// what a terminal expects. The stream bridges directly onto an interactive
+	// WebSocket; see server's shell endpoint.
+	ExecShell(ctx context.Context, id string, cmd []string) (io.ReadWriteCloser, error)
 }
 
 // Ensure both implementations satisfy the interface at compile time.

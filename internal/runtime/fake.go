@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 )
 
@@ -30,6 +31,13 @@ type ExecFunc func(id string, cmd []string) (ExecResult, error)
 // nothing and returns exit code 0.
 type StreamFunc func(id string, cmd []string, emit func(ExecChunk) error) (int, error)
 
+// ShellFunc lets a test define how the Fake responds to an interactive shell
+// request. It receives the target container id and command and returns the
+// duplex stream that stands in for the container's hijacked TTY. When nil,
+// ExecShell returns an ErrNotFound-free empty stream that reports EOF on read
+// and discards writes.
+type ShellFunc func(id string, cmd []string) (io.ReadWriteCloser, error)
+
 // Fake is an in-memory Runtime for tests. It never talks to a Docker daemon.
 // The zero value is ready to use; it is safe for concurrent use.
 type Fake struct {
@@ -46,6 +54,11 @@ type Fake struct {
 	// use; it is read under the Fake's lock so tests should not mutate it
 	// concurrently with runtime calls.
 	StreamHandler StreamFunc
+
+	// ShellHandler, when set, produces the duplex stream for an interactive
+	// shell. Set it before use; it is read under the Fake's lock so tests
+	// should not mutate it concurrently with runtime calls.
+	ShellHandler ShellFunc
 
 	// CreateErr, StartErr, KillErr, when set, are returned by the
 	// corresponding method to let tests exercise error paths.
@@ -157,6 +170,39 @@ func (f *Fake) ExecStream(ctx context.Context, id string, cmd []string, emit fun
 	}
 	return handler(id, cmd, emit)
 }
+
+// ExecShell implements Runtime. The container must exist and be running
+// (started, not killed). The configured ShellHandler produces the duplex
+// stream; with no handler it returns a stream that reports EOF on read and
+// discards writes.
+func (f *Fake) ExecShell(ctx context.Context, id string, cmd []string) (io.ReadWriteCloser, error) {
+	f.mu.Lock()
+	c, ok := f.containers[id]
+	if !ok {
+		f.mu.Unlock()
+		return nil, ErrNotFound
+	}
+	if !c.Started || c.Killed {
+		f.mu.Unlock()
+		return nil, ErrNotRunning
+	}
+	c.Execs = append(c.Execs, cmd)
+	handler := f.ShellHandler
+	f.mu.Unlock()
+
+	if handler == nil {
+		return nopStream{}, nil
+	}
+	return handler(id, cmd)
+}
+
+// nopStream is the default duplex stream returned by ExecShell when no
+// ShellHandler is set: reads report EOF immediately and writes are discarded.
+type nopStream struct{}
+
+func (nopStream) Read([]byte) (int, error)    { return 0, io.EOF }
+func (nopStream) Write(p []byte) (int, error) { return len(p), nil }
+func (nopStream) Close() error                { return nil }
 
 // Container returns a snapshot-safe reference to a tracked container and whether
 // it exists. Intended for test assertions; the returned pointer aliases the

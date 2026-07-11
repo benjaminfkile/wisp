@@ -40,6 +40,37 @@ func (d *DockerRuntime) Close() error {
 	return d.cli.Close()
 }
 
+// EnsureImage implements Runtime. It inspects the image locally first and, only
+// when it is absent, pulls it from its registry, draining the pull stream to
+// completion so the pull has finished before returning. A local-only tag that
+// inspects successfully is never pulled.
+func (d *DockerRuntime) EnsureImage(ctx context.Context, ref string) error {
+	if _, _, err := d.cli.ImageInspectWithRaw(ctx, ref); err == nil {
+		// Already present locally; nothing to pull.
+		return nil
+	} else if !client.IsErrNotFound(err) {
+		return fmt.Errorf("runtime: inspect image %s: %w", ref, err)
+	}
+
+	rc, err := d.cli.ImagePull(ctx, ref, types.ImagePullOptions{})
+	if err != nil {
+		return fmt.Errorf("runtime: pull image %s: %w", ref, err)
+	}
+	// Draining the reader to EOF blocks until the pull actually completes; the
+	// payload is progress JSON we do not need.
+	_, copyErr := io.Copy(io.Discard, rc)
+	rc.Close()
+	if copyErr != nil {
+		return fmt.Errorf("runtime: pull image %s: %w", ref, copyErr)
+	}
+
+	// Confirm the pull produced a usable local image.
+	if _, _, err := d.cli.ImageInspectWithRaw(ctx, ref); err != nil {
+		return fmt.Errorf("runtime: image %s not present after pull: %w", ref, err)
+	}
+	return nil
+}
+
 // Create implements Runtime.
 func (d *DockerRuntime) Create(ctx context.Context, image string, opts CreateOptions) (string, error) {
 	cfg := &container.Config{

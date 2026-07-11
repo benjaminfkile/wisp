@@ -173,6 +173,13 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, p preset.Pr
 		return c, err
 	}
 
+	// Pull the base image on demand so a contract is never blocked from using an
+	// allowed image just because it is not in `docker images` yet.
+	if err := b.rt.EnsureImage(ctx, p.Image); err != nil {
+		b.fail(ctx, c.ID, "")
+		return c, err
+	}
+
 	cid, err := b.rt.Create(ctx, p.Image, createOptions(p, c.ID))
 	if err != nil {
 		b.fail(ctx, c.ID, "")

@@ -92,6 +92,15 @@ const (
 // Runtime abstracts the container backend. Implementations must be safe for
 // concurrent use by multiple goroutines.
 type Runtime interface {
+	// EnsureImage makes the image ref available locally so a subsequent Create
+	// can use it. It inspects locally first: if the image is already present it
+	// returns nil without pulling, so a bare local-only tag (e.g. "wisp-base")
+	// that exists in no registry is never pulled and never errors. If the image
+	// is absent it pulls ref from its registry and blocks until the pull
+	// completes. If the pull fails and the image is still not present, it
+	// returns a wrapped error. Safe for concurrent use.
+	EnsureImage(ctx context.Context, ref string) error
+
 	// Create provisions a container from image with the given options and
 	// returns its id. The container is created but not started.
 	Create(ctx context.Context, image string, opts CreateOptions) (string, error)

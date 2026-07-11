@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestLoadDefault(t *testing.T) {
 	t.Setenv("WISP_ADDR", "")
@@ -47,5 +50,52 @@ func TestLoadInvalidPort(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() error = nil, want error for invalid WISP_PORT")
+	}
+}
+
+func TestLoadReaperDefaults(t *testing.T) {
+	t.Setenv("WISP_REAP_INTERVAL_SECONDS", "")
+	t.Setenv("WISP_EXPIRING_LEAD_SECONDS", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ReapInterval != defaultReapInterval {
+		t.Errorf("ReapInterval = %v, want %v", cfg.ReapInterval, defaultReapInterval)
+	}
+	if cfg.ExpiringLead != defaultExpiringLead {
+		t.Errorf("ExpiringLead = %v, want %v", cfg.ExpiringLead, defaultExpiringLead)
+	}
+}
+
+func TestLoadReaperOverride(t *testing.T) {
+	t.Setenv("WISP_REAP_INTERVAL_SECONDS", "5")
+	t.Setenv("WISP_EXPIRING_LEAD_SECONDS", "120")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ReapInterval != 5*time.Second {
+		t.Errorf("ReapInterval = %v, want 5s", cfg.ReapInterval)
+	}
+	if cfg.ExpiringLead != 120*time.Second {
+		t.Errorf("ExpiringLead = %v, want 120s", cfg.ExpiringLead)
+	}
+}
+
+func TestLoadInvalidReaperEnv(t *testing.T) {
+	for _, name := range []string{"WISP_REAP_INTERVAL_SECONDS", "WISP_EXPIRING_LEAD_SECONDS"} {
+		for _, val := range []string{"notanint", "0", "-3"} {
+			t.Run(name+"="+val, func(t *testing.T) {
+				t.Setenv("WISP_REAP_INTERVAL_SECONDS", "")
+				t.Setenv("WISP_EXPIRING_LEAD_SECONDS", "")
+				t.Setenv(name, val)
+				if _, err := Load(); err == nil {
+					t.Fatalf("Load() error = nil, want error for %s=%q", name, val)
+				}
+			})
+		}
 	}
 }

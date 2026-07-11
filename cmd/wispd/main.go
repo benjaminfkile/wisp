@@ -18,6 +18,7 @@ import (
 
 	"github.com/benjaminfkile/wisp/internal/config"
 	"github.com/benjaminfkile/wisp/internal/contract"
+	"github.com/benjaminfkile/wisp/internal/reaper"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 	"github.com/benjaminfkile/wisp/internal/server"
 )
@@ -56,6 +57,15 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// The TTL reaper reconciles tracked contracts on boot and then drives
+	// expiring/expired transitions on a ticker until shutdown.
+	rp := reaper.New(store, rt, reaper.Options{
+		Lead:     cfg.ExpiringLead,
+		Interval: cfg.ReapInterval,
+		Logger:   logger,
+	})
+	go rp.Run(ctx)
 
 	errc := make(chan error, 1)
 	go func() {

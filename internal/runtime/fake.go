@@ -45,6 +45,10 @@ type Fake struct {
 	seq        int
 	containers map[string]*FakeContainer
 
+	// ensured records, in call order, every ref passed to EnsureImage so tests
+	// can assert the pull-on-demand step ran with the expected image.
+	ensured []string
+
 	// ExecHandler, when set, produces exec results. Set it before use; it is
 	// read under the Fake's lock so tests should not mutate it concurrently
 	// with runtime calls.
@@ -60,11 +64,12 @@ type Fake struct {
 	// should not mutate it concurrently with runtime calls.
 	ShellHandler ShellFunc
 
-	// CreateErr, StartErr, KillErr, when set, are returned by the
-	// corresponding method to let tests exercise error paths.
-	CreateErr error
-	StartErr  error
-	KillErr   error
+	// CreateErr, StartErr, KillErr, EnsureImageErr, when set, are returned by
+	// the corresponding method to let tests exercise error paths.
+	CreateErr      error
+	StartErr       error
+	KillErr        error
+	EnsureImageErr error
 }
 
 // NewFake returns an initialized Fake runtime.
@@ -77,6 +82,25 @@ func (f *Fake) lazyInit() {
 	if f.containers == nil {
 		f.containers = make(map[string]*FakeContainer)
 	}
+}
+
+// EnsureImage implements Runtime. The Fake has no daemon, so it never pulls; it
+// simply records the ref (in call order) and returns nil, letting tests assert
+// that provisioning invoked pull-on-demand with the expected image.
+func (f *Fake) EnsureImage(ctx context.Context, ref string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensured = append(f.ensured, ref)
+	return f.EnsureImageErr
+}
+
+// Ensured returns a copy of the refs passed to EnsureImage, in call order.
+func (f *Fake) Ensured() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.ensured))
+	copy(out, f.ensured)
+	return out
 }
 
 // Create implements Runtime.

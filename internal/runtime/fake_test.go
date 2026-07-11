@@ -74,6 +74,34 @@ func TestFakeCreateStartExecKill(t *testing.T) {
 	}
 }
 
+func TestFakeEnsureImageRecordsRefs(t *testing.T) {
+	ctx := context.Background()
+	f := NewFake()
+
+	// No calls yet: nothing recorded.
+	if got := f.Ensured(); len(got) != 0 {
+		t.Fatalf("Ensured before any call = %v, want empty", got)
+	}
+
+	if err := f.EnsureImage(ctx, "debian:slim"); err != nil {
+		t.Fatalf("EnsureImage: %v", err)
+	}
+	if err := f.EnsureImage(ctx, "alpine:3"); err != nil {
+		t.Fatalf("EnsureImage: %v", err)
+	}
+
+	want := []string{"debian:slim", "alpine:3"}
+	if got := f.Ensured(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Ensured = %v, want %v", got, want)
+	}
+
+	// Ensured returns a copy: mutating it must not affect the Fake's record.
+	f.Ensured()[0] = "tampered"
+	if got := f.Ensured(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Ensured after mutation = %v, want %v", got, want)
+	}
+}
+
 func TestFakeExecStreamEmitsChunks(t *testing.T) {
 	ctx := context.Background()
 	f := NewFake()

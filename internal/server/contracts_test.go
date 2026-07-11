@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -571,6 +572,51 @@ func TestCreateUserdataFailure(t *testing.T) {
 	}
 	if all[0].State != contract.StateExpired {
 		t.Errorf("state = %q, want expired after failed userdata", all[0].State)
+	}
+}
+
+func TestCreateEnsuresImageBeforeCreate(t *testing.T) {
+	h, store, fake := testServer(t)
+
+	created := createContract(t, h, `{"ttl_seconds":3600,"preset":"coding"}`)
+
+	c, err := store.Get(created.ContractID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+
+	// Provisioning pulled the preset's base image on demand before booting.
+	ensured := fake.Ensured()
+	if len(ensured) != 1 || ensured[0] != "wisp-base" {
+		t.Errorf("ensured images = %v, want [wisp-base]", ensured)
+	}
+	// The image ensured is the one the container was created from.
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	if fc.Image != ensured[0] {
+		t.Errorf("created image = %q, ensured image = %q; want equal", fc.Image, ensured[0])
+	}
+}
+
+func TestCreateEnsureImageError(t *testing.T) {
+	h, store, fake := testServer(t)
+	fake.EnsureImageErr = errors.New("pull failed")
+
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	// EnsureImage runs before Create: a pull failure fails the contract and no
+	// container is ever booted.
+	if n := fake.Count(); n != 0 {
+		t.Errorf("live containers = %d, want 0 after failed pull", n)
+	}
+	all := store.List()
+	if len(all) != 1 || all[0].State != contract.StateExpired {
+		t.Errorf("contract state = %v, want a single expired contract", all)
 	}
 }
 

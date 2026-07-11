@@ -1,0 +1,16 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/wisp
+/wisp.exe
+
+# Test / coverage output
+*.test
+*.out
+
+# Go workspace files
+go.work
+go.work.sum

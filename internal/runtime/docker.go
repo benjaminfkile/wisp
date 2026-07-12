@@ -199,7 +199,7 @@ func (d *DockerRuntime) ExecStream(ctx context.Context, id string, cmd []string,
 // returned io.ReadWriteCloser reads the shell's TTY output and writes to its
 // stdin; closing it detaches from the exec. With Tty:true Docker does not
 // multiplex the streams, so the reader yields the terminal bytes verbatim.
-func (d *DockerRuntime) ExecShell(ctx context.Context, id string, cmd []string) (io.ReadWriteCloser, error) {
+func (d *DockerRuntime) ExecShell(ctx context.Context, id string, cmd []string) (ShellStream, error) {
 	execID, err := d.cli.ContainerExecCreate(ctx, id, types.ExecConfig{
 		Cmd:          cmd,
 		Tty:          true,
@@ -215,19 +215,36 @@ func (d *DockerRuntime) ExecShell(ctx context.Context, id string, cmd []string) 
 	if err != nil {
 		return nil, fmt.Errorf("runtime: exec attach on %s: %w", id, err)
 	}
-	return &hijackStream{attach: attach}, nil
+	return &hijackStream{cli: d.cli, execID: execID.ID, attach: attach}, nil
 }
 
-// hijackStream adapts a Docker HijackedResponse into an io.ReadWriteCloser. The
-// hijacked connection is full duplex: reads come from the multiplexed reader
-// (raw TTY bytes, since the exec has a TTY) and writes go to the underlying
-// conn (the shell's stdin). Close tears down both directions.
+// hijackStream adapts a Docker HijackedResponse into a ShellStream. The hijacked
+// connection is full duplex: reads come from the multiplexed reader (raw TTY
+// bytes, since the exec has a TTY) and writes go to the underlying conn (the
+// shell's stdin). Resize issues an out-of-band ContainerExecResize for the exec
+// so the pseudo-terminal tracks the client's window size. Close tears down both
+// directions.
 type hijackStream struct {
+	cli    client.APIClient
+	execID string
 	attach types.HijackedResponse
 }
 
 func (h *hijackStream) Read(p []byte) (int, error)  { return h.attach.Reader.Read(p) }
 func (h *hijackStream) Write(p []byte) (int, error) { return h.attach.Conn.Write(p) }
+
+// Resize forwards a TTY window-size change to the exec. It is a separate Engine
+// API call from the hijacked byte stream, so it can run while reads and writes
+// are in flight.
+func (h *hijackStream) Resize(ctx context.Context, rows, cols uint16) error {
+	if err := h.cli.ContainerExecResize(ctx, h.execID, container.ResizeOptions{
+		Height: uint(rows),
+		Width:  uint(cols),
+	}); err != nil {
+		return fmt.Errorf("runtime: exec resize on %s: %w", h.execID, err)
+	}
+	return nil
+}
 
 func (h *hijackStream) Close() error {
 	// CloseWrite signals stdin EOF where supported; Close tears down the conn.

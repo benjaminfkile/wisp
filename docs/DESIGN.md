@@ -107,6 +107,14 @@ bridges that duplex byte stream to a WebSocket — client bytes → container st
 client. This is the same pattern every web terminal uses (Portainer, k8s dashboard, ttyd). In Go
 it's a small read/write-loop bridge over the Docker SDK's hijacked stream and `gorilla/websocket`.
 
+*Framing & resize.* Raw terminal bytes ride **binary** WebSocket messages in both directions —
+that is the whole protocol for a client that never resizes, so pre-resize clients are unchanged.
+Terminal resize is layered on as an optional out-of-band control channel: the client sends a
+**text** message carrying a small JSON control frame `{"type":"resize","rows":<n>,"cols":<n>}`,
+and Wisp forwards the new window size to the exec's TTY via Docker's `ContainerExecResize` instead
+of writing it to stdin. A text message that is not a recognized control frame is still written to
+stdin verbatim, so the addition is fully backward compatible (no resize sent ⇒ current behavior).
+
 ### Concurrency example (the motivating use case)
 
 A satellite runs a coding session on the **streaming** exec and watches how long the response text

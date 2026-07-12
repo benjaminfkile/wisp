@@ -18,6 +18,10 @@ type FakeContainer struct {
 	// Execs is the ordered list of commands run against this container via
 	// ExecSync or ExecStream.
 	Execs [][]string
+	// Resizes is the ordered list of {rows, cols} TTY dimensions forwarded to
+	// the interactive shell via ShellStream.Resize, so tests can assert that a
+	// client's resize control reached the runtime.
+	Resizes [][2]uint16
 }
 
 // ExecFunc lets a test define how the Fake responds to an exec. It receives the
@@ -199,7 +203,7 @@ func (f *Fake) ExecStream(ctx context.Context, id string, cmd []string, emit fun
 // (started, not killed). The configured ShellHandler produces the duplex
 // stream; with no handler it returns a stream that reports EOF on read and
 // discards writes.
-func (f *Fake) ExecShell(ctx context.Context, id string, cmd []string) (io.ReadWriteCloser, error) {
+func (f *Fake) ExecShell(ctx context.Context, id string, cmd []string) (ShellStream, error) {
 	f.mu.Lock()
 	c, ok := f.containers[id]
 	if !ok {
@@ -214,13 +218,56 @@ func (f *Fake) ExecShell(ctx context.Context, id string, cmd []string) (io.ReadW
 	handler := f.ShellHandler
 	f.mu.Unlock()
 
-	if handler == nil {
-		return nopStream{}, nil
+	var inner io.ReadWriteCloser = nopStream{}
+	if handler != nil {
+		s, err := handler(id, cmd)
+		if err != nil {
+			return nil, err
+		}
+		inner = s
 	}
-	return handler(id, cmd)
+	// Wrap the handler's duplex stream so the Fake can satisfy ShellStream and
+	// record any forwarded resizes against the container (under the lock) for
+	// test assertions. The ShellFunc contract stays a plain io.ReadWriteCloser.
+	return &fakeShellStream{ReadWriteCloser: inner, onResize: func(rows, cols uint16) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if c, ok := f.containers[id]; ok {
+			c.Resizes = append(c.Resizes, [2]uint16{rows, cols})
+		}
+	}}, nil
 }
 
-// nopStream is the default duplex stream returned by ExecShell when no
+// Resizes returns a copy of the {rows, cols} dimensions forwarded to the given
+// container's shell via ShellStream.Resize, in call order. It is safe to call
+// concurrently with an active shell bridge.
+func (f *Fake) Resizes(id string) [][2]uint16 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.containers[id]
+	if !ok {
+		return nil
+	}
+	out := make([][2]uint16, len(c.Resizes))
+	copy(out, c.Resizes)
+	return out
+}
+
+// fakeShellStream adapts a ShellFunc's io.ReadWriteCloser into a ShellStream,
+// recording resizes via onResize while delegating the byte streams unchanged.
+type fakeShellStream struct {
+	io.ReadWriteCloser
+	onResize func(rows, cols uint16)
+}
+
+func (s *fakeShellStream) Resize(ctx context.Context, rows, cols uint16) error {
+	if s.onResize != nil {
+		s.onResize(rows, cols)
+	}
+	return nil
+}
+
+// nopStream is the default duplex stream wrapped by ExecShell when no
 // ShellHandler is set: reads report EOF immediately and writes are discarded.
 type nopStream struct{}
 

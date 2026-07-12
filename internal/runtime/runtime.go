@@ -133,8 +133,20 @@ type Runtime interface {
 	// and Close tears the exec down. Because the exec has a TTY, the output is a
 	// single raw stream (not the multiplexed stdout/stderr of ExecSync), exactly
 	// what a terminal expects. The stream bridges directly onto an interactive
-	// WebSocket; see server's shell endpoint.
-	ExecShell(ctx context.Context, id string, cmd []string) (io.ReadWriteCloser, error)
+	// WebSocket; see server's shell endpoint. Resize adjusts the TTY window so a
+	// client can forward terminal resize events.
+	ExecShell(ctx context.Context, id string, cmd []string) (ShellStream, error)
+}
+
+// ShellStream is the duplex byte stream of an interactive shell exec (see
+// ExecShell). Beyond the raw read/write/close of the TTY it exposes Resize so a
+// caller can adjust the pseudo-terminal's window size in response to a client's
+// terminal resize; rows and cols are in character cells and a zero dimension is
+// left unchanged. Resize is a no-op-safe control channel: it is independent of
+// the byte streams and may be called concurrently with reads and writes.
+type ShellStream interface {
+	io.ReadWriteCloser
+	Resize(ctx context.Context, rows, cols uint16) error
 }
 
 // Ensure both implementations satisfy the interface at compile time.

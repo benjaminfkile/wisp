@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -17,17 +18,28 @@ import (
 // bridge reads container output from reads and writes shell stdin into wrote; no
 // Docker daemon is involved.
 type fakeDuplex struct {
-	reads  chan []byte   // test → bridge: bytes the shell "produces"
-	wrote  chan []byte   // bridge → test: bytes sent to the shell's stdin
-	closed chan struct{} // closed by Close, unblocking a pending Read
-	once   sync.Once
+	reads   chan []byte    // test → bridge: bytes the shell "produces"
+	wrote   chan []byte    // bridge → test: bytes sent to the shell's stdin
+	resizes chan [2]uint16 // bridge → test: {rows, cols} forwarded via Resize
+	closed  chan struct{}  // closed by Close, unblocking a pending Read
+	once    sync.Once
 }
 
 func newFakeDuplex() *fakeDuplex {
 	return &fakeDuplex{
-		reads:  make(chan []byte),
-		wrote:  make(chan []byte, 16),
-		closed: make(chan struct{}),
+		reads:   make(chan []byte),
+		wrote:   make(chan []byte, 16),
+		resizes: make(chan [2]uint16, 16),
+		closed:  make(chan struct{}),
+	}
+}
+
+func (s *fakeDuplex) Resize(_ context.Context, rows, cols uint16) error {
+	select {
+	case s.resizes <- [2]uint16{rows, cols}:
+		return nil
+	case <-s.closed:
+		return io.ErrClosedPipe
 	}
 }
 
@@ -57,7 +69,8 @@ func (s *fakeDuplex) Close() error {
 
 // fakeWS is an in-memory stand-in for the WebSocket side of the bridge.
 type fakeWS struct {
-	reads   chan []byte   // test → bridge: client keystrokes
+	reads   chan []byte   // test → bridge: client keystrokes (binary messages)
+	texts   chan []byte   // test → bridge: client text messages (control frames)
 	written chan []byte   // bridge → test: bytes delivered to the client
 	closed  chan struct{} // closed by Close, unblocking a pending ReadMessage
 	once    sync.Once
@@ -66,6 +79,7 @@ type fakeWS struct {
 func newFakeWS() *fakeWS {
 	return &fakeWS{
 		reads:   make(chan []byte),
+		texts:   make(chan []byte),
 		written: make(chan []byte, 16),
 		closed:  make(chan struct{}),
 	}
@@ -78,6 +92,11 @@ func (w *fakeWS) ReadMessage() (int, []byte, error) {
 			return 0, nil, io.EOF
 		}
 		return websocket.BinaryMessage, b, nil
+	case b, ok := <-w.texts:
+		if !ok {
+			return 0, nil, io.EOF
+		}
+		return websocket.TextMessage, b, nil
 	case <-w.closed:
 		return 0, nil, io.EOF
 	}
@@ -106,7 +125,7 @@ func TestShellBridgePumpsBothDirections(t *testing.T) {
 	stream := newFakeDuplex()
 
 	done := make(chan error, 1)
-	go func() { done <- shellBridge(ws, stream) }()
+	go func() { done <- shellBridge(context.Background(), ws, stream) }()
 
 	// Shell output → client.
 	stream.reads <- []byte("motd\n")
@@ -149,6 +168,66 @@ func TestShellBridgePumpsBothDirections(t *testing.T) {
 	}
 }
 
+// TestShellBridgeResizeControlFrame checks the resize control channel: a text
+// message carrying a resize control frame is forwarded to the stream's Resize
+// (not written to stdin), while an unrecognized text message and binary
+// messages still flow to stdin as raw bytes — the backward-compatible path.
+func TestShellBridgeResizeControlFrame(t *testing.T) {
+	ws := newFakeWS()
+	stream := newFakeDuplex()
+
+	done := make(chan error, 1)
+	go func() { done <- shellBridge(context.Background(), ws, stream) }()
+
+	// A resize control frame → stream.Resize, not stdin.
+	ws.texts <- []byte(`{"type":"resize","rows":40,"cols":120}`)
+	select {
+	case got := <-stream.resizes:
+		if got != [2]uint16{40, 120} {
+			t.Fatalf("resize got %v, want {40 120}", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for resize to reach the stream")
+	}
+
+	// A text message that is not a control frame falls through to stdin,
+	// preserving the pre-resize behavior for raw text keystrokes.
+	ws.texts <- []byte("plain text\n")
+	select {
+	case got := <-stream.wrote:
+		if string(got) != "plain text\n" {
+			t.Fatalf("stdin got %q, want %q", got, "plain text\n")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for non-control text to reach stdin")
+	}
+
+	// Binary input is unaffected: it still reaches stdin verbatim.
+	ws.reads <- []byte("echo hi\n")
+	select {
+	case got := <-stream.wrote:
+		if string(got) != "echo hi\n" {
+			t.Fatalf("stdin got %q, want %q", got, "echo hi\n")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for binary input to reach stdin")
+	}
+
+	// A resize must not appear on the stdin stream.
+	select {
+	case got := <-stream.wrote:
+		t.Fatalf("resize control frame leaked to stdin as %q", got)
+	default:
+	}
+
+	stream.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("bridge did not return after stream close")
+	}
+}
+
 // TestShellHandshakeRequiresToken checks the pre-upgrade token gate directly:
 // a handshake without a valid contract token is rejected before any upgrade.
 func TestShellHandshakeRequiresToken(t *testing.T) {
@@ -182,7 +261,9 @@ func TestShellEndToEnd(t *testing.T) {
 
 	containerEnd, testEnd := net.Pipe()
 	defer testEnd.Close()
+	var containerID string
 	fake.ShellHandler = func(id string, cmd []string) (io.ReadWriteCloser, error) {
+		containerID = id
 		return containerEnd, nil
 	}
 
@@ -227,5 +308,24 @@ func TestShellEndToEnd(t *testing.T) {
 	}
 	if string(buf) != "id\n" {
 		t.Fatalf("shell stdin got %q, want %q", buf, "id\n")
+	}
+
+	// A resize control frame (a text message) reaches the runtime's TTY resize
+	// and does not leak into stdin. The fake records forwarded resizes on the
+	// container; poll briefly since the bridge processes the frame async.
+	if err := conn.WriteMessage(websocket.TextMessage,
+		[]byte(`{"type":"resize","rows":50,"cols":132}`)); err != nil {
+		t.Fatalf("write resize control frame: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var resizes [][2]uint16
+	for time.Now().Before(deadline) {
+		if resizes = fake.Resizes(containerID); len(resizes) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(resizes) != 1 || resizes[0] != [2]uint16{50, 132} {
+		t.Fatalf("recorded resizes = %v, want [{50 132}]", resizes)
 	}
 }

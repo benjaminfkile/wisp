@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -31,6 +33,41 @@ type wsConn interface {
 	WriteMessage(messageType int, data []byte) error
 	// Close tears down the connection, unblocking a pending ReadMessage.
 	Close() error
+}
+
+// shellStream is the container-side duplex stream the bridge drives: raw byte
+// I/O plus a TTY resize. It mirrors runtime.ShellStream but is declared locally
+// so the bridge logic stays testable against a fake stream with no daemon.
+type shellStream interface {
+	io.ReadWriteCloser
+	Resize(ctx context.Context, rows, cols uint16) error
+}
+
+// shellControl is a client→server control frame sent as a WebSocket *text*
+// message, distinguishing it from the raw keystroke bytes that ride binary
+// messages. Only "resize" is defined; it carries the new TTY dimensions in
+// character cells. Text messages that are not a recognized control frame fall
+// through to the shell's stdin, so pre-resize clients (which send only binary
+// messages, or occasional text keystrokes) keep their exact old behavior.
+type shellControl struct {
+	Type string `json:"type"`
+	Rows uint16 `json:"rows"`
+	Cols uint16 `json:"cols"`
+}
+
+// parseShellControl decodes a WebSocket text frame as a shell control message.
+// It reports ok only when data is a JSON object carrying a recognized control
+// type; anything else (non-JSON, unknown type) is treated as raw stdin bytes by
+// the caller, preserving backward compatibility.
+func parseShellControl(data []byte) (shellControl, bool) {
+	var ctrl shellControl
+	if err := json.Unmarshal(data, &ctrl); err != nil {
+		return shellControl{}, false
+	}
+	if ctrl.Type != "resize" {
+		return shellControl{}, false
+	}
+	return ctrl, true
 }
 
 // shell handles WS /contracts/:id/shell: it upgrades the connection to a
@@ -81,7 +118,7 @@ func (b *broker) shell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := shellBridge(conn, stream); err != nil &&
+	if err := shellBridge(r.Context(), conn, stream); err != nil &&
 		!errors.Is(err, io.EOF) && !websocket.IsCloseError(err,
 		websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 		b.logger.Info("shell bridge closed", "contract_id", c.ID, "error", err)
@@ -94,10 +131,17 @@ func (b *broker) shell(w http.ResponseWriter, r *http.Request) {
 // or errors, then tears both ends down (so the surviving pump unblocks) and
 // returns the first error observed.
 //
+// Client binary messages are forwarded verbatim to the shell's stdin. A client
+// text message that decodes as a shell control frame (currently only "resize")
+// is handled out of band — a resize forwards the new dimensions to the TTY via
+// stream.Resize instead of being written to stdin. Any text message that is not
+// a recognized control frame is still written to stdin, so a client that never
+// sends a control frame behaves exactly as before. ctx scopes the resize calls.
+//
 // It deliberately takes interfaces, not the concrete gorilla/Docker types, so
 // its read/write-loop logic is unit-testable against a fake duplex stream and a
 // fake WebSocket with no Docker daemon.
-func shellBridge(ws wsConn, stream io.ReadWriteCloser) error {
+func shellBridge(ctx context.Context, ws wsConn, stream shellStream) error {
 	errc := make(chan error, 2)
 
 	// Shell output → client.
@@ -118,10 +162,24 @@ func shellBridge(ws wsConn, stream io.ReadWriteCloser) error {
 		}
 	}()
 
-	// Client input → shell stdin.
+	// Client input → shell stdin (with out-of-band resize control frames).
 	go func() {
 		for {
-			_, data, err := ws.ReadMessage()
+			mt, data, err := ws.ReadMessage()
+			if mt == websocket.TextMessage {
+				if ctrl, ok := parseShellControl(data); ok {
+					// A resize is out of band: forward the new TTY window size
+					// and do not write the control frame to stdin. A resize
+					// failure (e.g. the exec already gone) must not tear down a
+					// working byte stream, so the error is intentionally dropped.
+					_ = stream.Resize(ctx, ctrl.Rows, ctrl.Cols)
+					if err != nil {
+						errc <- err
+						return
+					}
+					continue
+				}
+			}
 			if len(data) > 0 {
 				if _, werr := stream.Write(data); werr != nil {
 					errc <- werr

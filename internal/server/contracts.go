@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -107,7 +108,23 @@ type createRequest struct {
 	Resources  resourcesRequest `json:"resources"`
 	Userdata   string           `json:"userdata"`
 	Meta       map[string]any   `json:"meta"`
+
+	// Env is an optional, opaque KEY->VALUE map injected as the container's
+	// environment (see docs/DESIGN.md §8). Wisp is domain-blind about its
+	// contents; it just carries them into Config.Env so every exec/shell
+	// inherits them. It is WRITE-ONLY: never echoed on GET status, never logged.
+	Env map[string]string `json:"env"`
 }
+
+// Env injection limits. These cap the blast radius of the opaque env map so a
+// create call cannot smuggle an unbounded environment into a container.
+const (
+	// maxEnvEntries caps the number of KEY=VALUE pairs a create may inject.
+	maxEnvEntries = 128
+	// maxEnvTotalBytes caps the total size of the injected environment,
+	// summed over "KEY=VALUE" for every entry.
+	maxEnvTotalBytes = 256 * 1024
+)
 
 // createResponse is returned on a successful create.
 type createResponse struct {
@@ -133,6 +150,9 @@ type launchSpec struct {
 	memoryMB int
 	pids     int
 	network  string
+	// env is the validated, KEY=VALUE-form environment injected into the
+	// container's Config.Env; nil when the create carried no env.
+	env []string
 }
 
 // create handles POST /contracts: it validates the requested image and network
@@ -173,6 +193,15 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate and convert the optional env map before recording anything, so a
+	// malformed env is a clean 400 with no contract created. Values are never
+	// echoed in the error.
+	env, err := envList(req.Env)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	// The policy caps the contract: the requested TTL and resources are clamped
 	// down to any configured maximum (see docs/DESIGN.md §7).
 	ttl := b.pol.ClampTTL(time.Duration(req.TTLSeconds) * time.Second)
@@ -182,6 +211,7 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		memoryMB: b.pol.ClampMemoryMB(req.Resources.MemoryMB),
 		pids:     b.pol.ClampPids(req.Resources.Pids),
 		network:  network,
+		env:      env,
 	}
 
 	c, err := b.store.Create(contract.CreateParams{
@@ -570,6 +600,45 @@ func (b *broker) statusOf(c contract.Contract) statusResponse {
 // SIGTERM, so release / `docker stop` reaps the container promptly.
 var keepAliveCmd = []string{"tail", "-f", "/dev/null"}
 
+// envList converts the opaque create-time env map into Docker's []string
+// "KEY=VALUE" form after light validation. A nil/empty map yields a nil slice
+// so a create without env is byte-for-byte unchanged. Keys must be non-empty
+// and free of '=' and NUL; the entry count and total size are capped. The
+// returned slice is sorted by key for deterministic output. Validation errors
+// carry a client-facing message suitable for a 400 and never include env values.
+func envList(m map[string]string) ([]string, error) {
+	if len(m) == 0 {
+		return nil, nil
+	}
+	if len(m) > maxEnvEntries {
+		return nil, fmt.Errorf("env has too many entries (max %d)", maxEnvEntries)
+	}
+	keys := make([]string, 0, len(m))
+	total := 0
+	for k, v := range m {
+		if k == "" {
+			return nil, errors.New("env key must not be empty")
+		}
+		if strings.ContainsAny(k, "=\x00") {
+			return nil, errors.New("env key must not contain '=' or NUL")
+		}
+		if strings.IndexByte(v, 0) >= 0 {
+			return nil, errors.New("env value must not contain NUL")
+		}
+		total += len(k) + 1 + len(v) // KEY=VALUE
+		keys = append(keys, k)
+	}
+	if total > maxEnvTotalBytes {
+		return nil, fmt.Errorf("env too large (max %d bytes)", maxEnvTotalBytes)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k+"="+m[k])
+	}
+	return out, nil
+}
+
 // createOptions translates a resolved launch spec into the runtime's
 // CreateOptions: the resource caps and network policy applied to the container,
 // plus the label correlating it back to its contract. It always sets the
@@ -580,6 +649,9 @@ func createOptions(spec launchSpec, contractID string) runtime.CreateOptions {
 		// Run the keep-alive as the container's main process so it stays up for
 		// the whole contract; all real work happens via exec/shell (see keepAliveCmd).
 		Cmd: keepAliveCmd,
+		// Env is set on Config.Env at container create, so every subsequent
+		// docker exec (sync, streaming, and the shell PTY) inherits it.
+		Env: spec.env,
 		Resources: runtime.Resources{
 			NanoCPUs:    int64(spec.cpus * 1e9),
 			MemoryBytes: int64(spec.memoryMB) * bytesPerMB,

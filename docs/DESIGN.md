@@ -193,6 +193,14 @@ never part of Wisp.
   inner, cross-app surface.
 - The operator config (image allow-list + limits) caps blast radius (image, network, TTL,
   resources) per contract; `GET /images` is the one unauthenticated discovery endpoint.
+- **Create-time `env` injection** — `POST /contracts` accepts an optional, opaque `KEY->VALUE`
+  `env` map that becomes the container's `Config.Env` (inherited by every exec/shell). It is
+  write-only: never returned on `GET /contracts/:id` and never logged.
+  - **TODO (harden):** lease `env` is currently passed as plaintext container environment
+    (visible via `docker inspect` and to anything that can read the container config). A future
+    task should deliver secret env via a tmpfs-backed file fed on the create call's stdin —
+    mirroring grunt's secret-injection pattern — so secret values never appear in `docker inspect`
+    or logs. v1 is plaintext, intended for local/trusted use only.
 
 ## 9. Architecture & stack
 

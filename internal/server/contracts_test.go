@@ -431,6 +431,94 @@ func TestCreateBootsAndReturns(t *testing.T) {
 	}
 }
 
+func TestCreateWithEnvReachesContainerAndExec(t *testing.T) {
+	h, store, fake := testServer(t)
+
+	created := createContract(t, h,
+		`{"ttl_seconds":3600,"env":{"CLAUDE_CODE_OAUTH_TOKEN":"abc","FOO":"bar"}}`)
+
+	c, _ := store.Get(created.ContractID)
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	// The env map reached the container's Config.Env in KEY=VALUE form (sorted).
+	want := []string{"CLAUDE_CODE_OAUTH_TOKEN=abc", "FOO=bar"}
+	if len(fc.Opts.Env) != len(want) {
+		t.Fatalf("Config.Env = %v, want %v", fc.Opts.Env, want)
+	}
+	for i, w := range want {
+		if fc.Opts.Env[i] != w {
+			t.Errorf("Config.Env[%d] = %q, want %q", i, fc.Opts.Env[i], w)
+		}
+	}
+
+	// docker exec inherits the container's Config.Env, so an exec after create
+	// sees the same variables. The fake records what the container was created
+	// with; assert the exec runs against that same container.
+	rec := doAuth(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec",
+		created.Token, `{"command":"env"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("exec status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	fc, _ = fake.Container(c.ContainerID)
+	if len(fc.Opts.Env) != len(want) {
+		t.Errorf("Config.Env after exec = %v, want %v (exec inherits it)", fc.Opts.Env, want)
+	}
+	if len(fc.Execs) == 0 {
+		t.Fatal("exec was not recorded against the env-carrying container")
+	}
+}
+
+func TestCreateWithoutEnvLeavesConfigEnvNil(t *testing.T) {
+	h, store, fake := testServer(t)
+
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+	c, _ := store.Get(created.ContractID)
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	if fc.Opts.Env != nil {
+		t.Errorf("Config.Env = %v, want nil when no env requested", fc.Opts.Env)
+	}
+}
+
+func TestCreateEnvNotEchoedOnStatus(t *testing.T) {
+	h, _, _ := testServer(t)
+	created := createContract(t, h,
+		`{"ttl_seconds":60,"env":{"SECRET":"do-not-leak"}}`)
+
+	rec := do(t, h, http.MethodGet, "/contracts/"+created.ContractID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200", rec.Code)
+	}
+	// env is write-only: it must not appear anywhere in the status response.
+	if body := rec.Body.String(); strings.Contains(body, "SECRET") || strings.Contains(body, "do-not-leak") || strings.Contains(body, "env") {
+		t.Errorf("status response leaked env: %s", body)
+	}
+}
+
+func TestCreateInvalidEnv(t *testing.T) {
+	h, store, _ := testServer(t)
+	bad := []string{
+		`{"ttl_seconds":60,"env":{"":"v"}}`,        // empty key
+		`{"ttl_seconds":60,"env":{"A=B":"v"}}`,     // '=' in key
+		`{"ttl_seconds":60,"env":{"A\u0000B":"v"}}`, // NUL in key
+		`{"ttl_seconds":60,"env":{"A":"v\u0000w"}}`,  // NUL in value
+	}
+	for _, body := range bad {
+		rec := do(t, h, http.MethodPost, "/contracts", body)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("POST %s status = %d, want 400", body, rec.Code)
+		}
+	}
+	// Rejected env creates no contract.
+	if n := len(store.List()); n != 0 {
+		t.Errorf("stored contracts = %d, want 0 after rejected env", n)
+	}
+}
+
 func TestGetReflectsState(t *testing.T) {
 	h, _, _ := testServer(t)
 

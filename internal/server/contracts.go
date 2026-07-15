@@ -307,7 +307,7 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, spec launch
 	}
 
 	if userdata != "" {
-		res, err := b.rt.ExecSync(ctx, cid, []string{"/bin/sh", "-c", userdata})
+		res, err := b.rt.ExecSync(ctx, cid, runtime.ShellCommand(b.rt.ContainerOS(), userdata))
 		if err != nil {
 			b.fail(ctx, c.ID, cid)
 			return c, err
@@ -443,10 +443,11 @@ type execStreamExit struct {
 // (see execStream), so a caller can watch a long-running command's output as it
 // is produced.
 //
-// Each exec is a fresh process: Wisp runs the command with a new `/bin/sh -c`
-// invocation, so there is no shared cwd or environment between calls (see
-// docs/DESIGN.md §5, "Each exec is a fresh process"). Clients that need state to
-// persist across steps send a single compound command.
+// Each exec is a fresh process: Wisp runs the command through a new OS-shell
+// invocation (`/bin/sh -c` on Linux, `cmd /c` on a Windows daemon; see
+// runtime.ShellCommand), so there is no shared cwd or environment between calls
+// (see docs/DESIGN.md §5, "Each exec is a fresh process"). Clients that need
+// state to persist across steps send a single compound command.
 //
 // The call requires the contract's bearer token (Authorization: Bearer <token>)
 // and rejects execs against a contract that is not ready (409), unknown (404),
@@ -488,7 +489,7 @@ func (b *broker) exec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := b.rt.ExecSync(r.Context(), c.ContainerID, []string{"/bin/sh", "-c", req.Command})
+	res, err := b.rt.ExecSync(r.Context(), c.ContainerID, runtime.ShellCommand(b.rt.ContainerOS(), req.Command))
 	if err != nil {
 		b.logger.Error("exec in container", "contract_id", c.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "exec failed")
@@ -537,7 +538,7 @@ func (b *broker) execStream(w http.ResponseWriter, r *http.Request, c contract.C
 		return nil
 	}
 
-	exitCode, err := b.rt.ExecStream(r.Context(), c.ContainerID, []string{"/bin/sh", "-c", command}, emit)
+	exitCode, err := b.rt.ExecStream(r.Context(), c.ContainerID, runtime.ShellCommand(b.rt.ContainerOS(), command), emit)
 	if err != nil {
 		b.logger.Error("stream exec in container", "contract_id", c.ID, "error", err)
 		_ = writeSSE(w, "error", map[string]string{"error": "exec failed"})

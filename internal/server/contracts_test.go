@@ -104,6 +104,58 @@ func TestExecReturnsResult(t *testing.T) {
 	}
 }
 
+// A sync exec against a Windows-mode runtime must wrap the command with the
+// Windows command processor (`cmd /c <cmd>`) rather than the POSIX `/bin/sh -c`,
+// since a Windows container has no /bin/sh. Uses the fake runtime with a stubbed
+// OS — no real Windows Docker daemon.
+func TestExecWrapsCommandForWindows(t *testing.T) {
+	h, store, fake := testServer(t)
+	fake.OS = runtime.OSWindows
+
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	rec := doAuth(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec",
+		created.Token, `{"command":"dir"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	c, _ := store.Get(created.ContractID)
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatalf("container not tracked")
+	}
+	last := fc.Execs[len(fc.Execs)-1]
+	if len(last) != 3 || last[0] != "cmd" || last[1] != "/c" || last[2] != "dir" {
+		t.Errorf("windows exec cmd = %v, want [cmd /c dir]", last)
+	}
+}
+
+// A streaming exec against a Windows-mode runtime must wrap the command with the
+// Windows command processor too, matching the sync path.
+func TestExecStreamWrapsCommandForWindows(t *testing.T) {
+	h, store, fake := testServer(t)
+	fake.OS = runtime.OSWindows
+
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	rec := doAuth(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec?stream=1",
+		created.Token, `{"command":"dir"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	c, _ := store.Get(created.ContractID)
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatalf("container not tracked")
+	}
+	last := fc.Execs[len(fc.Execs)-1]
+	if len(last) != 3 || last[0] != "cmd" || last[1] != "/c" || last[2] != "dir" {
+		t.Errorf("windows stream exec cmd = %v, want [cmd /c dir]", last)
+	}
+}
+
 // flushRecorder is a ResponseWriter that records a snapshot of the body written
 // so far on every Flush(), letting a test assert output was flushed
 // incrementally rather than all at once at the end.

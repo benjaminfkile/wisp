@@ -123,6 +123,36 @@ func IdleCommand(os ContainerOS) []string {
 	return []string{"tail", "-f", "/dev/null"}
 }
 
+// ShellCommand wraps a command string in the container OS's shell so a client's
+// single command (which may be a compound like `cd /repo && git diff`) runs
+// through a shell interpreter rather than being exec'd directly. On Linux it is
+// the historical `/bin/sh -c <cmd>`, byte-for-byte unchanged; a Windows-mode
+// daemon has no `/bin/sh`, so the command runs through the Windows command
+// processor (`cmd /c <cmd>`) instead. Callers pick the OS from the daemon's
+// detected ContainerOS (see DockerRuntime.ContainerOS) so every exec is
+// runnable on the daemon's OS.
+func ShellCommand(os ContainerOS, cmd string) []string {
+	if os == OSWindows {
+		return []string{"cmd", "/c", cmd}
+	}
+	return []string{"/bin/sh", "-c", cmd}
+}
+
+// DefaultShell returns the default interactive shell binary launched for a
+// container's PTY session, chosen for the container OS. On Linux it is
+// `/bin/sh`, byte-for-byte unchanged; a Windows-mode daemon has no `/bin/sh`,
+// so the interactive shell is `cmd.exe`, valid on the standard Windows base
+// images. Callers pick the OS from the daemon's detected ContainerOS (see
+// DockerRuntime.ContainerOS) so the interactive shell is always runnable on the
+// daemon's OS. The exec is created with a TTY (see ExecShell), which Windows
+// containers support alongside the hijacked attach.
+func DefaultShell(os ContainerOS) []string {
+	if os == OSWindows {
+		return []string{"cmd.exe"}
+	}
+	return []string{"/bin/sh"}
+}
+
 // Create implements Runtime.
 func (d *DockerRuntime) Create(ctx context.Context, image string, opts CreateOptions) (string, error) {
 	cfg := &container.Config{

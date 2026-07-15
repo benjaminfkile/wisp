@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/benjaminfkile/wisp/internal/contract"
+	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
 // shellUpgrader upgrades the shell endpoint's HTTP handshake to a WebSocket.
@@ -103,7 +104,7 @@ func (b *broker) shell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stream, err := b.rt.ExecShell(r.Context(), c.ContainerID, []string{"/bin/sh"})
+	stream, err := b.rt.ExecShell(r.Context(), c.ContainerID, runtime.DefaultShell(b.rt.ContainerOS()))
 	if err != nil {
 		b.logger.Error("open shell in container", "contract_id", c.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "could not open shell")

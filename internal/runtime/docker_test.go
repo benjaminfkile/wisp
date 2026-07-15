@@ -3,11 +3,36 @@ package runtime
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/client"
 )
+
+// TestIdleCommand verifies the keep-alive command is chosen for the container
+// OS: Linux keeps the historical `tail -f /dev/null` byte-for-byte (that binary
+// only exists on Linux), and Windows gets a Windows-runnable idle command.
+func TestIdleCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		os   ContainerOS
+		want []string
+	}{
+		{"linux", OSLinux, []string{"tail", "-f", "/dev/null"}},
+		{"windows", OSWindows, []string{"cmd", "/c", "ping -t localhost >NUL"}},
+		// An unset/unknown OS falls back to the Linux command, matching the
+		// daemon-default that ContainerOS detection also falls back to.
+		{"unset falls back to linux", ContainerOS(""), []string{"tail", "-f", "/dev/null"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IdleCommand(tt.os); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("IdleCommand(%q) = %v, want %v", tt.os, got, tt.want)
+			}
+		})
+	}
+}
 
 // infoStubClient embeds the full Docker APIClient interface (left nil) and
 // overrides only Info, so a test can drive DockerRuntime's OS detection without

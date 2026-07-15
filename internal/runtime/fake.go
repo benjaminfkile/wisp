@@ -74,11 +74,28 @@ type Fake struct {
 	StartErr       error
 	KillErr        error
 	EnsureImageErr error
+
+	// OS is the container OS mode reported by ContainerOS. The zero value ("")
+	// is treated as OSLinux, so a freshly constructed Fake defaults to linux;
+	// tests set it to OSWindows to exercise Windows-container paths.
+	OS ContainerOS
 }
 
-// NewFake returns an initialized Fake runtime.
+// NewFake returns an initialized Fake runtime. It reports OSLinux by default;
+// set OS to OSWindows to have it report a Windows daemon.
 func NewFake() *Fake {
-	return &Fake{containers: make(map[string]*FakeContainer)}
+	return &Fake{containers: make(map[string]*FakeContainer), OS: OSLinux}
+}
+
+// ContainerOS implements Runtime, reporting the configured OS. An unset (empty)
+// OS is reported as OSLinux so the zero-value Fake defaults to linux.
+func (f *Fake) ContainerOS() ContainerOS {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.OS == "" {
+		return OSLinux
+	}
+	return f.OS
 }
 
 // lazyInit ensures the container map exists so the zero value is usable.

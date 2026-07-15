@@ -17,6 +17,11 @@ import (
 // therefore never exercised by the unit tests, which use Fake instead.
 type DockerRuntime struct {
 	cli client.APIClient
+
+	// containerOS is the daemon's container OS mode, detected once at
+	// construction (and re-detected on reconnect). The daemon never switches
+	// modes at runtime, so a cached value stays correct for the runtime's life.
+	containerOS ContainerOS
 }
 
 // NewDockerRuntime constructs a DockerRuntime using the ambient Docker
@@ -26,13 +31,39 @@ func NewDockerRuntime() (*DockerRuntime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("runtime: docker client: %w", err)
 	}
-	return &DockerRuntime{cli: cli}, nil
+	d := &DockerRuntime{cli: cli}
+	d.detectContainerOS(context.Background())
+	return d, nil
 }
 
 // NewDockerRuntimeWithClient wraps a pre-built Docker API client. It exists so
 // callers (and tests that supply a stub client) can inject their own client.
 func NewDockerRuntimeWithClient(cli client.APIClient) *DockerRuntime {
-	return &DockerRuntime{cli: cli}
+	d := &DockerRuntime{cli: cli}
+	d.detectContainerOS(context.Background())
+	return d
+}
+
+// detectContainerOS queries the daemon for its container OS mode via Info and
+// caches it. Call it once at construction and again if the runtime reconnects
+// its client. Detection is best-effort: if Info fails or reports an unknown
+// OSType, the runtime falls back to OSLinux, the Docker default. It never
+// switches the daemon's mode — the operator owns that.
+func (d *DockerRuntime) detectContainerOS(ctx context.Context) {
+	d.containerOS = OSLinux
+	info, err := d.cli.Info(ctx)
+	if err != nil {
+		return
+	}
+	if ContainerOS(info.OSType) == OSWindows {
+		d.containerOS = OSWindows
+	}
+}
+
+// ContainerOS implements Runtime, returning the daemon's detected container OS
+// mode ("linux" or "windows").
+func (d *DockerRuntime) ContainerOS() ContainerOS {
+	return d.containerOS
 }
 
 // Close releases the underlying Docker client resources.

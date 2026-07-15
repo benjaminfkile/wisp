@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1063,6 +1064,34 @@ func TestCreateImageOSMismatch(t *testing.T) {
 	}
 	// No container survives and the contract is marked expired (no mode switching,
 	// just a failed create).
+	if n := fake.Count(); n != 0 {
+		t.Errorf("live containers = %d, want 0 after mismatch", n)
+	}
+	all := store.List()
+	if len(all) != 1 || all[0].State != contract.StateExpired {
+		t.Errorf("contract state = %v, want a single expired contract", all)
+	}
+}
+
+// The most common real mismatch surfaces on the on-demand pull path, not
+// ContainerCreate: the modern daemon rejects an incompatible registry image at
+// pull time with "no matching manifest ... in the manifest list entries",
+// arriving wrapped as `runtime: pull image <name>: Error response from daemon:
+// ...`. That wrapped chain must still map to the clear 400, not a generic 500.
+func TestCreateImageOSMismatchOnPull(t *testing.T) {
+	h, store, fake := testServer(t)
+	fake.EnsureImageErr = fmt.Errorf("runtime: pull image ghcr.io/x/y: %w",
+		errors.New(`Error response from daemon: no matching manifest for windows(10.0.26200)/amd64 in the manifest list entries`))
+
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "this host is in linux container mode") || !strings.Contains(body, "not compatible") {
+		t.Errorf("error body = %q, want the clear OS-mismatch message", body)
+	}
+	// The pull never produced a container, and the contract is marked expired.
 	if n := fake.Count(); n != 0 {
 		t.Errorf("live containers = %d, want 0 after mismatch", n)
 	}

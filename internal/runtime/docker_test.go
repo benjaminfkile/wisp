@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -130,8 +131,21 @@ func TestIsImageOSMismatch(t *testing.T) {
 		{"linux on windows", errors.New(`image operating system "linux" cannot be used on this platform`), true},
 		{"uppercased", errors.New(`Image Operating System "windows" Cannot Be Used On This Platform`), true},
 		{"operating-system/platform shape", errors.New("the container operating system does not match the host platform"), true},
+		// The modern daemon rejects a Linux-only image on a windows-mode host at
+		// pull time with this "no matching manifest ... manifest list entries"
+		// shape (the exact message observed on a 4.61-era Docker Desktop).
+		{"no matching manifest windows", errors.New(`no matching manifest for windows(10.0.26200)/amd64 in the manifest list entries`), true},
+		// The linux-mode equivalent (a windows/arm image on a linux host) matches too.
+		{"no matching manifest linux", errors.New(`no matching manifest for linux/amd64 in the manifest list entries`), true},
+		// The wrapped chain the pull path actually produces still matches, since
+		// the matcher is substring-based on err.Error().
+		{"no matching manifest wrapped", fmt.Errorf("runtime: pull image ghcr.io/x/y: %w", errors.New(`Error response from daemon: no matching manifest for windows(10.0.26200)/amd64 in the manifest list entries`)), true},
 		{"unrelated", errors.New("runtime: create container: no such image"), false},
-		{"pull failure", errors.New("no matching manifest for linux/amd64"), false},
+		// "no matching manifest" WITHOUT the "manifest list entries" tail is not
+		// enough to classify as a mismatch, so this stays false.
+		{"partial no matching manifest", errors.New("no matching manifest for linux/amd64"), false},
+		{"pull access denied", errors.New("pull access denied for foo/bar, repository does not exist or may require authentication"), false},
+		{"no such image", errors.New("Error: No such image: foo:bar"), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

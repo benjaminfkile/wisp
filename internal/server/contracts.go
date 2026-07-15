@@ -374,10 +374,17 @@ func (e *userdataError) Error() string {
 	return "userdata script failed with exit code " + strconv.Itoa(e.ExitCode)
 }
 
-// imageOSMismatchError reports that the requested image's operating system is
-// incompatible with this host's container mode. os is the daemon's detected
-// container OS; the message names it so the client understands why the image was
-// rejected and that Wisp will not switch modes to run it.
+// imageOSMismatchError reports that the requested image is incompatible with
+// this host's container mode. os is the daemon's detected container OS; the
+// message names it so the client understands why the image was rejected and that
+// Wisp will not switch modes to run it.
+//
+// The daemon's "no matching manifest ... in the manifest list entries" rejection
+// (see runtime.IsImageOSMismatch) can also stem from an ARCHITECTURE mismatch —
+// e.g. an arm64-only image on an amd64 daemon — not strictly an OS mismatch, and
+// Wisp does not parse the OS out of the daemon message. The wording is kept
+// deliberately general ("not compatible") rather than claiming an OS-only cause,
+// so it stays honest for both the OS-mode and the architecture case.
 type imageOSMismatchError struct {
 	os runtime.ContainerOS
 }

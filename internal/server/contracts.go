@@ -292,7 +292,7 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, spec launch
 		return c, err
 	}
 
-	cid, err := b.rt.Create(ctx, spec.image, createOptions(spec, c.ID))
+	cid, err := b.rt.Create(ctx, spec.image, createOptions(spec, c.ID, b.rt.ContainerOS()))
 	if err != nil {
 		b.fail(ctx, c.ID, "")
 		return c, err
@@ -591,14 +591,20 @@ func (b *broker) statusOf(c contract.Contract) statusResponse {
 	}
 }
 
-// keepAliveCmd is the command Wisp runs as a container's main (PID 1) process.
-// A Wisp container is a persistent sandbox that clients drive via exec/shell for
-// the contract's lifetime — the main process does no work, it just blocks so the
-// container stays running. Without it, a bare base image's own default command
-// (e.g. Alpine's /bin/sh) exits immediately and the container stops before any
-// exec can attach, which surfaces as "container is not running". `tail` exits on
-// SIGTERM, so release / `docker stop` reaps the container promptly.
-var keepAliveCmd = []string{"tail", "-f", "/dev/null"}
+// keepAliveCmd returns the command Wisp runs as a container's main (PID 1)
+// process, chosen for the daemon's container OS. A Wisp container is a
+// persistent sandbox that clients drive via exec/shell for the contract's
+// lifetime — the main process does no work, it just blocks so the container
+// stays running. Without it, a bare base image's own default command (e.g.
+// Alpine's /bin/sh) exits immediately and the container stops before any exec
+// can attach, which surfaces as "container is not running". The Linux idle
+// command (`tail -f /dev/null`) only exists on Linux, so the runtime layer owns
+// the OS→command mapping (see runtime.IdleCommand); Windows containers get a
+// Windows-runnable idle command instead. Both terminate on SIGTERM/`docker
+// stop`, so release reaps the container promptly.
+func keepAliveCmd(os runtime.ContainerOS) []string {
+	return runtime.IdleCommand(os)
+}
 
 // envList converts the opaque create-time env map into Docker's []string
 // "KEY=VALUE" form after light validation. A nil/empty map yields a nil slice
@@ -642,13 +648,16 @@ func envList(m map[string]string) ([]string, error) {
 // createOptions translates a resolved launch spec into the runtime's
 // CreateOptions: the resource caps and network policy applied to the container,
 // plus the label correlating it back to its contract. It always sets the
-// keep-alive command so the container outlives its provisioning step.
-func createOptions(spec launchSpec, contractID string) runtime.CreateOptions {
+// keep-alive command — chosen for the daemon's container OS — so the container
+// outlives its provisioning step. WorkingDir, entrypoint, and user are left
+// unset so each OS uses its own container default (Linux the image default,
+// Windows C:\ with the image's user); no POSIX-only default is imposed.
+func createOptions(spec launchSpec, contractID string, os runtime.ContainerOS) runtime.CreateOptions {
 	opts := runtime.CreateOptions{
 		Labels: map[string]string{contractLabel: contractID},
 		// Run the keep-alive as the container's main process so it stays up for
 		// the whole contract; all real work happens via exec/shell (see keepAliveCmd).
-		Cmd: keepAliveCmd,
+		Cmd: keepAliveCmd(os),
 		// Env is set on Config.Env at container create, so every subsequent
 		// docker exec (sync, streaming, and the shell PTY) inherits it.
 		Env: spec.env,

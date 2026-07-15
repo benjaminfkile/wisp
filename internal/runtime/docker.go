@@ -102,6 +102,27 @@ func (d *DockerRuntime) EnsureImage(ctx context.Context, ref string) error {
 	return nil
 }
 
+// IdleCommand returns the no-op command Wisp runs as a leased container's main
+// (PID 1) process to keep it alive for the whole contract, chosen for the
+// container OS. A Wisp container does no work of its own — clients drive it via
+// exec/shell — so its main process just blocks; without it a bare base image's
+// default command exits and the container stops before any exec can attach.
+//
+// On Linux `tail -f /dev/null` blocks forever and exits on SIGTERM, so release
+// or `docker stop` reaps the container promptly; the `tail` executable only
+// exists on Linux. On a Windows-mode daemon that command is not runnable, so
+// Windows containers instead ping the loopback forever with output discarded
+// (`cmd /c ping -t localhost >NUL`), an idle process valid on the standard
+// Windows base images that likewise terminates on stop. Callers pick the
+// command from the daemon's detected ContainerOS (see DockerRuntime.ContainerOS)
+// so a leased container's main process is always runnable on the daemon's OS.
+func IdleCommand(os ContainerOS) []string {
+	if os == OSWindows {
+		return []string{"cmd", "/c", "ping -t localhost >NUL"}
+	}
+	return []string{"tail", "-f", "/dev/null"}
+}
+
 // Create implements Runtime.
 func (d *DockerRuntime) Create(ctx context.Context, image string, opts CreateOptions) (string, error) {
 	cfg := &container.Config{

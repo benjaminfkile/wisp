@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -151,6 +152,29 @@ func DefaultShell(os ContainerOS) []string {
 		return []string{"cmd.exe"}
 	}
 	return []string{"/bin/sh"}
+}
+
+// IsImageOSMismatch reports whether err is the Docker daemon rejecting an image
+// because its operating system does not match the daemon's container OS mode.
+// Wisp cannot reliably know an arbitrary image's OS before it tries to launch
+// it, so a create against an incompatible image is attempted and the daemon's
+// rejection is recognized here and mapped to a clear, OS-aware error rather than
+// a generic failure. The daemon phrases the rejection as e.g. `image operating
+// system "windows" cannot be used on this platform` (and the linux/windows
+// equivalent); the match is on the stable substrings of that message and is
+// case-insensitive. It never switches the daemon's mode — the operator owns
+// that; this only classifies the error. A nil error is never a mismatch.
+func IsImageOSMismatch(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "cannot be used on this platform") {
+		return true
+	}
+	// Some daemon/SDK versions phrase it as an operating-system/platform mismatch
+	// without the exact clause above; match that shape too.
+	return strings.Contains(msg, "operating system") && strings.Contains(msg, "platform")
 }
 
 // Create implements Runtime.

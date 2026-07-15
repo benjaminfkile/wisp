@@ -9,14 +9,16 @@ import (
 
 func TestDefaultConfig(t *testing.T) {
 	c := Default()
-	if len(c.Allow) != 1 || c.Allow[0] != baseImage {
-		t.Errorf("Allow = %v, want [%s]", c.Allow, baseImage)
+	// The built-in policy allows both base images so the same default serves a
+	// Linux or a Windows daemon; the Linux base is the configured default image.
+	if len(c.Allow) != 2 || c.Allow[0] != baseImage || c.Allow[1] != windowsBaseImage {
+		t.Errorf("Allow = %v, want [%s %s]", c.Allow, baseImage, windowsBaseImage)
 	}
 	if c.DefaultImage != baseImage {
 		t.Errorf("DefaultImage = %q, want %q", c.DefaultImage, baseImage)
 	}
-	if !c.AllowsImage(baseImage) {
-		t.Errorf("Default should allow %q", baseImage)
+	if !c.AllowsImage(baseImage) || !c.AllowsImage(windowsBaseImage) {
+		t.Errorf("Default should allow both %q and %q", baseImage, windowsBaseImage)
 	}
 	if !c.AllowsNetwork(NetworkNone) || !c.AllowsNetwork(NetworkOpen) {
 		t.Errorf("Default networks = %v, want none+open", c.Limits.Networks)
@@ -36,6 +38,28 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if got := c.ClampPids(9999); got != 9999 {
 		t.Errorf("ClampPids with no cap = %v, want unchanged", got)
+	}
+}
+
+func TestDefaultImageForOS(t *testing.T) {
+	// The built-in policy allow-lists both base images, so the default tracks the
+	// daemon OS: the Windows base on a windows-mode host, the Linux base otherwise.
+	c := Default()
+	if got := c.DefaultImageFor("linux"); got != baseImage {
+		t.Errorf("DefaultImageFor(linux) = %q, want %q", got, baseImage)
+	}
+	if got := c.DefaultImageFor(""); got != baseImage {
+		t.Errorf("DefaultImageFor(\"\") = %q, want %q (linux fallback)", got, baseImage)
+	}
+	if got := c.DefaultImageFor("windows"); got != windowsBaseImage {
+		t.Errorf("DefaultImageFor(windows) = %q, want %q", got, windowsBaseImage)
+	}
+
+	// A policy that does NOT allow-list the Windows base falls back to its
+	// configured default even on a windows host (the result is always allowed).
+	linuxOnly := &Config{Allow: []string{baseImage}, DefaultImage: baseImage}
+	if got := linuxOnly.DefaultImageFor("windows"); got != baseImage {
+		t.Errorf("DefaultImageFor(windows) with no windows image = %q, want %q", got, baseImage)
 	}
 }
 

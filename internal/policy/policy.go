@@ -23,9 +23,22 @@ import (
 	"time"
 )
 
-// baseImage is the bare, domain-blind base image (see docs/DESIGN.md §7): the
-// generic default the built-in policy allows and boots from.
+// baseImage is the bare, domain-blind Linux base image (see docs/DESIGN.md §7):
+// the generic default the built-in policy allows and boots from on a Linux
+// daemon.
 const baseImage = "wisp-base"
+
+// windowsBaseImage is the bare Windows base image: the OS-appropriate default the
+// built-in policy boots from on a windows-mode daemon (see DefaultImageFor). A
+// Docker daemon is fixed in one container OS mode, so only one of the two base
+// images is ever launchable on a given host; the allow-list may carry both so
+// the same policy serves either OS, and the current OS picks the default.
+const windowsBaseImage = "wisp-base-windows"
+
+// osWindows is the container OS mode string a windows-mode daemon reports (it
+// mirrors runtime.OSWindows). Policy stays free of a runtime import by comparing
+// the mode as a plain string; callers pass the daemon's detected OS through.
+const osWindows = "windows"
 
 // Network policy names. A container's network is one of these; the operator's
 // limits.networks list gates which a client may request at create time.
@@ -84,14 +97,31 @@ type Config struct {
 }
 
 // Default returns the built-in policy used when WISP_CONFIG is unset: the bare
-// base image is the only allowed (and default) image, "none" and "open" are the
-// permitted networks, and no TTL / resource caps are imposed.
+// Linux and Windows base images are both allowed so the same default serves
+// either daemon OS, the Linux base is the configured default image (the current
+// OS overrides it for a windows daemon via DefaultImageFor), "none" and "open"
+// are the permitted networks, and no TTL / resource caps are imposed.
 func Default() *Config {
 	return &Config{
-		Allow:        []string{baseImage},
+		Allow:        []string{baseImage, windowsBaseImage},
 		DefaultImage: baseImage,
 		Limits:       Limits{Networks: []string{NetworkNone, NetworkOpen}},
 	}
+}
+
+// DefaultImageFor returns the image a create should boot when it omits one,
+// chosen for the daemon's container OS (as reported by runtime.ContainerOS and
+// passed through as a plain "linux"/"windows" string). On a windows-mode host it
+// prefers the Windows base image when the allow-list carries it; otherwise (and
+// always on Linux) it returns the configured DefaultImage. The result is always
+// a member of the allow-list: a windows host without the Windows base image
+// allow-listed still falls back to DefaultImage. Wisp never switches the daemon's
+// mode — it only picks an OS-appropriate default to advertise and boot.
+func (c *Config) DefaultImageFor(os string) string {
+	if os == osWindows && c.AllowsImage(windowsBaseImage) {
+		return windowsBaseImage
+	}
+	return c.DefaultImage
 }
 
 // AllowsImage reports whether image is in the allow-list.

@@ -171,11 +171,13 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve the image: an omitted image selects the policy default; any other
-	// image must be in the allow-list, else it is a client error (400).
+	// Resolve the image: an omitted image selects the policy default for the
+	// daemon's container OS (the Windows base on a windows-mode host, the Linux
+	// base otherwise); any other image must be in the allow-list, else it is a
+	// client error (400).
 	image := req.Image
 	if image == "" {
-		image = b.pol.DefaultImage
+		image = b.pol.DefaultImageFor(string(b.rt.ContainerOS()))
 	}
 	if !b.pol.AllowsImage(image) {
 		writeError(w, http.StatusBadRequest, "image not allowed: "+image)
@@ -233,6 +235,16 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 
 	c, err = b.provision(r.Context(), c, spec, req.Userdata)
 	if err != nil {
+		// An image whose OS does not match this host's container mode is a client
+		// choice we cannot validate up front, so it surfaces here as a clear 400
+		// (the requested image is not compatible) rather than an opaque 500. Wisp
+		// never switches the daemon's mode to accommodate it.
+		var mismatch *imageOSMismatchError
+		if errors.As(err, &mismatch) {
+			b.logger.Warn("image OS mismatch on create", "contract_id", c.ID, "image", spec.image, "os", mismatch.os)
+			writeError(w, http.StatusBadRequest, mismatch.Error())
+			return
+		}
 		b.logger.Error("provision contract", "contract_id", c.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "provisioning failed")
 		return
@@ -248,9 +260,11 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 // images handles GET /images: the unauthenticated discovery document any
 // consumer can read to learn what it may request (see docs/DESIGN.md §7).
 func (b *broker) images(w http.ResponseWriter, r *http.Request) {
+	os := b.rt.ContainerOS()
 	writeJSON(w, http.StatusOK, imagesResponse{
+		OS:      string(os),
 		Images:  b.pol.Allow,
-		Default: b.pol.DefaultImage,
+		Default: b.pol.DefaultImageFor(string(os)),
 		Limits: limitsResponse{
 			MaxTTLSeconds: b.pol.Limits.MaxTTLSeconds,
 			MaxCPUs:       b.pol.Limits.MaxCPUs,
@@ -263,6 +277,10 @@ func (b *broker) images(w http.ResponseWriter, r *http.Request) {
 
 // imagesResponse is the GET /images discovery document.
 type imagesResponse struct {
+	// OS is the daemon's detected container OS mode ("linux" or "windows") so a
+	// consumer knows what this host serves; the daemon is fixed in one mode and
+	// Wisp never switches it (see docs/DESIGN.md §7).
+	OS      string         `json:"os"`
 	Images  []string       `json:"images"`
 	Default string         `json:"default"`
 	Limits  limitsResponse `json:"limits"`
@@ -289,13 +307,16 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, spec launch
 	// an allowed image just because it is not in `docker images` yet.
 	if err := b.rt.EnsureImage(ctx, spec.image); err != nil {
 		b.fail(ctx, c.ID, "")
-		return c, err
+		return c, b.mapOSMismatch(err)
 	}
 
 	cid, err := b.rt.Create(ctx, spec.image, createOptions(spec, c.ID, b.rt.ContainerOS()))
 	if err != nil {
 		b.fail(ctx, c.ID, "")
-		return c, err
+		// wisp can't know an arbitrary image's OS up front, so it attempts the
+		// create and translates the daemon's OS/platform rejection into a clear,
+		// OS-aware contract error (see mapOSMismatch). It never switches modes.
+		return c, b.mapOSMismatch(err)
 	}
 	if _, err := b.store.SetContainerID(c.ID, cid); err != nil {
 		b.fail(ctx, c.ID, cid)
@@ -351,6 +372,31 @@ type userdataError struct {
 
 func (e *userdataError) Error() string {
 	return "userdata script failed with exit code " + strconv.Itoa(e.ExitCode)
+}
+
+// imageOSMismatchError reports that the requested image's operating system is
+// incompatible with this host's container mode. os is the daemon's detected
+// container OS; the message names it so the client understands why the image was
+// rejected and that Wisp will not switch modes to run it.
+type imageOSMismatchError struct {
+	os runtime.ContainerOS
+}
+
+func (e *imageOSMismatchError) Error() string {
+	return fmt.Sprintf("this host is in %s container mode; the requested image is not compatible", e.os)
+}
+
+// mapOSMismatch translates a runtime error that is the Docker daemon rejecting an
+// image for an OS/platform mismatch into a clear imageOSMismatchError naming this
+// host's container mode; any other error (including nil) is returned unchanged.
+// Wisp cannot know an arbitrary image's OS before launch, so this recognizes the
+// daemon's rejection after the fact rather than pre-validating — and never
+// switches the daemon's mode (see docs/DESIGN.md §7).
+func (b *broker) mapOSMismatch(err error) error {
+	if runtime.IsImageOSMismatch(err) {
+		return &imageOSMismatchError{os: b.rt.ContainerOS()}
+	}
+	return err
 }
 
 // get handles GET /contracts/:id: it reports the current status and the

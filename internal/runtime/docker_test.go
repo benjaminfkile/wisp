@@ -116,6 +116,32 @@ func TestDockerRuntimeContainerOS(t *testing.T) {
 	}
 }
 
+// TestIsImageOSMismatch verifies the daemon's OS/platform rejection is
+// recognized (case-insensitively) while unrelated errors and nil are not, so a
+// higher layer can map only genuine mismatches to a clear OS-aware error.
+func TestIsImageOSMismatch(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"windows on linux", errors.New(`image operating system "windows" cannot be used on this platform`), true},
+		{"linux on windows", errors.New(`image operating system "linux" cannot be used on this platform`), true},
+		{"uppercased", errors.New(`Image Operating System "windows" Cannot Be Used On This Platform`), true},
+		{"operating-system/platform shape", errors.New("the container operating system does not match the host platform"), true},
+		{"unrelated", errors.New("runtime: create container: no such image"), false},
+		{"pull failure", errors.New("no matching manifest for linux/amd64"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsImageOSMismatch(tt.err); got != tt.want {
+				t.Errorf("IsImageOSMismatch(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestDockerRuntimeContainerOSFallback verifies detection is best-effort: an
 // Info error or an unrecognized OSType falls back to linux, the Docker default.
 func TestDockerRuntimeContainerOSFallback(t *testing.T) {

@@ -173,7 +173,13 @@ At create time (§4) the client sends `image`, `network`, and `resources`:
 - **ttl_seconds** — required; clamped down to `limits.max_ttl_seconds` when set.
 
 Any consumer can discover what it may request via the unauthenticated `GET /images` (§10), which
-returns `{ images, default, limits }`.
+returns `{ os, images, default, limits }`. `os` is the daemon's detected container OS mode
+(`"linux"` or `"windows"`) so a consumer knows what this host serves; `default` is the
+OS-appropriate base image (the Windows base on a windows-mode host, the Linux base otherwise). A
+Docker daemon is fixed in one mode by the operator — Wisp only detects it and never switches it —
+so an image whose OS does not match is rejected. Wisp cannot know an arbitrary image's OS up front,
+so it attempts the create and maps the daemon's OS/platform rejection to a clear
+`this host is in <os> container mode; the requested image is not compatible` error (a `400`).
 
 **Cold-start escape hatch.** Installing a toolchain on every contract costs provisioning time. To
 skip it, a client builds its own image `FROM wisp-base` with its tools baked in and the operator
@@ -245,7 +251,7 @@ WS     /contracts/:id/shell           interactive PTY console
 
 POST   /events                        publish an event to the bus
 WS     /events                        subscribe (with filter)
-GET    /images                        allow-list + default + limits (unauthenticated, §7)
+GET    /images                        os + allow-list + default + limits (unauthenticated, §7)
 GET    /healthz                       liveness
 
 Auth: Authorization: Bearer <contract token> on contract-scoped calls;

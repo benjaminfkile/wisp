@@ -979,6 +979,99 @@ func TestImagesDiscovery(t *testing.T) {
 	}
 }
 
+// GET /images advertises the daemon's detected container OS so a consumer knows
+// what this host serves. A default (linux) fake reports "linux".
+func TestImagesAdvertisesOS(t *testing.T) {
+	h, _, _ := testServer(t)
+	rec := do(t, h, http.MethodGet, "/images", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got imagesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.OS != string(runtime.OSLinux) {
+		t.Errorf("os = %q, want linux", got.OS)
+	}
+	// The Linux default is advertised on a linux host.
+	if got.Default != "wisp-base" {
+		t.Errorf("default = %q, want wisp-base on a linux host", got.Default)
+	}
+}
+
+// On a windows-mode host, GET /images reports os "windows" and advertises the
+// Windows base image as the default (the built-in policy allow-lists both).
+// Uses the fake runtime with a stubbed OS — no real Windows Docker daemon.
+func TestImagesAdvertisesWindowsDefault(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	fake.OS = runtime.OSWindows
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, policy.Default(), bus.New(nil), "")
+
+	rec := do(t, h, http.MethodGet, "/images", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got imagesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.OS != string(runtime.OSWindows) {
+		t.Errorf("os = %q, want windows", got.OS)
+	}
+	if got.Default != "wisp-base-windows" {
+		t.Errorf("default = %q, want wisp-base-windows on a windows host", got.Default)
+	}
+}
+
+// On a windows-mode host, an omitted image on create boots the Windows base
+// image (the OS-aware default) rather than the Linux base.
+func TestCreateDefaultsToWindowsBaseImage(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	fake.OS = runtime.OSWindows
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, policy.Default(), bus.New(nil), "")
+
+	created := createContract(t, h, `{"ttl_seconds":60}`)
+	c, _ := store.Get(created.ContractID)
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	if fc.Image != "wisp-base-windows" {
+		t.Errorf("image = %q, want wisp-base-windows on a windows host", fc.Image)
+	}
+}
+
+// When the daemon rejects the image for an OS/platform mismatch, create surfaces
+// a clear, mapped error naming this host's container mode (a 400), and does NOT
+// switch modes. Uses the fake runtime with a create error that mimics Docker's
+// rejection message.
+func TestCreateImageOSMismatch(t *testing.T) {
+	h, store, fake := testServer(t)
+	fake.CreateErr = errors.New(`Error response from daemon: image operating system "windows" cannot be used on this platform`)
+
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	// The error is the clear, OS-aware message — not an opaque "provisioning failed".
+	body := rec.Body.String()
+	if !strings.Contains(body, "this host is in linux container mode") || !strings.Contains(body, "not compatible") {
+		t.Errorf("error body = %q, want the clear OS-mismatch message", body)
+	}
+	// No container survives and the contract is marked expired (no mode switching,
+	// just a failed create).
+	if n := fake.Count(); n != 0 {
+		t.Errorf("live containers = %d, want 0 after mismatch", n)
+	}
+	all := store.List()
+	if len(all) != 1 || all[0].State != contract.StateExpired {
+		t.Errorf("contract state = %v, want a single expired contract", all)
+	}
+}
+
 func TestImagesUnauthenticatedWithAppToken(t *testing.T) {
 	store := contract.NewStore()
 	fake := runtime.NewFake()

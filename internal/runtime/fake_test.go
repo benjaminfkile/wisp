@@ -334,3 +334,20 @@ func TestFakeSatisfiesRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestFakeContainerOS verifies the Fake defaults to linux and honors a
+// configured OS, including the zero-value ("") Fake defaulting to linux.
+func TestFakeContainerOS(t *testing.T) {
+	if got := NewFake().ContainerOS(); got != OSLinux {
+		t.Fatalf("NewFake().ContainerOS() = %q, want %q", got, OSLinux)
+	}
+	if got := (&Fake{}).ContainerOS(); got != OSLinux {
+		t.Fatalf("zero-value Fake ContainerOS() = %q, want %q", got, OSLinux)
+	}
+
+	f := NewFake()
+	f.OS = OSWindows
+	if got := f.ContainerOS(); got != OSWindows {
+		t.Fatalf("ContainerOS() after OS=windows = %q, want %q", got, OSWindows)
+	}
+}

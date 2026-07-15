@@ -89,6 +89,17 @@ const (
 	StreamStderr = "stderr"
 )
 
+// ContainerOS identifies the container OS mode a Docker daemon runs in. A
+// daemon is fixed in one mode (linux or windows) by the operator and never
+// switches at runtime; Wisp only detects it so higher layers can adapt.
+type ContainerOS string
+
+// The container OS modes reported by the Docker daemon's Info.OSType.
+const (
+	OSLinux   ContainerOS = "linux"
+	OSWindows ContainerOS = "windows"
+)
+
 // Runtime abstracts the container backend. Implementations must be safe for
 // concurrent use by multiple goroutines.
 type Runtime interface {
@@ -136,6 +147,12 @@ type Runtime interface {
 	// WebSocket; see server's shell endpoint. Resize adjusts the TTY window so a
 	// client can forward terminal resize events.
 	ExecShell(ctx context.Context, id string, cmd []string) (ShellStream, error)
+
+	// ContainerOS reports the container OS mode of the underlying daemon
+	// ("linux" or "windows"). The daemon is fixed in one mode by the operator,
+	// so this is detected once and does not change while the runtime is live.
+	// Server and policy layers read it to stay OS-aware.
+	ContainerOS() ContainerOS
 }
 
 // ShellStream is the duplex byte stream of an interactive shell exec (see

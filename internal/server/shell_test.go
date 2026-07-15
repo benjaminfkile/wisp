@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
 // fakeDuplex is an in-memory stand-in for a container's hijacked TTY stream. The
@@ -327,5 +329,55 @@ func TestShellEndToEnd(t *testing.T) {
 	}
 	if len(resizes) != 1 || resizes[0] != [2]uint16{50, 132} {
 		t.Fatalf("recorded resizes = %v, want [{50 132}]", resizes)
+	}
+}
+
+// The interactive shell must launch the OS-appropriate default binary: `/bin/sh`
+// on a Linux daemon (unchanged) and `cmd.exe` on a Windows daemon, which has no
+// /bin/sh. Uses the fake runtime with a stubbed OS — no real Windows Docker.
+func TestShellDefaultBinaryByOS(t *testing.T) {
+	tests := []struct {
+		name string
+		os   runtime.ContainerOS
+		want []string
+	}{
+		{"linux", runtime.OSLinux, []string{"/bin/sh"}},
+		{"windows", runtime.OSWindows, []string{"cmd.exe"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _, fake := testServer(t)
+			fake.OS = tt.os
+
+			gotCmd := make(chan []string, 1)
+			containerEnd, testEnd := net.Pipe()
+			defer testEnd.Close()
+			fake.ShellHandler = func(id string, cmd []string) (io.ReadWriteCloser, error) {
+				gotCmd <- cmd
+				return containerEnd, nil
+			}
+
+			created := createContract(t, h, `{"ttl_seconds":3600}`)
+
+			srv := httptest.NewServer(h)
+			defer srv.Close()
+			wsBase := "ws" + strings.TrimPrefix(srv.URL, "http")
+			shellURL := wsBase + "/contracts/" + created.ContractID + "/shell?token=" + created.Token
+
+			conn, _, err := websocket.DefaultDialer.Dial(shellURL, nil)
+			if err != nil {
+				t.Fatalf("dial shell: %v", err)
+			}
+			defer conn.Close()
+
+			select {
+			case cmd := <-gotCmd:
+				if len(cmd) != len(tt.want) || cmd[0] != tt.want[0] {
+					t.Fatalf("shell cmd = %v, want %v", cmd, tt.want)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("ExecShell was not invoked")
+			}
+		})
 	}
 }

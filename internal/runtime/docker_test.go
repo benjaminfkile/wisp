@@ -34,6 +34,53 @@ func TestIdleCommand(t *testing.T) {
 	}
 }
 
+// TestShellCommand verifies a command string is wrapped in the OS shell: Linux
+// keeps the historical `/bin/sh -c <cmd>` byte-for-byte (there is no /bin/sh on
+// Windows), and a Windows daemon runs the command through `cmd /c <cmd>`.
+func TestShellCommand(t *testing.T) {
+	const cmd = "cd /repo && git diff"
+	tests := []struct {
+		name string
+		os   ContainerOS
+		want []string
+	}{
+		{"linux", OSLinux, []string{"/bin/sh", "-c", cmd}},
+		{"windows", OSWindows, []string{"cmd", "/c", cmd}},
+		// An unset/unknown OS falls back to the Linux wrapper, matching the
+		// daemon-default that ContainerOS detection also falls back to.
+		{"unset falls back to linux", ContainerOS(""), []string{"/bin/sh", "-c", cmd}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ShellCommand(tt.os, cmd); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("ShellCommand(%q, %q) = %v, want %v", tt.os, cmd, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDefaultShell verifies the interactive PTY shell binary is chosen for the
+// container OS: Linux keeps `/bin/sh` byte-for-byte, and a Windows daemon (which
+// has no /bin/sh) launches `cmd.exe`.
+func TestDefaultShell(t *testing.T) {
+	tests := []struct {
+		name string
+		os   ContainerOS
+		want []string
+	}{
+		{"linux", OSLinux, []string{"/bin/sh"}},
+		{"windows", OSWindows, []string{"cmd.exe"}},
+		{"unset falls back to linux", ContainerOS(""), []string{"/bin/sh"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := DefaultShell(tt.os); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("DefaultShell(%q) = %v, want %v", tt.os, got, tt.want)
+			}
+		})
+	}
+}
+
 // infoStubClient embeds the full Docker APIClient interface (left nil) and
 // overrides only Info, so a test can drive DockerRuntime's OS detection without
 // a real daemon. Any other method call would panic, which is fine: the OS

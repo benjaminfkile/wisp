@@ -81,8 +81,19 @@ Any consumer can discover what it may request via the **unauthenticated**
 
 ```sh
 curl -s localhost:8080/images
-# {"images":["wisp-base"],"default":"wisp-base","limits":{"max_ttl_seconds":0,...,"networks":["none","open"]}}
+# {"images":["wisp-base"],"default":"wisp-base","os":"linux","limits":{"max_ttl_seconds":0,...,"networks":["none","open"]}}
 ```
+
+The `os` field reports the Docker daemon's current container mode (`linux` or
+`windows`), which Wisp **detects** from `docker info` (`OSType`). Wisp serves
+whichever mode the host is in: on a `windows`-mode daemon it defaults to the
+Windows base image ([`examples/wisp-base-windows`](examples/wisp-base-windows/Dockerfile))
+and drives containers with the Windows keep-alive and `cmd.exe` shell. The
+**operator** owns the mode (the Docker Desktop engine switch / daemon config);
+**Wisp never switches it**. One daemon runs one mode at a time, Windows
+containers require a Windows host, and the container/host OS build plus isolation
+(process vs Hyper-V) must be compatible — see
+[`docs/DESIGN.md` §12](docs/DESIGN.md).
 
 ## Auth
 

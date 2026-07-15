@@ -280,13 +280,27 @@ The old task-runner/scheduler/hierarchy stops being part of core and becomes one
 Wisp knew none of: git, the repo, the branch, "a task," or Claude. It leased a box and brokered
 access.
 
-## 12. Windows + Linux containers (future / optional)
+## 12. Windows + Linux containers
 
-The base image exists per platform; Wisp selects by the Docker daemon's current mode. **Constraint:**
-a single Docker daemon cannot run Windows and Linux containers simultaneously — on a Windows host
-you switch modes; on a Linux host you can't run Windows containers at all. So a given Wisp instance
-serves whichever mode its host is in. Treat Windows support as a later addition unless a concrete
-use case needs it now.
+The base image exists per platform (`examples/wisp-base`, `examples/wisp-base-windows`); Wisp selects
+by the Docker daemon's current mode. Wisp **detects** that mode from the daemon (`docker info` →
+`OSType`), **advertises** the result as `os` in `GET /images`, and — when the daemon is in `windows`
+mode — boots the Windows base by default and drives the container with the Windows keep-alive
+(`cmd /c ping -t localhost >NUL` as PID 1) and a `cmd.exe` shell for exec/interactive sessions.
+The **operator** sets the mode (the Docker Desktop engine switch, or daemon config); **Wisp never
+switches it** — it only serves whichever mode the host is in.
+
+**Constraints:**
+
+- **One daemon, one mode at a time** — a single Docker daemon cannot run Windows and Linux containers
+  simultaneously. On a Windows host you switch the engine between modes; a given Wisp instance serves
+  whichever mode its host is in.
+- **Windows containers require a Windows host** — on a Linux host you can't run Windows containers at
+  all, so a Linux-hosted Wisp only ever reports `os: "linux"`.
+- **OS version + isolation must be compatible** — the container's base-image OS build and the host's
+  OS build, plus the isolation mode (process vs Hyper-V), must line up per Windows-container rules;
+  a mismatch fails at launch. Wisp surfaces such a rejection as a clear OS-mismatch error rather than
+  guessing or switching modes.
 
 ## 13. Design constraints / gotchas (bake these in)
 

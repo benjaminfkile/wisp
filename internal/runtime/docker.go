@@ -157,13 +157,27 @@ func DefaultShell(os ContainerOS) []string {
 // IsImageOSMismatch reports whether err is the Docker daemon rejecting an image
 // because its operating system does not match the daemon's container OS mode.
 // Wisp cannot reliably know an arbitrary image's OS before it tries to launch
-// it, so a create against an incompatible image is attempted and the daemon's
-// rejection is recognized here and mapped to a clear, OS-aware error rather than
-// a generic failure. The daemon phrases the rejection as e.g. `image operating
-// system "windows" cannot be used on this platform` (and the linux/windows
-// equivalent); the match is on the stable substrings of that message and is
-// case-insensitive. It never switches the daemon's mode — the operator owns
-// that; this only classifies the error. A nil error is never a mismatch.
+// it, so a create (or on-demand pull) against an incompatible image is attempted
+// and the daemon's rejection is recognized here and mapped to a clear, OS-aware
+// error rather than a generic failure. The daemon phrases the rejection several
+// ways, all matched here case-insensitively:
+//
+//   - the classic ContainerCreate rejection, e.g. `image operating system
+//     "windows" cannot be used on this platform` (and the linux equivalent);
+//   - some daemon/SDK versions phrase it as an operating-system/platform
+//     mismatch without that exact clause;
+//   - the modern pull-time rejection, e.g. `no matching manifest for
+//     windows(10.0.26200)/amd64 in the manifest list entries`, emitted when a
+//     multi-platform registry image has no variant for this host's platform.
+//
+// The match is substring-based on err.Error(), so a rejection wrapped with
+// fmt.Errorf context (e.g. `runtime: pull image <name>: Error response from
+// daemon: ...`) is still recognized. Note the "no matching manifest" shape can
+// also mean an ARCHITECTURE mismatch (e.g. an arm64-only image on an amd64
+// daemon) rather than strictly an OS mismatch; the higher layer keeps the mapped
+// message honest about that (see mapOSMismatch in internal/server/contracts.go).
+// This only classifies the error — it never switches the daemon's mode, which
+// the operator owns. A nil error is never a mismatch.
 func IsImageOSMismatch(err error) bool {
 	if err == nil {
 		return false
@@ -172,8 +186,15 @@ func IsImageOSMismatch(err error) bool {
 	if strings.Contains(msg, "cannot be used on this platform") {
 		return true
 	}
+	// The modern daemon rejects an incompatible registry pull with a
+	// "no matching manifest ... in the manifest list entries" message; match that
+	// shape too. Both substrings are required so an unrelated "no matching
+	// manifest" phrasing without a manifest list does not false-positive.
+	if strings.Contains(msg, "no matching manifest") && strings.Contains(msg, "manifest list entries") {
+		return true
+	}
 	// Some daemon/SDK versions phrase it as an operating-system/platform mismatch
-	// without the exact clause above; match that shape too.
+	// without the exact clauses above; match that shape too.
 	return strings.Contains(msg, "operating system") && strings.Contains(msg, "platform")
 }
 

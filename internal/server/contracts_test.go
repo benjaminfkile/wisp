@@ -848,6 +848,21 @@ func TestCreateNoneNetworkMapsToDockerNone(t *testing.T) {
 	}
 }
 
+func TestCreateAppliesNoNewPrivileges(t *testing.T) {
+	h, store, fake := testServer(t)
+	// Every leased container is hardened with the no-new-privileges security
+	// option regardless of image, network, or resource request.
+	created := createContract(t, h, `{"ttl_seconds":60}`)
+	c, _ := store.Get(created.ContractID)
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	if got := fc.Opts.SecurityOpt; len(got) != 1 || got[0] != "no-new-privileges:true" {
+		t.Errorf("SecurityOpt = %v, want [no-new-privileges:true]", got)
+	}
+}
+
 func TestCreateClampsTTLToLimit(t *testing.T) {
 	// A policy with a 15-minute TTL cap clamps a longer requested lease.
 	pol := &policy.Config{

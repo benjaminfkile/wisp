@@ -51,6 +51,11 @@ type CreateOptions struct {
 	// NetworkMode selects the container's network. Empty uses the runtime's
 	// default network; "none" disconnects the container from all networks.
 	NetworkMode string
+
+	// SecurityOpt carries Docker security options applied to the container's
+	// HostConfig.SecurityOpt (e.g. "no-new-privileges:true"). Empty applies no
+	// extra options.
+	SecurityOpt []string
 }
 
 // Resources caps a container's resource usage. A zero field means "no limit"

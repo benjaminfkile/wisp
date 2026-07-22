@@ -23,6 +23,12 @@ import (
 // to the contract that owns it (see runtime.CreateOptions.Labels).
 const contractLabel = "wisp.contract"
 
+// noNewPrivilegesOpt is the Docker security option applied to every leased
+// container so a process inside it cannot gain privileges via setuid binaries
+// (e.g. sudo/su). It is safe, workload-agnostic hardening: it neither drops
+// Linux capabilities nor blocks root-in-container provisioning/userdata.
+const noNewPrivilegesOpt = "no-new-privileges:true"
+
 // bytesPerMB converts a request's memory_mb (mebibytes) to the byte limit the
 // runtime expects.
 const bytesPerMB = 1024 * 1024
@@ -702,8 +708,10 @@ func envList(m map[string]string) ([]string, error) {
 }
 
 // createOptions translates a resolved launch spec into the runtime's
-// CreateOptions: the resource caps and network policy applied to the container,
-// plus the label correlating it back to its contract. It always sets the
+// CreateOptions: the resource caps, network policy, and security options
+// applied to the container, plus the label correlating it back to its
+// contract. Every leased container is hardened with no-new-privileges so a
+// process inside it cannot escalate via setuid binaries. It always sets the
 // keep-alive command — chosen for the daemon's container OS — so the container
 // outlives its provisioning step. WorkingDir, entrypoint, and user are left
 // unset so each OS uses its own container default (Linux the image default,
@@ -722,6 +730,8 @@ func createOptions(spec launchSpec, contractID string, os runtime.ContainerOS) r
 			MemoryBytes: int64(spec.memoryMB) * bytesPerMB,
 			PidsLimit:   int64(spec.pids),
 		},
+		// Always harden leased containers against setuid privilege escalation.
+		SecurityOpt: []string{noNewPrivilegesOpt},
 	}
 	// Only "none" maps to an explicit Docker network mode today; "egress" and
 	// "open" both boot on the runtime's default network. Egress is not yet

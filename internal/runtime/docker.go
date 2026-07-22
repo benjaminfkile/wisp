@@ -9,6 +9,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 )
@@ -287,6 +288,25 @@ func (d *DockerRuntime) Kill(ctx context.Context, id string) error {
 		return fmt.Errorf("runtime: kill container %s: %w", id, err)
 	}
 	return nil
+}
+
+// ListLeased implements Runtime. It queries the daemon for every container
+// (including stopped ones, via All) carrying the Wisp contract label, using a
+// server-side label filter so only leased containers are returned, and maps each
+// to a LeasedContainer with its id and full label set for the startup
+// reconcile. A container that has lost its labels is not returned by the filter.
+func (d *DockerRuntime) ListLeased(ctx context.Context) ([]LeasedContainer, error) {
+	f := filters.NewArgs()
+	f.Add("label", ContractLabel)
+	list, err := d.cli.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
+	if err != nil {
+		return nil, fmt.Errorf("runtime: list leased containers: %w", err)
+	}
+	out := make([]LeasedContainer, 0, len(list))
+	for _, c := range list {
+		out = append(out, LeasedContainer{ID: c.ID, Labels: c.Labels})
+	}
+	return out, nil
 }
 
 // ExecSync implements Runtime. It creates an exec, attaches to capture output,

@@ -72,6 +72,12 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, pol *policy
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Rebuild tracking for containers a previous wispd left behind (matched by
+	// their wisp.contract label), BEFORE the reaper starts, so an orphaned lease
+	// is either reaped or resumed on the reaper's first sweep instead of running
+	// unbounded with no daemon enforcing its TTL (see server.Reconcile).
+	server.Reconcile(ctx, store, rt, logger)
+
 	// The TTL reaper reconciles tracked contracts on boot and then drives
 	// expiring/expired transitions on a ticker until shutdown. Its lifecycle
 	// hook republishes those transitions onto the event bus.

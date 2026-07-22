@@ -23,7 +23,7 @@ import (
 // not running". This guards against silently dropping the keep-alive.
 func TestCreateOptionsAlwaysSetsKeepAliveCmd(t *testing.T) {
 	// A zero-value spec (no image/limits/network) must still get the keep-alive.
-	opts := createOptions(launchSpec{}, "contract-abc", runtime.OSLinux)
+	opts := createOptions(launchSpec{}, contract.Contract{ID: "contract-abc"}, runtime.OSLinux)
 
 	if len(opts.Cmd) == 0 {
 		t.Fatal("createOptions returned an empty Cmd; the container would exit immediately")
@@ -48,7 +48,7 @@ func TestCreateOptionsKeepAliveByOS(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			opts := createOptions(launchSpec{}, "contract-abc", tt.os)
+			opts := createOptions(launchSpec{}, contract.Contract{ID: "contract-abc"}, tt.os)
 			if !reflect.DeepEqual(opts.Cmd, tt.want) {
 				t.Fatalf("createOptions(%s) Cmd = %v, want %v", tt.os, opts.Cmd, tt.want)
 			}

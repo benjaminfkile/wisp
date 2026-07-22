@@ -91,6 +91,50 @@ func (s *Store) Create(p CreateParams) (Contract, error) {
 	return *c, nil
 }
 
+// AdoptParams carries the fields needed to rebuild a tracking entry for a
+// container that already exists at startup — one launched by a previous wispd
+// process whose in-memory state was lost on restart (see the Docker-label
+// reconcile). The id and expiry come from the container's labels; the store
+// fills in the remaining bookkeeping so the reaper can enforce the TTL.
+type AdoptParams struct {
+	// ID is the contract id, recovered from the container's wisp.contract label.
+	ID string
+
+	// ContainerID is the runtime container backing the contract, so the reaper
+	// can kill it when the TTL elapses.
+	ContainerID string
+
+	// ExpiresAt is the contract's absolute expiry, recovered from the container's
+	// wisp.expires_at label.
+	ExpiresAt time.Time
+}
+
+// Adopt records a tracking entry for a pre-existing container discovered during
+// startup reconciliation. The contract is rebuilt in StateReady so the reaper
+// treats it like any live lease: still-valid ones keep being tracked, and ones
+// already past ExpiresAt are reaped (their container killed) on the reaper's
+// first sweep. It has no bearer token — a reconciled lease cannot be driven via
+// exec/shell, only tracked to expiry — and no client Meta, which did not survive
+// the restart. A no-op if the id is already tracked, so re-running the reconcile
+// never clobbers a live contract. Returns a copy of the tracked contract.
+func (s *Store) Adopt(p AdoptParams) (Contract, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if c, ok := s.contracts[p.ID]; ok {
+		return *c, nil
+	}
+	c := &Contract{
+		ID:          p.ID,
+		State:       StateReady,
+		ContainerID: p.ContainerID,
+		ExpiresAt:   p.ExpiresAt,
+		CreatedAt:   s.now(),
+	}
+	s.contracts[p.ID] = c
+	return *c, nil
+}
+
 // Get returns a copy of the contract with the given id, or ErrNotFound.
 func (s *Store) Get(id string) (Contract, error) {
 	s.mu.RLock()

@@ -488,7 +488,7 @@ func TestCreateWithEnvReachesContainerAndExec(t *testing.T) {
 	h, store, fake := testServer(t)
 
 	created := createContract(t, h,
-		`{"ttl_seconds":3600,"env":{"CLAUDE_CODE_OAUTH_TOKEN":"abc","FOO":"bar"}}`)
+		`{"ttl_seconds":3600,"env":{"API_KEY":"abc","FOO":"bar"}}`)
 
 	c, _ := store.Get(created.ContractID)
 	fc, ok := fake.Container(c.ContainerID)
@@ -496,7 +496,7 @@ func TestCreateWithEnvReachesContainerAndExec(t *testing.T) {
 		t.Fatal("container not tracked")
 	}
 	// The env map reached the container's Config.Env in KEY=VALUE form (sorted).
-	want := []string{"CLAUDE_CODE_OAUTH_TOKEN=abc", "FOO=bar"}
+	want := []string{"API_KEY=abc", "FOO=bar"}
 	if len(fc.Opts.Env) != len(want) {
 		t.Fatalf("Config.Env = %v, want %v", fc.Opts.Env, want)
 	}

@@ -1,6 +1,6 @@
 # Wisp — Design Doc
 
-**Status:** Draft / v0 · **Language:** Go · **Author:** Ben (with Claude)
+**Status:** Draft / v0 · **Language:** Go · **Author:** Ben
 **One-liner:** Wisp leases you an authenticated, root-access, throwaway container with a shell, for a bounded time — then it vanishes. You bring your own tools.
 
 ---
@@ -11,7 +11,7 @@ Wisp is a small, domain-blind **broker**. A client application asks Wisp for a *
 short-lived container it can drive live for an agreed duration (e.g. "give me a container for
 1 hour"). Wisp boots a fresh container from a **bare base image** (a shell + a package manager,
 nothing domain-specific), runs the client's provisioning script, and hands back a handle. The
-client installs whatever it needs — Claude Code, git, a language runtime — itself. For the life
+client installs whatever it needs — a language runtime, git, a build tool — itself. For the life
 of the contract the client has **root inside that container** and drives it two ways:
 
 - an **interactive shell** (a real PTY over a WebSocket — stateful: `cd`, env, `vim`, `top` all work), and
@@ -31,10 +31,11 @@ talks to Wisp over HTTP / WebSocket / the bus. Wisp itself never knows what any 
 2. **Ephemeral by construction.** Containers are cattle, not pets. Destroyed at contract end. This
    buys isolation for free: no state drift, no cross-contract bleed, and any credentials a client
    installs die with the container.
-3. **Tool-agnostic (not even Claude).** The base image ships nothing domain-specific — just a shell
-   and a package manager. The client installs its own toolchain (Claude Code, git, runtimes) via
-   userdata or the shell. Wisp has no concept of "Claude" or a "prompt" at all; running an agent is
-   just a command the client happens to run in its container. Wisp could host any workload.
+3. **Tool-agnostic.** The base image ships nothing domain-specific — no runtime, no tool, no concept
+   of a task; just a shell and a package manager. The client installs whatever it needs (a runtime,
+   git, build tools) via userdata or the shell. Wisp has no concept of a "workload" or a "command"
+   with meaning at all; running any job is just a command the client happens to run in its container.
+   Wisp could host any workload.
 4. **The client is in the loop.** Because a contract is a *live* lease (not a fire-and-forget job),
    the client supervises its own work — watches output stream in, probes the filesystem, reacts.
    This is what lets all the "is this healthy?" intelligence live in satellites.
@@ -48,7 +49,7 @@ talks to Wisp over HTTP / WebSocket / the bus. Wisp itself never knows what any 
 - Not a git client and does not manage credentials — the client installs and uses those inside its
   own contract.
 - Not an ADO / GitHub / Datadog integration.
-- Not tool-aware at all: the base image ships no Claude Code, no git, no runtime — just a shell +
+- Not tool-aware at all: the base image ships no tool, no git, no runtime — just a shell +
   package manager. Clients bring their own tools.
 - Not a place where domain logic lives. If a feature needs to know *what* the work is, it's a satellite.
 
@@ -97,7 +98,7 @@ opens as many as it wants.
 
 | Mode | Endpoint | Shape | Use |
 |---|---|---|---|
-| **Interactive shell** | `WS /contracts/:id/shell` | PTY, stateful, bidirectional | The Claude session; humans; anything interactive |
+| **Interactive shell** | `WS /contracts/:id/shell` | PTY, stateful, bidirectional | The live workload session; humans; anything interactive |
 | **Sync exec** | `POST /contracts/:id/exec` | one process → `{stdout,stderr,exit_code}` | Machine-readable probes: `git diff`, `ls`, health checks |
 | **Streaming exec** | `POST /contracts/:id/exec?stream=1` (SSE/chunked) | output flows live | Long-runners where you watch latency (the coding session) |
 
@@ -264,11 +265,11 @@ The old task-runner/scheduler/hierarchy stops being part of core and becomes one
 
 1. Satellite gets a unit of work (however it decides — its own queue, a bus event, a human).
 2. `POST /contracts { ttl_seconds: 3600, image: "wisp-base", network: "open", userdata: "install
-   node + claude code + git, configure credentials, clone <repo>, checkout <branch>" }` — or request
-   an allow-listed image that already has the toolchain baked in, and userdata just clones + checks
-   out.
-3. On `contract.ready`, it drives the coding session on a **streaming exec**:
-   `claude -p "<the task>" --dangerously-skip-permissions`.
+   a language runtime + git + build tools, configure credentials, clone <repo>, checkout <branch>" }`
+   — or request an allow-listed image that already has the toolchain baked in, and userdata just
+   clones + checks out.
+3. On `contract.ready`, it drives the job on a **streaming exec**:
+   `cd /repo && make build` (or whatever command the workload is).
 4. While that streams, it **watches latency** and periodically fires a **sync exec**
    `cd /repo && git diff --stat`. Long silence + empty diff ⇒ it treats the run as stuck and reacts
    (retry, escalate, abort). *This is the old "Doctor" logic — now client-side, because the client
@@ -277,8 +278,8 @@ The old task-runner/scheduler/hierarchy stops being part of core and becomes one
    event to the bus.
 6. It `DELETE`s the contract (or lets the TTL reap it). Container gone; credentials gone.
 
-Wisp knew none of: git, the repo, the branch, "a task," or Claude. It leased a box and brokered
-access.
+Wisp knew none of: git, the repo, the branch, "a task," or the tool that ran it. It leased a box
+and brokered access.
 
 ## 12. Windows + Linux containers
 

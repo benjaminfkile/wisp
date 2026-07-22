@@ -68,12 +68,19 @@ type Fake struct {
 	// should not mutate it concurrently with runtime calls.
 	ShellHandler ShellFunc
 
-	// CreateErr, StartErr, KillErr, EnsureImageErr, when set, are returned by
-	// the corresponding method to let tests exercise error paths.
+	// CreateErr, StartErr, KillErr, EnsureImageErr, ListLeasedErr, when set, are
+	// returned by the corresponding method to let tests exercise error paths.
 	CreateErr      error
 	StartErr       error
 	KillErr        error
 	EnsureImageErr error
+	ListLeasedErr  error
+
+	// LeasedContainers, when non-nil, is returned verbatim by ListLeased so
+	// tests can simulate containers that pre-exist a restart (labels and ids of
+	// their choosing) without going through Create. When nil, ListLeased derives
+	// the result from the currently tracked containers carrying ContractLabel.
+	LeasedContainers []LeasedContainer
 
 	// OS is the container OS mode reported by ContainerOS. The zero value ("")
 	// is treated as OSLinux, so a freshly constructed Fake defaults to linux;
@@ -167,6 +174,30 @@ func (f *Fake) Kill(ctx context.Context, id string) error {
 	c.Killed = true
 	delete(f.containers, id)
 	return nil
+}
+
+// ListLeased implements Runtime. When LeasedContainers is set it returns that
+// injected list (letting a test model containers left over from a prior daemon
+// run); otherwise it derives the list from the tracked containers that carry
+// ContractLabel, mirroring the real runtime's label filter.
+func (f *Fake) ListLeased(ctx context.Context) ([]LeasedContainer, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ListLeasedErr != nil {
+		return nil, f.ListLeasedErr
+	}
+	if f.LeasedContainers != nil {
+		out := make([]LeasedContainer, len(f.LeasedContainers))
+		copy(out, f.LeasedContainers)
+		return out, nil
+	}
+	out := make([]LeasedContainer, 0, len(f.containers))
+	for _, c := range f.containers {
+		if _, ok := c.Opts.Labels[ContractLabel]; ok {
+			out = append(out, LeasedContainer{ID: c.ID, Labels: c.Opts.Labels})
+		}
+	}
+	return out, nil
 }
 
 // ExecSync implements Runtime. The container must exist and be running

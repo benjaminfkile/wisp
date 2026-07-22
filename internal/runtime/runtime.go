@@ -35,9 +35,34 @@ const EgressNetworkName = "wisp-egress"
 // path intact.
 const EgressICCOption = "com.docker.network.bridge.enable_icc"
 
+// ContractLabel is the Docker label Wisp writes on every leased container to
+// correlate it back to the contract that owns it. ListLeased filters on its
+// presence so a wispd restart can rediscover leased containers whose in-memory
+// tracking was lost, rather than orphaning them.
+const ContractLabel = "wisp.contract"
+
+// ExpiresAtLabel is the Docker label carrying a contract's absolute expiry as
+// Unix seconds. It is written at create time alongside ContractLabel so the
+// daemon can rebuild a contract's TTL tracking from the container's labels
+// alone after a restart (see ListLeased). It is omitted when a contract has no
+// TTL, since there is nothing to reap against.
+const ExpiresAtLabel = "wisp.expires_at"
+
 // ErrNotFound is returned when an operation references a container id that the
 // runtime does not know about (never created, or already destroyed).
 var ErrNotFound = errors.New("runtime: container not found")
+
+// LeasedContainer is a container the runtime reports as carrying Wisp's
+// contract label, returned by ListLeased so the daemon can rebuild its
+// in-memory tracking after a restart. Labels is the container's full label set;
+// the reconcile reads ContractLabel and ExpiresAtLabel from it.
+type LeasedContainer struct {
+	// ID is the runtime container id.
+	ID string
+
+	// Labels is the container's complete label map as reported by the runtime.
+	Labels map[string]string
+}
 
 // ErrNotRunning is returned when an exec is attempted against a container that
 // exists but is not in the running state (not started, or already killed).
@@ -148,6 +173,14 @@ type Runtime interface {
 	// Kill forcibly stops and removes the container. After Kill the id is no
 	// longer valid.
 	Kill(ctx context.Context, id string) error
+
+	// ListLeased returns every container (running or stopped) the runtime knows
+	// about that carries the Wisp contract label (ContractLabel), so the daemon
+	// can rebuild its in-memory contract tracking after a restart and reap or
+	// resume pre-existing leases rather than orphaning them. Each result carries
+	// the container id and its full label set; the caller reads ContractLabel and
+	// ExpiresAtLabel from the labels.
+	ListLeased(ctx context.Context) ([]LeasedContainer, error)
 
 	// ExecSync runs cmd to completion inside a running container and returns
 	// its buffered stdout, stderr, and exit code. A non-zero exit code is

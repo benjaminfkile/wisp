@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -475,6 +476,11 @@ func TestCreateBootsAndReturns(t *testing.T) {
 	}
 	if fc.Opts.Labels[contractLabel] != c.ID {
 		t.Errorf("label %s = %q, want %q", contractLabel, fc.Opts.Labels[contractLabel], c.ID)
+	}
+	// The absolute expiry is stamped as a Unix-seconds label so a wispd restart
+	// can rebuild this container's TTL tracking from its labels alone.
+	if got, want := fc.Opts.Labels[expiresAtLabel], strconv.FormatInt(c.ExpiresAt.Unix(), 10); got != want {
+		t.Errorf("label %s = %q, want %q", expiresAtLabel, got, want)
 	}
 	if len(fc.Execs) != 1 {
 		t.Fatalf("execs = %d, want 1 (userdata)", len(fc.Execs))

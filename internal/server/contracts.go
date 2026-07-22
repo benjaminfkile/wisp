@@ -20,8 +20,16 @@ import (
 )
 
 // contractLabel is the container label Wisp uses to correlate a container back
-// to the contract that owns it (see runtime.CreateOptions.Labels).
-const contractLabel = "wisp.contract"
+// to the contract that owns it (see runtime.CreateOptions.Labels). It is defined
+// in the runtime package because the runtime filters on it during the startup
+// reconcile; the alias keeps this package's create path referring to it locally.
+const contractLabel = runtime.ContractLabel
+
+// expiresAtLabel is the container label carrying a contract's absolute expiry as
+// Unix seconds, written at create time next to contractLabel so a wispd restart
+// can rebuild the contract's TTL tracking from the container's labels alone (see
+// reconcile). Defined in the runtime package for the same reason as contractLabel.
+const expiresAtLabel = runtime.ExpiresAtLabel
 
 // noNewPrivilegesOpt is the Docker security option applied to every leased
 // container so a process inside it cannot gain privileges via setuid binaries
@@ -318,7 +326,7 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, spec launch
 		return c, b.mapOSMismatch(err)
 	}
 
-	cid, err := b.rt.Create(ctx, spec.image, createOptions(spec, c.ID, b.rt.ContainerOS()))
+	cid, err := b.rt.Create(ctx, spec.image, createOptions(spec, c, b.rt.ContainerOS()))
 	if err != nil {
 		b.fail(ctx, c.ID, "")
 		// wisp can't know an arbitrary image's OS up front, so it attempts the
@@ -709,16 +717,29 @@ func envList(m map[string]string) ([]string, error) {
 
 // createOptions translates a resolved launch spec into the runtime's
 // CreateOptions: the resource caps, network policy, and security options
-// applied to the container, plus the label correlating it back to its
-// contract. Every leased container is hardened with no-new-privileges so a
-// process inside it cannot escalate via setuid binaries. It always sets the
-// keep-alive command — chosen for the daemon's container OS — so the container
-// outlives its provisioning step. WorkingDir, entrypoint, and user are left
-// unset so each OS uses its own container default (Linux the image default,
-// Windows C:\ with the image's user); no POSIX-only default is imposed.
-func createOptions(spec launchSpec, contractID string, os runtime.ContainerOS) runtime.CreateOptions {
+// applied to the container, plus the labels correlating it back to its
+// contract. Two labels are written: wisp.contract carries the contract id, and
+// wisp.expires_at carries the contract's absolute expiry as Unix seconds so a
+// wispd restart can rebuild the TTL tracking for this container from its labels
+// alone (see reconcile); the expiry label is omitted when the contract has no
+// TTL, since there is nothing to reap against. Every leased container is hardened
+// with no-new-privileges so a process inside it cannot escalate via setuid
+// binaries. It always sets the keep-alive command — chosen for the daemon's
+// container OS — so the container outlives its provisioning step. WorkingDir,
+// entrypoint, and user are left unset so each OS uses its own container default
+// (Linux the image default, Windows C:\ with the image's user); no POSIX-only
+// default is imposed.
+func createOptions(spec launchSpec, c contract.Contract, os runtime.ContainerOS) runtime.CreateOptions {
+	labels := map[string]string{contractLabel: c.ID}
+	// Record the absolute expiry so the startup reconcile can reap or resume this
+	// container from its labels alone after a restart. Omitted for a contract with
+	// no TTL (none in the current create path, which requires a positive TTL, but
+	// kept defensive) since there would be nothing to reap against.
+	if c.TTL > 0 && !c.ExpiresAt.IsZero() {
+		labels[expiresAtLabel] = strconv.FormatInt(c.ExpiresAt.Unix(), 10)
+	}
 	opts := runtime.CreateOptions{
-		Labels: map[string]string{contractLabel: contractID},
+		Labels: labels,
 		// Run the keep-alive as the container's main process so it stays up for
 		// the whole contract; all real work happens via exec/shell (see keepAliveCmd).
 		Cmd: keepAliveCmd(os),

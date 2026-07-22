@@ -46,9 +46,10 @@ const (
 	// NetworkNone disconnects the container from all networks.
 	NetworkNone = "none"
 
-	// NetworkEgress allows outbound traffic only. Wisp does not yet enforce a
-	// distinct egress-only mode, so it currently boots on the default network;
-	// the policy is recorded so a later task can tighten it.
+	// NetworkEgress allows outbound traffic only. A lease requesting it is
+	// attached to a dedicated wisp-managed bridge with inter-container
+	// communication disabled, so it reaches the internet but not other leases or
+	// host services on the default bridge (see runtime.EgressNetworkName).
 	NetworkEgress = "egress"
 
 	// NetworkOpen places the container on the runtime's default network.

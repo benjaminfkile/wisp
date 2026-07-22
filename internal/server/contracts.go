@@ -733,11 +733,16 @@ func createOptions(spec launchSpec, contractID string, os runtime.ContainerOS) r
 		// Always harden leased containers against setuid privilege escalation.
 		SecurityOpt: []string{noNewPrivilegesOpt},
 	}
-	// Only "none" maps to an explicit Docker network mode today; "egress" and
-	// "open" both boot on the runtime's default network. Egress is not yet
-	// separately enforced (see policy.NetworkEgress).
-	if spec.network == policy.NetworkNone {
+	// Map the network policy to a Docker network mode. "none" disconnects the
+	// container entirely; "egress" attaches it to the dedicated wisp-managed
+	// egress bridge (outbound-only, no inter-container reachability), which the
+	// runtime creates on demand; "open" (the default) leaves NetworkMode empty
+	// so the container boots on the runtime's default bridge.
+	switch spec.network {
+	case policy.NetworkNone:
 		opts.NetworkMode = "none"
+	case policy.NetworkEgress:
+		opts.NetworkMode = runtime.EgressNetworkName
 	}
 	return opts
 }

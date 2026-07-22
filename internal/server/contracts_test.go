@@ -848,6 +848,28 @@ func TestCreateNoneNetworkMapsToDockerNone(t *testing.T) {
 	}
 }
 
+func TestCreateEgressNetworkMapsToDedicatedBridge(t *testing.T) {
+	// A policy permitting egress lets a lease request outbound-only isolation.
+	pol := &policy.Config{
+		Allow:        []string{"wisp-base"},
+		DefaultImage: "wisp-base",
+		Limits:       policy.Limits{Networks: []string{"none", "open", "egress"}},
+	}
+	h, store, fake := policyServer(t, pol)
+
+	// "egress" attaches the container to the dedicated wisp-managed bridge rather
+	// than falling through to the default network, so the runtime can isolate it.
+	created := createContract(t, h, `{"ttl_seconds":60,"network":"egress"}`)
+	c, _ := store.Get(created.ContractID)
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	if fc.Opts.NetworkMode != runtime.EgressNetworkName {
+		t.Errorf("network mode = %q, want %q for egress", fc.Opts.NetworkMode, runtime.EgressNetworkName)
+	}
+}
+
 func TestCreateAppliesNoNewPrivileges(t *testing.T) {
 	h, store, fake := testServer(t)
 	// Every leased container is hardened with the no-new-privileges security

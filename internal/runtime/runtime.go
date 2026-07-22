@@ -18,6 +18,23 @@ import (
 	"io"
 )
 
+// EgressNetworkName is the stable name of the dedicated wisp-managed bridge
+// network backing the "egress" network policy. A container attached to it
+// reaches the outside world (the network is a plain NAT bridge, not an
+// "internal" one, so outbound traffic still routes out) but cannot reach other
+// containers on the same bridge — inter-container communication is disabled via
+// EgressICCOption. The DockerRuntime creates this network on demand and reuses
+// it if it already exists (see DockerRuntime.ensureEgressNetwork); Create
+// treats a CreateOptions.NetworkMode equal to this name as the signal to do so.
+const EgressNetworkName = "wisp-egress"
+
+// EgressICCOption is the Docker bridge-network option that disables
+// inter-container communication on the egress network. With ICC off the daemon
+// installs iptables rules that drop traffic between containers on the bridge,
+// isolating leases from one another while leaving their outbound (masqueraded)
+// path intact.
+const EgressICCOption = "com.docker.network.bridge.enable_icc"
+
 // ErrNotFound is returned when an operation references a container id that the
 // runtime does not know about (never created, or already destroyed).
 var ErrNotFound = errors.New("runtime: container not found")
@@ -49,7 +66,10 @@ type CreateOptions struct {
 	Resources Resources
 
 	// NetworkMode selects the container's network. Empty uses the runtime's
-	// default network; "none" disconnects the container from all networks.
+	// default network; "none" disconnects the container from all networks;
+	// EgressNetworkName attaches the container to the dedicated wisp-managed
+	// egress bridge, which the DockerRuntime creates on demand (outbound-only,
+	// inter-container communication disabled).
 	NetworkMode string
 
 	// SecurityOpt carries Docker security options applied to the container's

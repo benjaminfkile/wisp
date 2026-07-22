@@ -198,8 +198,54 @@ func IsImageOSMismatch(err error) bool {
 	return strings.Contains(msg, "operating system") && strings.Contains(msg, "platform")
 }
 
+// ensureEgressNetwork makes the dedicated wisp-managed egress bridge available
+// before a container attaches to it, creating it on demand and reusing it if it
+// already exists. The network is a plain bridge (NOT internal), so containers on
+// it keep their masqueraded outbound path to the internet, but inter-container
+// communication is disabled (EgressICCOption=false) so leases on the bridge
+// cannot reach one another. The operation is idempotent: it inspects first and
+// returns early when the network is present, and treats an "already exists"
+// create conflict (e.g. from a concurrent create) as success.
+func (d *DockerRuntime) ensureEgressNetwork(ctx context.Context) error {
+	if _, err := d.cli.NetworkInspect(ctx, EgressNetworkName, types.NetworkInspectOptions{}); err == nil {
+		return nil // Already present; reuse it.
+	} else if !client.IsErrNotFound(err) {
+		return fmt.Errorf("runtime: inspect network %s: %w", EgressNetworkName, err)
+	}
+
+	_, err := d.cli.NetworkCreate(ctx, EgressNetworkName, types.NetworkCreate{
+		Driver: "bridge",
+		Options: map[string]string{
+			// Disable inter-container communication so leases sharing this bridge
+			// cannot reach each other; outbound (masqueraded) traffic is unaffected.
+			EgressICCOption: "false",
+		},
+		Labels: map[string]string{egressNetworkLabel: "true"},
+	})
+	if err != nil {
+		// A concurrent create may have won the race; treat "already exists" as
+		// success so the create stays idempotent.
+		if strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			return nil
+		}
+		return fmt.Errorf("runtime: create network %s: %w", EgressNetworkName, err)
+	}
+	return nil
+}
+
+// egressNetworkLabel marks the egress bridge as wisp-managed so it is
+// distinguishable from operator-created networks.
+const egressNetworkLabel = "wisp.managed"
+
 // Create implements Runtime.
 func (d *DockerRuntime) Create(ctx context.Context, image string, opts CreateOptions) (string, error) {
+	// An egress lease attaches to the dedicated wisp-managed bridge; ensure it
+	// exists (idempotently) before the container references it.
+	if opts.NetworkMode == EgressNetworkName {
+		if err := d.ensureEgressNetwork(ctx); err != nil {
+			return "", err
+		}
+	}
 	cfg := &container.Config{
 		Image:      image,
 		Cmd:        opts.Cmd,

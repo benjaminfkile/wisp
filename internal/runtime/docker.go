@@ -209,6 +209,7 @@ func (d *DockerRuntime) Create(ctx context.Context, image string, opts CreateOpt
 	}
 	host := &container.HostConfig{
 		NetworkMode: container.NetworkMode(opts.NetworkMode),
+		SecurityOpt: opts.SecurityOpt,
 		Resources: container.Resources{
 			NanoCPUs: opts.Resources.NanoCPUs,
 			Memory:   opts.Resources.MemoryBytes,

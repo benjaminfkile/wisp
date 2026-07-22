@@ -90,8 +90,10 @@ func (b *broker) requireAppToken(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // resourcesRequest is the optional per-request resource shaping. Each value is
-// clamped down to the operator's configured maximum when that maximum is set; a
-// zero value means "no request" (the runtime imposes no cap for that dimension).
+// clamped down to the operator's configured maximum when that maximum is set; an
+// unset (zero) value inherits that maximum so a lease that omits a dimension is
+// still bounded by the ceiling. When no maximum is configured for a dimension, a
+// zero value means "no request" and the runtime imposes no cap for it.
 type resourcesRequest struct {
 	CPUs     float64 `json:"cpus"`
 	MemoryMB int     `json:"memory_mb"`

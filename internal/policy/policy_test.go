@@ -26,18 +26,43 @@ func TestDefaultConfig(t *testing.T) {
 	if c.AllowsNetwork(NetworkEgress) {
 		t.Errorf("Default should not allow egress")
 	}
-	// No caps by default.
-	if got := c.ClampTTL(100 * time.Hour); got != 100*time.Hour {
-		t.Errorf("ClampTTL with no cap = %v, want unchanged", got)
+	// The built-in policy ships conservative non-zero ceilings so an
+	// uncustomized lease cannot exhaust the host or run forever.
+	if c.Limits.MaxTTLSeconds != 3600 {
+		t.Errorf("MaxTTLSeconds = %d, want 3600", c.Limits.MaxTTLSeconds)
 	}
-	if got := c.ClampCPUs(64); got != 64 {
-		t.Errorf("ClampCPUs with no cap = %v, want unchanged", got)
+	if c.Limits.MaxCPUs != 4 {
+		t.Errorf("MaxCPUs = %v, want 4", c.Limits.MaxCPUs)
 	}
-	if got := c.ClampMemoryMB(1 << 20); got != 1<<20 {
-		t.Errorf("ClampMemoryMB with no cap = %v, want unchanged", got)
+	if c.Limits.MaxMemoryMB != 4096 {
+		t.Errorf("MaxMemoryMB = %d, want 4096", c.Limits.MaxMemoryMB)
 	}
-	if got := c.ClampPids(9999); got != 9999 {
-		t.Errorf("ClampPids with no cap = %v, want unchanged", got)
+	if c.Limits.PidsLimit != 512 {
+		t.Errorf("PidsLimit = %d, want 512", c.Limits.PidsLimit)
+	}
+	// A request over a ceiling is clamped down to it.
+	if got := c.ClampTTL(100 * time.Hour); got != time.Hour {
+		t.Errorf("ClampTTL = %v, want 1h", got)
+	}
+	if got := c.ClampCPUs(64); got != 4 {
+		t.Errorf("ClampCPUs = %v, want 4", got)
+	}
+	if got := c.ClampMemoryMB(1 << 20); got != 4096 {
+		t.Errorf("ClampMemoryMB = %v, want 4096", got)
+	}
+	if got := c.ClampPids(9999); got != 512 {
+		t.Errorf("ClampPids = %v, want 512", got)
+	}
+	// An unset (zero) resource request inherits the ceiling instead of running
+	// uncapped, so a lease requesting resources:{} is bounded by the defaults.
+	if got := c.ClampCPUs(0); got != 4 {
+		t.Errorf("ClampCPUs(0) = %v, want 4 (inherits ceiling)", got)
+	}
+	if got := c.ClampMemoryMB(0); got != 4096 {
+		t.Errorf("ClampMemoryMB(0) = %v, want 4096 (inherits ceiling)", got)
+	}
+	if got := c.ClampPids(0); got != 512 {
+		t.Errorf("ClampPids(0) = %v, want 512 (inherits ceiling)", got)
 	}
 }
 

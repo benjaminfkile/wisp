@@ -96,16 +96,41 @@ type Config struct {
 	Limits Limits
 }
 
+// Conservative built-in resource / TTL ceilings applied by Default when
+// WISP_CONFIG is unset. They are DEFAULTS, not hard limits: an operator config
+// (loaded via Load) can raise or lower any of them. Their purpose is to ensure a
+// lease created against the built-in defaults — including one requesting
+// resources:{} — inherits a bounded container rather than an uncapped one that
+// could exhaust host CPU / RAM / PIDs or run forever.
+const (
+	// defaultMaxTTLSeconds caps a default lease at one hour.
+	defaultMaxTTLSeconds = 3600
+	// defaultMaxCPUs caps a default lease at four host cores.
+	defaultMaxCPUs = 4
+	// defaultMaxMemoryMB caps a default lease at 4 GiB of memory.
+	defaultMaxMemoryMB = 4096
+	// defaultPidsLimit caps a default lease at 512 processes.
+	defaultPidsLimit = 512
+)
+
 // Default returns the built-in policy used when WISP_CONFIG is unset: the bare
 // Linux and Windows base images are both allowed so the same default serves
 // either daemon OS, the Linux base is the configured default image (the current
 // OS overrides it for a windows daemon via DefaultImageFor), "none" and "open"
-// are the permitted networks, and no TTL / resource caps are imposed.
+// are the permitted networks, and conservative non-zero TTL / CPU / memory / PID
+// ceilings are imposed so a default lease is always bounded (an operator
+// WISP_CONFIG can raise or lower them).
 func Default() *Config {
 	return &Config{
 		Allow:        []string{baseImage, windowsBaseImage},
 		DefaultImage: baseImage,
-		Limits:       Limits{Networks: []string{NetworkNone, NetworkOpen}},
+		Limits: Limits{
+			MaxTTLSeconds: defaultMaxTTLSeconds,
+			MaxCPUs:       defaultMaxCPUs,
+			MaxMemoryMB:   defaultMaxMemoryMB,
+			PidsLimit:     defaultPidsLimit,
+			Networks:      []string{NetworkNone, NetworkOpen},
+		},
 	}
 }
 
@@ -167,26 +192,34 @@ func (c *Config) ClampTTL(requested time.Duration) time.Duration {
 	return requested
 }
 
-// ClampCPUs caps requested at the configured maximum. A zero max imposes no cap.
+// ClampCPUs caps requested at the configured maximum. A zero max imposes no cap
+// and returns requested unchanged. When a max is set, an unset request (<= 0)
+// inherits the maximum so a lease that omits a CPU request is bounded by the
+// ceiling instead of running uncapped.
 func (c *Config) ClampCPUs(requested float64) float64 {
-	if c.Limits.MaxCPUs > 0 && requested > c.Limits.MaxCPUs {
+	if c.Limits.MaxCPUs > 0 && (requested <= 0 || requested > c.Limits.MaxCPUs) {
 		return c.Limits.MaxCPUs
 	}
 	return requested
 }
 
 // ClampMemoryMB caps requested (mebibytes) at the configured maximum. A zero max
-// imposes no cap.
+// imposes no cap and returns requested unchanged. When a max is set, an unset
+// request (<= 0) inherits the maximum so a lease that omits a memory request is
+// bounded by the ceiling instead of running uncapped.
 func (c *Config) ClampMemoryMB(requested int) int {
-	if c.Limits.MaxMemoryMB > 0 && requested > c.Limits.MaxMemoryMB {
+	if c.Limits.MaxMemoryMB > 0 && (requested <= 0 || requested > c.Limits.MaxMemoryMB) {
 		return c.Limits.MaxMemoryMB
 	}
 	return requested
 }
 
-// ClampPids caps requested at the configured maximum. A zero max imposes no cap.
+// ClampPids caps requested at the configured maximum. A zero max imposes no cap
+// and returns requested unchanged. When a max is set, an unset request (<= 0)
+// inherits the maximum so a lease that omits a PID request is bounded by the
+// ceiling instead of running uncapped.
 func (c *Config) ClampPids(requested int) int {
-	if c.Limits.PidsLimit > 0 && requested > c.Limits.PidsLimit {
+	if c.Limits.PidsLimit > 0 && (requested <= 0 || requested > c.Limits.PidsLimit) {
 		return c.Limits.PidsLimit
 	}
 	return requested

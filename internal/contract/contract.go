@@ -115,6 +115,12 @@ type Contract struct {
 	// docs/DESIGN.md §7). Opaque to this package.
 	Image string
 
+	// Isolation is the resolved isolation level for the lease (see
+	// policy.Isolation), recorded so a later task can select the container
+	// runtime that satisfies it. Opaque to this package; empty on contracts
+	// reconciled from Docker labels, where it did not survive the restart.
+	Isolation string
+
 	// Meta is arbitrary client-supplied metadata echoed back on status reads.
 	// Opaque to Wisp.
 	Meta map[string]any

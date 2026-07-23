@@ -80,6 +80,15 @@ type Limits struct {
 
 	// Networks is the allow-list of network names a client may request.
 	Networks []string
+
+	// Isolations is the allow-list of isolation levels a client may request,
+	// gated exactly like Networks: a requested level must be a member (see
+	// Isolation). The built-in Default allows only "shared".
+	Isolations []string
+
+	// DefaultIsolation is the isolation level applied when a create request omits
+	// one. Empty falls back to "shared" (see Config.DefaultIsolation).
+	DefaultIsolation string
 }
 
 // Config is the operator's launch policy: an image allow-list, a default image,
@@ -131,6 +140,11 @@ func Default() *Config {
 			MaxMemoryMB:   defaultMaxMemoryMB,
 			PidsLimit:     defaultPidsLimit,
 			Networks:      []string{NetworkNone, NetworkOpen},
+			// The safe baseline: only "shared" (runc, today's behavior) is
+			// allowed and it is the default. A later capability-detection task
+			// widens this per host, and an operator WISP_CONFIG may set it.
+			Isolations:       []string{string(IsolationShared)},
+			DefaultIsolation: string(IsolationShared),
 		},
 	}
 }
@@ -180,6 +194,26 @@ func (c *Config) DefaultNetwork() string {
 		return c.Limits.Networks[0]
 	}
 	return ""
+}
+
+// AllowsIsolation reports whether level is one the operator permits.
+func (c *Config) AllowsIsolation(level Isolation) bool {
+	for _, l := range c.Limits.Isolations {
+		if Isolation(l) == level {
+			return true
+		}
+	}
+	return false
+}
+
+// DefaultIsolation is the isolation level used when a create request omits one:
+// the operator's configured default when set, otherwise the safe baseline
+// "shared".
+func (c *Config) DefaultIsolation() Isolation {
+	if c.Limits.DefaultIsolation != "" {
+		return Isolation(c.Limits.DefaultIsolation)
+	}
+	return IsolationShared
 }
 
 // ClampTTL caps requested at the configured maximum TTL. A zero max imposes no
@@ -244,6 +278,12 @@ type fileLimits struct {
 	MaxMemoryMB   int      `json:"max_memory_mb"`
 	PidsLimit     int      `json:"pids_limit"`
 	Networks      []string `json:"networks"`
+	// Isolations gates the isolation levels a client may request; DefaultIsolation
+	// is the level applied when a create omits one. Both are optional: an omitted
+	// list falls back to shared-only and an omitted default falls back to shared
+	// (see Load), mirroring how the networks list falls back.
+	Isolations       []string `json:"isolations"`
+	DefaultIsolation string   `json:"default_isolation"`
 }
 
 // Load returns the policy at path, or the built-in Default when path is empty.
@@ -273,17 +313,28 @@ func Load(path string) (*Config, error) {
 		Allow:        fc.Images.Allow,
 		DefaultImage: fc.Images.Default,
 		Limits: Limits{
-			MaxTTLSeconds: fc.Limits.MaxTTLSeconds,
-			MaxCPUs:       fc.Limits.MaxCPUs,
-			MaxMemoryMB:   fc.Limits.MaxMemoryMB,
-			PidsLimit:     fc.Limits.PidsLimit,
-			Networks:      fc.Limits.Networks,
+			MaxTTLSeconds:    fc.Limits.MaxTTLSeconds,
+			MaxCPUs:          fc.Limits.MaxCPUs,
+			MaxMemoryMB:      fc.Limits.MaxMemoryMB,
+			PidsLimit:        fc.Limits.PidsLimit,
+			Networks:         fc.Limits.Networks,
+			Isolations:       fc.Limits.Isolations,
+			DefaultIsolation: fc.Limits.DefaultIsolation,
 		},
 	}
 	// An omitted networks list falls back to the default set so a config that
 	// only tunes the allow-list still permits the usual networks.
 	if len(cfg.Limits.Networks) == 0 {
 		cfg.Limits.Networks = []string{NetworkNone, NetworkOpen}
+	}
+	// An omitted isolations list falls back to the safe baseline (shared-only) and
+	// an omitted default falls back to shared, so a config that only tunes other
+	// limits still permits and defaults to the runc baseline.
+	if len(cfg.Limits.Isolations) == 0 {
+		cfg.Limits.Isolations = []string{string(IsolationShared)}
+	}
+	if cfg.Limits.DefaultIsolation == "" {
+		cfg.Limits.DefaultIsolation = string(IsolationShared)
 	}
 	// An omitted default image falls back to the first allowed image.
 	if cfg.DefaultImage == "" && len(cfg.Allow) > 0 {
@@ -309,6 +360,18 @@ func (c *Config) validate() error {
 		if !validNetworks[n] {
 			return fmt.Errorf("invalid network %q (want none, open, or egress)", n)
 		}
+	}
+	// Every configured isolation level (and the default) must be a recognized
+	// level so a typo in the config is rejected at load, not at create time. A
+	// level that is known but not yet launchable (confidential) still parses here;
+	// the create path is what refuses to launch it.
+	for _, iso := range c.Limits.Isolations {
+		if _, err := ParseIsolation(iso); err != nil {
+			return fmt.Errorf("invalid isolation %q (want shared, sandboxed, or vm)", iso)
+		}
+	}
+	if _, err := ParseIsolation(c.Limits.DefaultIsolation); err != nil {
+		return fmt.Errorf("invalid default isolation %q (want shared, sandboxed, or vm)", c.Limits.DefaultIsolation)
 	}
 	return nil
 }

@@ -125,6 +125,13 @@ type createRequest struct {
 	Userdata   string           `json:"userdata"`
 	Meta       map[string]any   `json:"meta"`
 
+	// Isolation is the optional, ordered isolation level for the lease (see
+	// policy.Isolation): "shared" (the default and today's runc behavior),
+	// "sandboxed", or "vm". Omitted/empty resolves to the policy default. It is
+	// validated and recorded here; a later task maps the level to a container
+	// runtime, so today every accepted level still launches under runc.
+	Isolation string `json:"isolation"`
+
 	// Env is an optional, opaque KEY->VALUE map injected as the container's
 	// environment (see docs/DESIGN.md §8). Wisp is domain-blind about its
 	// contents; it just carries them into Config.Env so every exec/shell
@@ -166,6 +173,10 @@ type launchSpec struct {
 	memoryMB int
 	pids     int
 	network  string
+	// isolation is the resolved, validated isolation level for the lease (see
+	// policy.Isolation). It is recorded on the contract for a later task to map to
+	// a container runtime; it does not affect container launch yet.
+	isolation policy.Isolation
 	// env is the validated, KEY=VALUE-form environment injected into the
 	// container's Config.Env; nil when the create carried no env.
 	env []string
@@ -211,6 +222,30 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the isolation level: an omitted level selects the policy default;
+	// any other level must parse, be a level Wisp supports today (confidential is
+	// known but rejected), and be one the operator permits — else a client error
+	// (400), mirroring the image/network validation shape. This is spec + policy
+	// only: a later task maps the level to a container runtime, so today every
+	// accepted level still launches under runc.
+	isolation := b.pol.DefaultIsolation()
+	if req.Isolation != "" {
+		level, err := policy.ParseIsolation(req.Isolation)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := level.Validate(); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if !b.pol.AllowsIsolation(level) {
+			writeError(w, http.StatusBadRequest, "isolation not allowed: "+string(level))
+			return
+		}
+		isolation = level
+	}
+
 	// Validate and convert the optional env map before recording anything, so a
 	// malformed env is a clean 400 with no contract created. Values are never
 	// echoed in the error.
@@ -224,18 +259,20 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 	// down to any configured maximum (see docs/DESIGN.md §7).
 	ttl := b.pol.ClampTTL(time.Duration(req.TTLSeconds) * time.Second)
 	spec := launchSpec{
-		image:    image,
-		cpus:     b.pol.ClampCPUs(req.Resources.CPUs),
-		memoryMB: b.pol.ClampMemoryMB(req.Resources.MemoryMB),
-		pids:     b.pol.ClampPids(req.Resources.Pids),
-		network:  network,
-		env:      env,
+		image:     image,
+		cpus:      b.pol.ClampCPUs(req.Resources.CPUs),
+		memoryMB:  b.pol.ClampMemoryMB(req.Resources.MemoryMB),
+		pids:      b.pol.ClampPids(req.Resources.Pids),
+		network:   network,
+		isolation: isolation,
+		env:       env,
 	}
 
 	c, err := b.store.Create(contract.CreateParams{
-		TTL:   ttl,
-		Image: image,
-		Meta:  req.Meta,
+		TTL:       ttl,
+		Image:     image,
+		Isolation: string(spec.isolation),
+		Meta:      req.Meta,
 	})
 	if err != nil {
 		// The only error Create returns for a positive TTL is ErrInvalidTTL,

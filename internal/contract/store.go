@@ -22,6 +22,11 @@ type CreateParams struct {
 	// Image is the base image the container will boot from. Opaque to the store.
 	Image string
 
+	// Isolation is the resolved isolation level for the lease (see
+	// policy.Isolation), recorded so a later task can select the runtime that
+	// satisfies it. Opaque to the store.
+	Isolation string
+
 	// Meta is arbitrary client-supplied metadata echoed back on status reads.
 	// Opaque to the store.
 	Meta map[string]any
@@ -81,6 +86,7 @@ func (s *Store) Create(p CreateParams) (Contract, error) {
 		ID:        s.newID(),
 		TTL:       p.TTL,
 		Image:     p.Image,
+		Isolation: p.Isolation,
 		Meta:      p.Meta,
 		State:     StateRequested,
 		CreatedAt: created,

@@ -3,6 +3,7 @@ package policy
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -132,6 +133,125 @@ func TestClampToLimits(t *testing.T) {
 	}
 	if got := c.ClampPids(9999); got != 256 {
 		t.Errorf("ClampPids = %v, want 256", got)
+	}
+}
+
+func TestParseIsolation(t *testing.T) {
+	// Every known level parses, case-insensitively and space-trimmed, including
+	// confidential (which Validate rejects separately).
+	cases := map[string]Isolation{
+		"shared":        IsolationShared,
+		"SHARED":        IsolationShared,
+		"  Sandboxed  ": IsolationSandboxed,
+		"VM":            IsolationVM,
+		"Confidential":  IsolationConfidential,
+	}
+	for in, want := range cases {
+		got, err := ParseIsolation(in)
+		if err != nil {
+			t.Errorf("ParseIsolation(%q): unexpected error %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("ParseIsolation(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// An unknown string is an error.
+	if _, err := ParseIsolation("turtle"); err == nil {
+		t.Error("ParseIsolation(turtle) = nil error, want error")
+	}
+	if _, err := ParseIsolation(""); err == nil {
+		t.Error("ParseIsolation(\"\") = nil error, want error (empty is not defaulted here)")
+	}
+}
+
+func TestIsolationOrdering(t *testing.T) {
+	// The levels form a strict total order shared < sandboxed < vm < confidential.
+	if !(IsolationShared.Rank() < IsolationSandboxed.Rank() &&
+		IsolationSandboxed.Rank() < IsolationVM.Rank() &&
+		IsolationVM.Rank() < IsolationConfidential.Rank()) {
+		t.Errorf("ranks not strictly increasing: shared=%d sandboxed=%d vm=%d confidential=%d",
+			IsolationShared.Rank(), IsolationSandboxed.Rank(), IsolationVM.Rank(), IsolationConfidential.Rank())
+	}
+	// An unknown level ranks below every recognized level.
+	if Isolation("turtle").Rank() != -1 {
+		t.Errorf("unknown Rank() = %d, want -1", Isolation("turtle").Rank())
+	}
+}
+
+func TestIsolationValidate(t *testing.T) {
+	// The launchable levels validate.
+	for _, lvl := range []Isolation{IsolationShared, IsolationSandboxed, IsolationVM} {
+		if err := lvl.Validate(); err != nil {
+			t.Errorf("Validate(%q) = %v, want nil", lvl, err)
+		}
+	}
+	// confidential is known (parses) but rejected as not supported yet.
+	err := IsolationConfidential.Validate()
+	if err == nil {
+		t.Fatal("Validate(confidential) = nil, want not-supported error")
+	}
+	if !strings.Contains(err.Error(), "not supported yet") {
+		t.Errorf("Validate(confidential) error = %q, want it to mention 'not supported yet'", err)
+	}
+	// An unknown level is rejected too.
+	if err := Isolation("turtle").Validate(); err == nil {
+		t.Error("Validate(turtle) = nil, want error")
+	}
+}
+
+func TestDefaultAllowsOnlyShared(t *testing.T) {
+	c := Default()
+	if !c.AllowsIsolation(IsolationShared) {
+		t.Error("Default should allow shared")
+	}
+	if c.AllowsIsolation(IsolationSandboxed) || c.AllowsIsolation(IsolationVM) || c.AllowsIsolation(IsolationConfidential) {
+		t.Errorf("Default should allow ONLY shared, got %v", c.Limits.Isolations)
+	}
+	if got := c.DefaultIsolation(); got != IsolationShared {
+		t.Errorf("DefaultIsolation = %q, want shared", got)
+	}
+}
+
+func TestLoadIsolationConfig(t *testing.T) {
+	// A config can widen the allowed set and set a default, wired through exactly
+	// like networks.
+	path := writeConfig(t, `{
+	  "images": { "allow": ["wisp-base"] },
+	  "limits": { "isolations": ["shared", "sandboxed", "vm"], "default_isolation": "sandboxed" }
+	}`)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.AllowsIsolation(IsolationShared) || !c.AllowsIsolation(IsolationSandboxed) || !c.AllowsIsolation(IsolationVM) {
+		t.Errorf("allowed isolations = %v, want shared+sandboxed+vm", c.Limits.Isolations)
+	}
+	if got := c.DefaultIsolation(); got != IsolationSandboxed {
+		t.Errorf("DefaultIsolation = %q, want sandboxed", got)
+	}
+}
+
+func TestLoadIsolationDefaultsWhenOmitted(t *testing.T) {
+	// A config that does not mention isolation falls back to shared-only, defaulting
+	// to shared, so it preserves today's behavior.
+	path := writeConfig(t, `{"images": {"allow": ["wisp-base"]}}`)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(c.Limits.Isolations) != 1 || c.Limits.Isolations[0] != string(IsolationShared) {
+		t.Errorf("isolations = %v, want [shared] fallback", c.Limits.Isolations)
+	}
+	if got := c.DefaultIsolation(); got != IsolationShared {
+		t.Errorf("DefaultIsolation = %q, want shared", got)
+	}
+}
+
+func TestLoadRejectsBadIsolation(t *testing.T) {
+	path := writeConfig(t, `{"images": {"allow": ["a"]}, "limits": {"isolations": ["sideways"]}}`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load with invalid isolation = nil, want error")
 	}
 }
 

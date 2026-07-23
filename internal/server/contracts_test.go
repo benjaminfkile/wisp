@@ -561,10 +561,10 @@ func TestCreateEnvNotEchoedOnStatus(t *testing.T) {
 func TestCreateInvalidEnv(t *testing.T) {
 	h, store, _ := testServer(t)
 	bad := []string{
-		`{"ttl_seconds":60,"env":{"":"v"}}`,        // empty key
-		`{"ttl_seconds":60,"env":{"A=B":"v"}}`,     // '=' in key
+		`{"ttl_seconds":60,"env":{"":"v"}}`,         // empty key
+		`{"ttl_seconds":60,"env":{"A=B":"v"}}`,      // '=' in key
 		`{"ttl_seconds":60,"env":{"A\u0000B":"v"}}`, // NUL in key
-		`{"ttl_seconds":60,"env":{"A":"v\u0000w"}}`,  // NUL in value
+		`{"ttl_seconds":60,"env":{"A":"v\u0000w"}}`, // NUL in value
 	}
 	for _, body := range bad {
 		rec := do(t, h, http.MethodPost, "/contracts", body)
@@ -873,6 +873,112 @@ func TestCreateEgressNetworkMapsToDedicatedBridge(t *testing.T) {
 	}
 	if fc.Opts.NetworkMode != runtime.EgressNetworkName {
 		t.Errorf("network mode = %q, want %q for egress", fc.Opts.NetworkMode, runtime.EgressNetworkName)
+	}
+}
+
+func TestCreateOmittedIsolationDefaultsToShared(t *testing.T) {
+	h, store, fake := testServer(t)
+	// Omitting isolation resolves to the policy default (shared) and preserves
+	// today's behavior exactly: nothing about the launch changes yet.
+	created := createContract(t, h, `{"ttl_seconds":60}`)
+
+	c, _ := store.Get(created.ContractID)
+	if c.Isolation != string(policy.IsolationShared) {
+		t.Errorf("stored isolation = %q, want shared", c.Isolation)
+	}
+	// A create with no isolation still launches a normal container: no network
+	// mode override and the usual no-new-privileges hardening (unchanged behavior).
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	if fc.Opts.NetworkMode != "" {
+		t.Errorf("network mode = %q, want empty (behavior preserved)", fc.Opts.NetworkMode)
+	}
+}
+
+func TestCreateSharedIsolationAccepted(t *testing.T) {
+	h, store, _ := testServer(t)
+	// The default policy allows shared, so an explicit shared request succeeds and
+	// is recorded on the contract.
+	created := createContract(t, h, `{"ttl_seconds":60,"isolation":"shared"}`)
+	c, _ := store.Get(created.ContractID)
+	if c.Isolation != string(policy.IsolationShared) {
+		t.Errorf("stored isolation = %q, want shared", c.Isolation)
+	}
+}
+
+func TestCreateUnknownIsolationRejected(t *testing.T) {
+	h, store, _ := testServer(t)
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"isolation":"turtle"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if n := len(store.List()); n != 0 {
+		t.Errorf("stored contracts = %d, want 0 after rejected isolation", n)
+	}
+}
+
+func TestCreateConfidentialIsolationRejected(t *testing.T) {
+	// confidential is a known level, so it parses, but it is not supported yet and
+	// is rejected with a clear error before any contract is recorded — even if an
+	// operator has (mistakenly) allow-listed it.
+	pol := &policy.Config{
+		Allow:        []string{"wisp-base"},
+		DefaultImage: "wisp-base",
+		Limits: policy.Limits{
+			Networks:         []string{"none", "open"},
+			Isolations:       []string{"shared", "confidential"},
+			DefaultIsolation: "shared",
+		},
+	}
+	h, store, _ := policyServer(t, pol)
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"isolation":"confidential"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "not supported yet") {
+		t.Errorf("body = %q, want it to mention 'not supported yet'", rec.Body.String())
+	}
+	if n := len(store.List()); n != 0 {
+		t.Errorf("stored contracts = %d, want 0 after rejected isolation", n)
+	}
+}
+
+func TestCreateIsolationNotAllowedRejected(t *testing.T) {
+	h, store, _ := testServer(t)
+	// The default policy allows only shared; a valid-but-not-permitted level is a
+	// 400, mirroring the network allow-list rejection.
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"isolation":"vm"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "not allowed") {
+		t.Errorf("body = %q, want it to mention 'not allowed'", rec.Body.String())
+	}
+	if n := len(store.List()); n != 0 {
+		t.Errorf("stored contracts = %d, want 0 after rejected isolation", n)
+	}
+}
+
+func TestCreateAllowedIsolationRecorded(t *testing.T) {
+	// A policy widening the allowed set lets a lease request a stronger level; it
+	// is recorded on the contract (a later task maps it to a runtime — launch
+	// behavior is unchanged for now, so the container still boots normally).
+	pol := &policy.Config{
+		Allow:        []string{"wisp-base"},
+		DefaultImage: "wisp-base",
+		Limits: policy.Limits{
+			Networks:         []string{"none", "open"},
+			Isolations:       []string{"shared", "sandboxed", "vm"},
+			DefaultIsolation: "shared",
+		},
+	}
+	h, store, _ := policyServer(t, pol)
+	created := createContract(t, h, `{"ttl_seconds":60,"isolation":"VM"}`)
+	c, _ := store.Get(created.ContractID)
+	if c.Isolation != string(policy.IsolationVM) {
+		t.Errorf("stored isolation = %q, want vm (case-normalized)", c.Isolation)
 	}
 }
 

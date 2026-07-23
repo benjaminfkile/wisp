@@ -974,11 +974,24 @@ func TestCreateAllowedIsolationRecorded(t *testing.T) {
 			DefaultIsolation: "shared",
 		},
 	}
-	h, store, _ := policyServer(t, pol)
+	h, store, fake := policyServer(t, pol)
 	created := createContract(t, h, `{"ttl_seconds":60,"isolation":"VM"}`)
 	c, _ := store.Get(created.ContractID)
 	if c.Isolation != string(policy.IsolationVM) {
 		t.Errorf("stored isolation = %q, want vm (case-normalized)", c.Isolation)
+	}
+	// The resolved level flows from the create path into the runtime's
+	// CreateOptions.Isolation, and the runtime maps it to a launch mechanism: vm
+	// on this linux-mode fake selects the Kata runtime.
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	if fc.Opts.Isolation != string(policy.IsolationVM) {
+		t.Errorf("CreateOptions.Isolation = %q, want vm", fc.Opts.Isolation)
+	}
+	if fc.Runtime != "kata-runtime" || fc.Isolation != "" {
+		t.Errorf("launch mechanism = {Runtime:%q Isolation:%q}, want {kata-runtime, }", fc.Runtime, fc.Isolation)
 	}
 }
 

@@ -101,6 +101,59 @@ type CreateOptions struct {
 	// HostConfig.SecurityOpt (e.g. "no-new-privileges:true"). Empty applies no
 	// extra options.
 	SecurityOpt []string
+
+	// Isolation selects HOW the container is launched — the strength of the
+	// boundary between it and the host. Its values mirror the contract's
+	// isolation levels: "" or "shared" leaves the launch mechanism at the
+	// default OCI runtime (runc), today's behavior; "sandboxed" selects the
+	// gVisor runtime; "vm" selects a lightweight VM (the Kata runtime on a Linux
+	// daemon, Hyper-V isolation on a Windows daemon). The DockerRuntime maps this
+	// to HostConfig.Runtime / HostConfig.Isolation in Create (see
+	// launchMechanism); other runtimes may ignore it.
+	Isolation string
+}
+
+// The isolation levels recognized by CreateOptions.Isolation. They mirror the
+// contract-spec / policy level names (shared < sandboxed < vm) but are kept as
+// plain runtime constants so the runtime package does not depend on the policy
+// package; the create path passes the resolved level string through.
+const (
+	IsolationShared    = "shared"
+	IsolationSandboxed = "sandboxed"
+	IsolationVM        = "vm"
+)
+
+// The Docker launch-mechanism names an isolation level maps to. These are the
+// standard defaults for each backend and are not configurable: gVisor registers
+// its OCI runtime as "runsc", Kata Containers as "kata-runtime", and Hyper-V
+// isolation is selected via the container's Isolation value "hyperv" rather than
+// a named runtime.
+const (
+	gVisorRuntimeName = "runsc"
+	kataRuntimeName   = "kata-runtime"
+	hyperVIsolation   = "hyperv"
+)
+
+// launchMechanism maps a requested isolation level and the daemon's container OS
+// to the Docker launch mechanism: the HostConfig.Runtime name and the
+// HostConfig.Isolation value. At most one is non-empty — they are NEVER both
+// set. "" and "shared" yield neither (the default OCI runtime, runc, unchanged);
+// "sandboxed" yields the gVisor runtime; "vm" yields the Kata runtime on a Linux
+// daemon or Hyper-V isolation on a Windows daemon. Both DockerRuntime.Create and
+// the Fake use it so their behavior matches and tests can assert the mapping
+// against the Fake.
+func launchMechanism(isolation string, os ContainerOS) (runtimeName, isolationMode string) {
+	switch isolation {
+	case IsolationSandboxed:
+		return gVisorRuntimeName, ""
+	case IsolationVM:
+		if os == OSWindows {
+			return "", hyperVIsolation
+		}
+		return kataRuntimeName, ""
+	default:
+		return "", ""
+	}
 }
 
 // Resources caps a container's resource usage. A zero field means "no limit"

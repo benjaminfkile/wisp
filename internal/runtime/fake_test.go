@@ -351,3 +351,52 @@ func TestFakeContainerOS(t *testing.T) {
 		t.Fatalf("ContainerOS() after OS=windows = %q, want %q", got, OSWindows)
 	}
 }
+
+// TestFakeCreateIsolationMechanism verifies the Fake resolves the isolation
+// level in CreateOptions to the same Docker launch mechanism the real runtime
+// would, recording the Runtime and Isolation values on the captured container so
+// tests can assert the full level→mechanism mapping without a daemon. The full
+// matrix: shared (and the empty default) → neither set; sandboxed → Runtime
+// "runsc"; vm on a linux daemon → Runtime "kata-runtime"; vm on a windows daemon
+// → Isolation "hyperv". Runtime and Isolation are never both set.
+func TestFakeCreateIsolationMechanism(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name          string
+		os            ContainerOS
+		isolation     string
+		wantRuntime   string
+		wantIsolation string
+	}{
+		{"shared linux", OSLinux, IsolationShared, "", ""},
+		{"empty defaults to shared", OSLinux, "", "", ""},
+		{"shared windows", OSWindows, IsolationShared, "", ""},
+		{"sandboxed linux", OSLinux, IsolationSandboxed, "runsc", ""},
+		{"sandboxed windows", OSWindows, IsolationSandboxed, "runsc", ""},
+		{"vm linux", OSLinux, IsolationVM, "kata-runtime", ""},
+		{"vm windows", OSWindows, IsolationVM, "", "hyperv"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := NewFake()
+			f.OS = tt.os
+			id, err := f.Create(ctx, "img", CreateOptions{Isolation: tt.isolation})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			c, ok := f.Container(id)
+			if !ok {
+				t.Fatalf("container %s not tracked", id)
+			}
+			if c.Runtime != tt.wantRuntime {
+				t.Errorf("Runtime = %q, want %q", c.Runtime, tt.wantRuntime)
+			}
+			if c.Isolation != tt.wantIsolation {
+				t.Errorf("Isolation = %q, want %q", c.Isolation, tt.wantIsolation)
+			}
+			if c.Runtime != "" && c.Isolation != "" {
+				t.Errorf("both Runtime (%q) and Isolation (%q) set; must never both be set", c.Runtime, c.Isolation)
+			}
+		})
+	}
+}

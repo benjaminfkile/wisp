@@ -790,6 +790,10 @@ func createOptions(spec launchSpec, c contract.Contract, os runtime.ContainerOS)
 		},
 		// Always harden leased containers against setuid privilege escalation.
 		SecurityOpt: []string{noNewPrivilegesOpt},
+		// Carry the resolved isolation level so the runtime selects the launch
+		// mechanism from it (shared→runc, sandboxed→gVisor, vm→Kata/Hyper-V); see
+		// runtime.launchMechanism. "shared" leaves today's behavior unchanged.
+		Isolation: string(spec.isolation),
 	}
 	// Map the network policy to a Docker network mode. "none" disconnects the
 	// container entirely; "egress" attaches it to the dedicated wisp-managed

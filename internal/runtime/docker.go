@@ -266,6 +266,14 @@ func (d *DockerRuntime) Create(ctx context.Context, image string, opts CreateOpt
 		pids := opts.Resources.PidsLimit
 		host.Resources.PidsLimit = &pids
 	}
+	// Select the launch mechanism from the requested isolation level. The daemon
+	// OS is distinguished the same way exec-command wrapping already does it (the
+	// cached containerOS). launchMechanism returns at most one of the two — they
+	// are never both set — leaving every other HostConfig field (SecurityOpt,
+	// Resources, NetworkMode) untouched.
+	runtimeName, isolationMode := launchMechanism(opts.Isolation, d.containerOS)
+	host.Runtime = runtimeName
+	host.Isolation = container.Isolation(isolationMode)
 	resp, err := d.cli.ContainerCreate(ctx, cfg, host, nil, nil, "")
 	if err != nil {
 		return "", fmt.Errorf("runtime: create container: %w", err)

@@ -15,6 +15,12 @@ type FakeContainer struct {
 	Opts    CreateOptions
 	Started bool
 	Killed  bool
+	// Runtime and Isolation are the Docker launch-mechanism values the isolation
+	// level in Opts resolves to for this fake's OS (see launchMechanism), so a
+	// test can assert the level→mechanism mapping without a real daemon. At most
+	// one is non-empty: they are never both set.
+	Runtime   string
+	Isolation string
 	// Execs is the ordered list of commands run against this container via
 	// ExecSync or ExecStream.
 	Execs [][]string
@@ -141,7 +147,16 @@ func (f *Fake) Create(ctx context.Context, image string, opts CreateOptions) (st
 	f.lazyInit()
 	f.seq++
 	id := fmt.Sprintf("fake-%d", f.seq)
-	f.containers[id] = &FakeContainer{ID: id, Image: image, Opts: opts}
+	// Resolve the launch mechanism the same way the real runtime does so tests
+	// can assert the isolation level→Runtime/Isolation mapping. The OS mirrors
+	// ContainerOS's default (an empty OS is treated as linux); read directly here
+	// because we already hold the lock.
+	os := f.OS
+	if os == "" {
+		os = OSLinux
+	}
+	rt, iso := launchMechanism(opts.Isolation, os)
+	f.containers[id] = &FakeContainer{ID: id, Image: image, Opts: opts, Runtime: rt, Isolation: iso}
 	return id, nil
 }
 

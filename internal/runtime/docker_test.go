@@ -7,8 +7,11 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/client"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // TestIdleCommand verifies the keep-alive command is chosen for the container
@@ -171,4 +174,92 @@ func TestDockerRuntimeContainerOSFallback(t *testing.T) {
 			t.Fatalf("ContainerOS() with unknown OSType = %q, want %q", got, OSLinux)
 		}
 	})
+}
+
+// createStubClient embeds the Docker APIClient (left nil) and overrides only the
+// two methods DockerRuntime.Create needs without a daemon: Info drives OS
+// detection at construction, and ContainerCreate captures the HostConfig so a
+// test can assert how the isolation level maps onto it. Any other method call
+// would panic, which is fine: Create only touches these.
+type createStubClient struct {
+	client.APIClient
+	osType    string
+	gotHost   *container.HostConfig
+	gotConfig *container.Config
+}
+
+func (c *createStubClient) Info(context.Context) (system.Info, error) {
+	return system.Info{OSType: c.osType}, nil
+}
+
+func (c *createStubClient) ContainerCreate(_ context.Context, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
+	c.gotConfig = config
+	c.gotHost = hostConfig
+	return container.CreateResponse{ID: "created"}, nil
+}
+
+// TestDockerRuntimeCreateIsolation verifies DockerRuntime.Create maps the
+// requested isolation level onto the container's HostConfig the same way for the
+// real backend: shared (and the empty default) leave Runtime and Isolation unset
+// (default runc); sandboxed selects the gVisor runtime "runsc"; vm on a linux
+// daemon selects the Kata runtime "kata-runtime"; vm on a windows daemon selects
+// Hyper-V isolation "hyperv". Runtime and Isolation are never both set, and no
+// other HostConfig field (SecurityOpt, Resources, NetworkMode) is disturbed.
+func TestDockerRuntimeCreateIsolation(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name          string
+		osType        string
+		isolation     string
+		wantRuntime   string
+		wantIsolation container.Isolation
+	}{
+		{"shared linux", "linux", IsolationShared, "", ""},
+		{"empty defaults to shared", "linux", "", "", ""},
+		{"shared windows", "windows", IsolationShared, "", ""},
+		{"sandboxed linux", "linux", IsolationSandboxed, "runsc", ""},
+		{"sandboxed windows", "windows", IsolationSandboxed, "runsc", ""},
+		{"vm linux", "linux", IsolationVM, "kata-runtime", ""},
+		{"vm windows", "windows", IsolationVM, "", container.Isolation("hyperv")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &createStubClient{osType: tt.osType}
+			d := NewDockerRuntimeWithClient(stub)
+
+			// Pass unrelated HostConfig-bearing options to confirm they survive
+			// untouched alongside the isolation mapping.
+			opts := CreateOptions{
+				Isolation:   tt.isolation,
+				SecurityOpt: []string{"no-new-privileges:true"},
+				NetworkMode: "none",
+				Resources:   Resources{NanoCPUs: 1_500_000_000, MemoryBytes: 256 << 20},
+			}
+			if _, err := d.Create(ctx, "img", opts); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if stub.gotHost == nil {
+				t.Fatal("ContainerCreate was not called")
+			}
+			if stub.gotHost.Runtime != tt.wantRuntime {
+				t.Errorf("HostConfig.Runtime = %q, want %q", stub.gotHost.Runtime, tt.wantRuntime)
+			}
+			if stub.gotHost.Isolation != tt.wantIsolation {
+				t.Errorf("HostConfig.Isolation = %q, want %q", stub.gotHost.Isolation, tt.wantIsolation)
+			}
+			if stub.gotHost.Runtime != "" && stub.gotHost.Isolation != "" {
+				t.Errorf("both Runtime (%q) and Isolation (%q) set; must never both be set", stub.gotHost.Runtime, stub.gotHost.Isolation)
+			}
+			// Other HostConfig fields are untouched by the isolation mapping.
+			if !reflect.DeepEqual(stub.gotHost.SecurityOpt, []string{"no-new-privileges:true"}) {
+				t.Errorf("SecurityOpt = %v, want unchanged", stub.gotHost.SecurityOpt)
+			}
+			if stub.gotHost.NetworkMode != "none" {
+				t.Errorf("NetworkMode = %q, want unchanged \"none\"", stub.gotHost.NetworkMode)
+			}
+			if stub.gotHost.Resources.NanoCPUs != 1_500_000_000 || stub.gotHost.Resources.Memory != 256<<20 {
+				t.Errorf("Resources = %+v, want unchanged", stub.gotHost.Resources)
+			}
+		})
+	}
 }

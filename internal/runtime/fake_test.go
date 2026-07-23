@@ -352,6 +352,60 @@ func TestFakeContainerOS(t *testing.T) {
 	}
 }
 
+// TestFakeDaemonInfo verifies DaemonInfo is stubbable: a nil Runtimes field
+// reports the permissive default set (so capability-agnostic tests see every
+// level), an explicit Runtimes value is reported verbatim, the reported OS
+// follows the Fake's OS (defaulting to linux), and DaemonInfoErr surfaces the
+// daemon-unreachable path.
+func TestFakeDaemonInfo(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("default permissive runtimes", func(t *testing.T) {
+		f := NewFake()
+		got, err := f.DaemonInfo(ctx)
+		if err != nil {
+			t.Fatalf("DaemonInfo: %v", err)
+		}
+		want := []string{"runc", "runsc", "kata-runtime"}
+		if !reflect.DeepEqual(got.Runtimes, want) {
+			t.Errorf("Runtimes = %v, want %v", got.Runtimes, want)
+		}
+		if got.OS != OSLinux {
+			t.Errorf("OS = %q, want linux", got.OS)
+		}
+		// The returned slice is a copy: mutating it must not affect the Fake.
+		got.Runtimes[0] = "tampered"
+		if again, _ := f.DaemonInfo(ctx); again.Runtimes[0] != "runc" {
+			t.Errorf("DaemonInfo returned an aliased slice: %v", again.Runtimes)
+		}
+	})
+
+	t.Run("stubbed runtimes and windows os", func(t *testing.T) {
+		f := NewFake()
+		f.Runtimes = []string{"runc"}
+		f.OS = OSWindows
+		got, err := f.DaemonInfo(ctx)
+		if err != nil {
+			t.Fatalf("DaemonInfo: %v", err)
+		}
+		if !reflect.DeepEqual(got.Runtimes, []string{"runc"}) {
+			t.Errorf("Runtimes = %v, want [runc]", got.Runtimes)
+		}
+		if got.OS != OSWindows {
+			t.Errorf("OS = %q, want windows", got.OS)
+		}
+	})
+
+	t.Run("injected error", func(t *testing.T) {
+		sentinel := errors.New("no daemon")
+		f := NewFake()
+		f.DaemonInfoErr = sentinel
+		if _, err := f.DaemonInfo(ctx); !errors.Is(err, sentinel) {
+			t.Errorf("DaemonInfo err = %v, want sentinel", err)
+		}
+	})
+}
+
 // TestFakeCreateIsolationMechanism verifies the Fake resolves the isolation
 // level in CreateOptions to the same Docker launch mechanism the real runtime
 // would, recording the Runtime and Isolation values on the captured container so

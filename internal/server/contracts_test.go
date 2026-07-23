@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -992,6 +993,147 @@ func TestCreateAllowedIsolationRecorded(t *testing.T) {
 	}
 	if fc.Runtime != "kata-runtime" || fc.Isolation != "" {
 		t.Errorf("launch mechanism = {Runtime:%q Isolation:%q}, want {kata-runtime, }", fc.Runtime, fc.Isolation)
+	}
+}
+
+// TestCreateIsolationUnavailableDroppedAndRejected verifies the host advertises
+// and accepts only isolation levels it can actually run: a policy that allows vm
+// on a host whose daemon reports only runc drops vm from the effective set (with a
+// startup WARNING), rejects a vm create request, and advertises only shared on the
+// discovery document.
+func TestCreateIsolationUnavailableDroppedAndRejected(t *testing.T) {
+	pol := &policy.Config{
+		Allow:        []string{"wisp-base"},
+		DefaultImage: "wisp-base",
+		Limits: policy.Limits{
+			Networks:         []string{"none", "open"},
+			Isolations:       []string{"shared", "vm"},
+			DefaultIsolation: "shared",
+		},
+	}
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	// This daemon can only run the shared baseline: no gVisor/Kata runtimes.
+	fake.Runtimes = []string{"runc"}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	h := New(logger, store, fake, pol, bus.New(nil), "")
+
+	// A clear startup warning names the dropped level.
+	if out := logs.String(); !strings.Contains(out, "vm") || !strings.Contains(out, "not available") {
+		t.Errorf("startup logs = %q, want a warning that vm is not available", out)
+	}
+
+	// A create requesting the dropped level is rejected before any contract exists.
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"isolation":"vm"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "not allowed") {
+		t.Errorf("body = %q, want it to mention 'not allowed'", rec.Body.String())
+	}
+	if n := len(store.List()); n != 0 {
+		t.Errorf("stored contracts = %d, want 0 after rejected isolation", n)
+	}
+
+	// The discovery document advertises only the effective (runnable) levels.
+	rec = do(t, h, http.MethodGet, "/images", "")
+	var got imagesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !reflect.DeepEqual(got.Isolation.Supported, []string{"shared"}) {
+		t.Errorf("advertised isolation.supported = %v, want [shared]", got.Isolation.Supported)
+	}
+	if got.Isolation.Default != "shared" {
+		t.Errorf("advertised isolation.default = %q, want shared", got.Isolation.Default)
+	}
+
+	// shared (the effective level) is still accepted.
+	if rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"isolation":"shared"}`); rec.Code != http.StatusCreated {
+		t.Errorf("shared create status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateSandboxedRequiresRunsc verifies sandboxed is only accepted when the
+// daemon has the gVisor runtime "runsc" registered: with runsc present the level
+// is advertised and a create succeeds; without it the level is dropped and the
+// create is rejected.
+func TestCreateSandboxedRequiresRunsc(t *testing.T) {
+	pol := &policy.Config{
+		Allow:        []string{"wisp-base"},
+		DefaultImage: "wisp-base",
+		Limits: policy.Limits{
+			Networks:         []string{"none", "open"},
+			Isolations:       []string{"shared", "sandboxed"},
+			DefaultIsolation: "shared",
+		},
+	}
+
+	t.Run("runsc present", func(t *testing.T) {
+		store := contract.NewStore()
+		fake := runtime.NewFake()
+		fake.Runtimes = []string{"runc", "runsc"}
+		h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, pol, bus.New(nil), "")
+
+		created := createContract(t, h, `{"ttl_seconds":60,"isolation":"sandboxed"}`)
+		c, _ := store.Get(created.ContractID)
+		fc, ok := fake.Container(c.ContainerID)
+		if !ok {
+			t.Fatal("container not tracked")
+		}
+		// sandboxed maps to the gVisor runtime on the launched container.
+		if fc.Runtime != "runsc" {
+			t.Errorf("launch runtime = %q, want runsc", fc.Runtime)
+		}
+	})
+
+	t.Run("runsc absent", func(t *testing.T) {
+		store := contract.NewStore()
+		fake := runtime.NewFake()
+		fake.Runtimes = []string{"runc"}
+		h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, pol, bus.New(nil), "")
+
+		rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"isolation":"sandboxed"}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+		}
+		if n := len(store.List()); n != 0 {
+			t.Errorf("stored contracts = %d, want 0", n)
+		}
+	})
+}
+
+// TestCreateVMAvailableOnWindowsDaemon verifies a windows-mode daemon provides vm
+// via Hyper-V even without a Kata runtime registered: the level is accepted and
+// maps to Hyper-V isolation on the launched container.
+func TestCreateVMAvailableOnWindowsDaemon(t *testing.T) {
+	pol := &policy.Config{
+		Allow:        []string{"wisp-base", "wisp-base-windows"},
+		DefaultImage: "wisp-base",
+		Limits: policy.Limits{
+			Networks:         []string{"none", "open"},
+			Isolations:       []string{"shared", "vm"},
+			DefaultIsolation: "shared",
+		},
+	}
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	fake.OS = runtime.OSWindows
+	// Only runc registered — vm comes from the windows daemon (Hyper-V), not Kata.
+	fake.Runtimes = []string{"runc"}
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, pol, bus.New(nil), "")
+
+	created := createContract(t, h, `{"ttl_seconds":60,"isolation":"vm"}`)
+	c, _ := store.Get(created.ContractID)
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	// vm on a windows daemon selects Hyper-V isolation, not a named runtime.
+	if fc.Isolation != "hyperv" || fc.Runtime != "" {
+		t.Errorf("launch mechanism = {Runtime:%q Isolation:%q}, want {\"\", hyperv}", fc.Runtime, fc.Isolation)
 	}
 }
 

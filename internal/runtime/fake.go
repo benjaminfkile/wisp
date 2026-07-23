@@ -92,7 +92,24 @@ type Fake struct {
 	// is treated as OSLinux, so a freshly constructed Fake defaults to linux;
 	// tests set it to OSWindows to exercise Windows-container paths.
 	OS ContainerOS
+
+	// Runtimes is the set of registered OCI runtime names reported by DaemonInfo.
+	// A nil value defaults to a permissive set (runc plus the gVisor and Kata
+	// runtimes) so a test that does not care about isolation capability still sees
+	// every level as available; capability tests set it explicitly (e.g.
+	// []string{"runc"}) to model a host that can only run the shared baseline.
+	Runtimes []string
+
+	// DaemonInfoErr, when set, is returned by DaemonInfo so tests can exercise the
+	// daemon-unreachable path and the caller's conservative fallback.
+	DaemonInfoErr error
 }
+
+// defaultFakeRuntimes is the permissive runtime set DaemonInfo reports when the
+// Fake's Runtimes field is left nil: runc (the shared baseline), the gVisor
+// runtime backing sandboxed, and the Kata runtime backing vm. It keeps tests that
+// don't care about capability seeing every isolation level as available.
+var defaultFakeRuntimes = []string{"runc", gVisorRuntimeName, kataRuntimeName}
 
 // NewFake returns an initialized Fake runtime. It reports OSLinux by default;
 // set OS to OSWindows to have it report a Windows daemon.
@@ -109,6 +126,30 @@ func (f *Fake) ContainerOS() ContainerOS {
 		return OSLinux
 	}
 	return f.OS
+}
+
+// DaemonInfo implements Runtime, reporting the Fake's configured runtimes and OS.
+// A nil Runtimes field defaults to the permissive defaultFakeRuntimes so a test
+// that ignores isolation capability still sees every level as available; an unset
+// OS reports linux, matching ContainerOS. When DaemonInfoErr is set it is
+// returned instead, letting a test drive the daemon-unreachable fallback.
+func (f *Fake) DaemonInfo(ctx context.Context) (DaemonInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.DaemonInfoErr != nil {
+		return DaemonInfo{}, f.DaemonInfoErr
+	}
+	os := f.OS
+	if os == "" {
+		os = OSLinux
+	}
+	runtimes := f.Runtimes
+	if runtimes == nil {
+		runtimes = defaultFakeRuntimes
+	}
+	out := make([]string, len(runtimes))
+	copy(out, runtimes)
+	return DaemonInfo{Runtimes: out, OS: os}, nil
 }
 
 // lazyInit ensures the container map exists so the zero value is usable.

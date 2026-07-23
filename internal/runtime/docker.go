@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/docker/docker/api/types"
@@ -66,6 +67,30 @@ func (d *DockerRuntime) detectContainerOS(ctx context.Context) {
 // mode ("linux" or "windows").
 func (d *DockerRuntime) ContainerOS() ContainerOS {
 	return d.containerOS
+}
+
+// DaemonInfo implements Runtime. It queries the daemon via the Docker client's
+// Info call, which exposes both the registered OCI runtimes (Info.Runtimes, keyed
+// by runtime name) and the container OS mode (Info.OSType). The runtime names are
+// returned sorted for stable output, and an unrecognized OSType falls back to
+// linux (the Docker default), mirroring detectContainerOS. An Info failure is
+// wrapped and returned so the caller can fall back to a conservative capability
+// set.
+func (d *DockerRuntime) DaemonInfo(ctx context.Context) (DaemonInfo, error) {
+	info, err := d.cli.Info(ctx)
+	if err != nil {
+		return DaemonInfo{}, fmt.Errorf("runtime: daemon info: %w", err)
+	}
+	runtimes := make([]string, 0, len(info.Runtimes))
+	for name := range info.Runtimes {
+		runtimes = append(runtimes, name)
+	}
+	sort.Strings(runtimes)
+	os := OSLinux
+	if ContainerOS(info.OSType) == OSWindows {
+		os = OSWindows
+	}
+	return DaemonInfo{Runtimes: runtimes, OS: os}, nil
 }
 
 // Close releases the underlying Docker client resources.

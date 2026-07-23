@@ -63,6 +63,7 @@ POST /contracts
   "ttl_seconds": 3600,            // required, > 0; clamped to limits.max_ttl_seconds (§7)
   "image": "wisp-base",           // optional; defaults to images.default, must be allow-listed (§7)
   "network": "open",              // optional; one of limits.networks (§7)
+  "isolation": "shared",          // optional; one of limits.isolations; shared<sandboxed<vm (§7)
   "resources": { "cpus": 2, "memory_mb": 4096, "pids": 1024 },  // optional; clamped to limits (§7)
   "userdata": "#!/bin/sh\napt-get install -y git ...",   // provisioning, runs at boot
   "meta": { ... }                 // opaque client tags, echoed back on status reads
@@ -144,31 +145,40 @@ owns a small, data-driven **config** — an image **allow-list**, a **default im
 Userdata owns everything *inside* the container.
 
 The config is a JSON file whose path comes from `WISP_CONFIG`. When unset, Wisp uses safe built-in
-defaults (allow-list of just the bare base image, networks `none` + `open`, no resource/TTL caps).
+defaults (allow-list of just the bare base image, networks `none` + `open`, isolation `shared` only,
+and conservative resource/TTL ceilings: TTL 3600 s, 4 CPUs, 4096 MB, 512 pids).
 
 ```jsonc
 {
   "images": { "allow": ["wisp-base"], "default": "wisp-base" },
   "limits": {
-    "max_ttl_seconds": 0,   // 0 / omitted ⇒ no cap
-    "max_cpus": 0,          // fraction of host cores; 0 ⇒ no cap
-    "max_memory_mb": 0,     // 0 ⇒ no cap
-    "pids_limit": 0,        // 0 ⇒ no cap
-    "networks": ["none", "open"]   // which of none/open/egress a client may request
+    "max_ttl_seconds": 3600,   // 0 / omitted ⇒ no cap; built-in default 3600
+    "max_cpus": 4,             // fraction of host cores; 0 ⇒ no cap; built-in default 4
+    "max_memory_mb": 4096,     // 0 ⇒ no cap; built-in default 4096
+    "pids_limit": 512,         // 0 ⇒ no cap; built-in default 512
+    "networks": ["none", "open"],        // which of none/open/egress a client may request
+    "isolations": ["shared"],            // which of shared/sandboxed/vm a client may request
+    "default_isolation": "shared"        // applied when a create omits isolation
   }
 }
 ```
 
-On load Wisp validates: the allow-list is non-empty, the default image is in it, and every network
-is one of `none` / `open` / `egress`. An example lives at `examples/wisp.config.json`.
+On load Wisp validates: the allow-list is non-empty, the default image is in it, every network is one
+of `none` / `open` / `egress`, and every configured isolation level and the default are valid
+(`shared` / `sandboxed` / `vm`). An example lives at `examples/wisp.config.json`.
 
-At create time (§4) the client sends `image`, `network`, and `resources`:
+At create time (§4) the client sends `image`, `network`, `isolation`, and `resources`:
 
 - **image** — optional; defaults to `images.default`. Must be in the allow-list, else `400`.
 - **network** — optional; defaults to `open` when allowed, else the first configured network. Must
   be one of `limits.networks`, else `400`. `none` disconnects the container from all networks;
-  `open` and `egress` both boot on the runtime's default network today (egress is not yet separately
-  enforced).
+  `open` boots on the runtime's default network; `egress` boots on a dedicated Wisp-managed bridge
+  with inter-container communication disabled (`enable_icc=false`), so the container has outbound
+  access but cannot reach other leases on the host.
+- **isolation** — optional; one of `limits.isolations`, defaults to `default_isolation` (`shared`).
+  Ordered `shared < sandboxed < vm` (`confidential` is reserved and rejected). The host maps the
+  level to a container runtime at launch (`shared`→runc, `sandboxed`→gVisor/`runsc`, `vm`→Kata on
+  Linux or Hyper-V on Windows) and rejects a level it cannot actually run.
 - **resources** — optional `{cpus, memory_mb, pids}`; each value is **clamped down** to the matching
   configured maximum when that maximum is set.
 - **ttl_seconds** — required; clamped down to `limits.max_ttl_seconds` when set.
@@ -321,8 +331,10 @@ switches it** — it only serves whichever mode the host is in.
   before then.
 - **Output backpressure** — the shell/stream bridge must handle large/fast output without blowing
   memory (stream, don't buffer whole).
-- **Reaping guarantees** — the reaper must destroy containers even across Wisp restarts (persist
-  contract → container mapping; reconcile on boot).
+- **Reaping guarantees** — the reaper destroys containers even across Wisp restarts. Each container
+  is labeled with its contract id and expiry (`wisp.contract`, `wisp.expires_at`); on boot Wisp
+  reconciles its in-memory store from the live containers' labels before the reaper starts, so a
+  restart cannot orphan a lease (`internal/server/reconcile.go`).
 
 ## 14. Open questions
 

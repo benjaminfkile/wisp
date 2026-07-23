@@ -43,19 +43,21 @@ image and shapes network / resources per request. Userdata owns everything
 
 The config is a JSON file whose path comes from `WISP_CONFIG`; when unset, Wisp
 uses safe built-in defaults (allow-list of just `wisp-base`, networks `none` +
-`open`, no resource/TTL caps). An example lives at
+`open`, isolation `shared` only, and conservative resource/TTL ceilings: TTL
+3600 s, 4 CPUs, 4096 MB, 512 pids). An example lives at
 [`examples/wisp.config.json`](examples/wisp.config.json):
 
 ```json
 {
   "images": { "allow": ["wisp-base"], "default": "wisp-base" },
-  "limits": { "max_ttl_seconds": 0, "max_cpus": 0, "max_memory_mb": 0, "pids_limit": 0, "networks": ["none", "open"] }
+  "limits": { "max_ttl_seconds": 3600, "max_cpus": 4, "max_memory_mb": 4096, "pids_limit": 512, "networks": ["none", "open"], "isolations": ["shared"], "default_isolation": "shared" }
 }
 ```
 
-A zero/empty numeric limit means **no cap**. On load Wisp validates that the
-allow-list is non-empty, the default image is in it, and every network is one of
-`none` / `open` / `egress`.
+A zero/empty numeric limit means **no cap** (the built-in defaults above are
+non-zero ceilings). On load Wisp validates that the allow-list is non-empty, the
+default image is in it, every network is one of `none` / `open` / `egress`, and
+every isolation level and the default are valid (`shared` / `sandboxed` / `vm`).
 
 `POST /contracts` accepts:
 
@@ -64,6 +66,7 @@ allow-list is non-empty, the default image is in it, and every network is one of
   "ttl_seconds": 3600,
   "image": "wisp-base",
   "network": "open",
+  "isolation": "shared",
   "resources": { "cpus": 2, "memory_mb": 4096, "pids": 1024 },
   "userdata": "#!/bin/sh\n...",
   "meta": { "job": "build-42" }
@@ -72,7 +75,10 @@ allow-list is non-empty, the default image is in it, and every network is one of
 
 `ttl_seconds` is required (> 0). `image` defaults to the config default and must
 be allow-listed (else `400`); `network` defaults to `open` when allowed and must
-be one of the configured networks (else `400`); each `resources` value and the
+be one of the configured networks (else `400`); `isolation` defaults to
+`default_isolation` (`shared`) and must be one of the host's advertised
+`isolation.supported` levels — ordered `shared` < `sandboxed` < `vm`, with
+`confidential` reserved and rejected (else `400`); each `resources` value and the
 TTL are clamped down to any configured maximum. `meta` is opaque and echoed back
 on status reads.
 
@@ -81,7 +87,7 @@ Any consumer can discover what it may request via the **unauthenticated**
 
 ```sh
 curl -s localhost:8080/images
-# {"images":["wisp-base"],"default":"wisp-base","os":"linux","limits":{"max_ttl_seconds":0,...,"networks":["none","open"]}}
+# {"images":["wisp-base"],"default":"wisp-base","os":"linux","limits":{"max_ttl_seconds":3600,...,"networks":["none","open"]},"isolation":{"supported":["shared"],"default":"shared"}}
 ```
 
 The `os` field reports the Docker daemon's current container mode (`linux` or
@@ -94,6 +100,13 @@ and drives containers with the Windows keep-alive and `cmd.exe` shell. The
 containers require a Windows host, and the container/host OS build plus isolation
 (process vs Hyper-V) must be compatible — see
 [`docs/DESIGN.md` §12](docs/DESIGN.md).
+
+The `isolation` object reports the host's **effective** isolation posture —
+`supported` is the operator allow-list intersected with the levels the daemon can
+actually run (`shared` always; `sandboxed` when the gVisor runtime `runsc` is
+registered; `vm` on a Kata-enabled Linux daemon or a Windows daemon via Hyper-V),
+and `default` is the level applied when a create omits `isolation`. A consumer
+only ever sees, and can only request, levels this host can launch.
 
 ## Auth
 

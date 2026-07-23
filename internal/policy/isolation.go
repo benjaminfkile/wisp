@@ -8,15 +8,14 @@ import (
 // Isolation is an ordered isolation level: the strength of the boundary between
 // a leased container and the host (and other leases). Levels form a total order
 // by rank — shared < sandboxed < vm — so a policy can reason about "at least
-// this strong" and a later task can pick the container runtime that satisfies a
-// level. It is modeled on how the network policy works (a gated, operator-owned
-// dimension of a lease).
+// this strong" and the runtime layer can pick the container runtime that
+// satisfies a level. It is modeled on how the network policy works (a gated,
+// operator-owned dimension of a lease).
 //
-// This is spec + policy only: a level is parsed, validated, gated by the
-// operator allow-list, and recorded on the contract, but nothing here changes
-// how a container is launched yet — a later task maps a level to a Docker
-// runtime, so today every accepted level still launches under the default OCI
-// runtime (runc), i.e. shared.
+// A level is parsed, validated, gated by the operator allow-list, and recorded
+// on the contract; the runtime layer maps it to a container runtime at launch
+// (shared → runc, sandboxed → gVisor/runsc, vm → Kata on Linux or Hyper-V on
+// Windows). See internal/runtime.launchMechanism.
 type Isolation string
 
 const (

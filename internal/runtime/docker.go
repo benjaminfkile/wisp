@@ -281,15 +281,21 @@ func (d *DockerRuntime) Create(ctx context.Context, image string, opts CreateOpt
 	}
 	host := &container.HostConfig{
 		NetworkMode: container.NetworkMode(opts.NetworkMode),
-		SecurityOpt: opts.SecurityOpt,
 		Resources: container.Resources{
 			NanoCPUs: opts.Resources.NanoCPUs,
 			Memory:   opts.Resources.MemoryBytes,
 		},
 	}
-	if opts.Resources.PidsLimit > 0 {
-		pids := opts.Resources.PidsLimit
-		host.Resources.PidsLimit = &pids
+	// no-new-privileges (SecurityOpt) and PidsLimit are Linux-only kernel
+	// features; a Windows daemon rejects both ("Windows does not support
+	// PidsLimit"; "invalid security option ... no-new-privileges:true"). Apply
+	// them only on a Linux daemon. NanoCPUs/Memory are cross-platform.
+	if d.containerOS == OSLinux {
+		host.SecurityOpt = opts.SecurityOpt
+		if opts.Resources.PidsLimit > 0 {
+			pids := opts.Resources.PidsLimit
+			host.Resources.PidsLimit = &pids
+		}
 	}
 	// Select the launch mechanism from the requested isolation level. The daemon
 	// OS is distinguished the same way exec-command wrapping already does it (the

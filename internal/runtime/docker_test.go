@@ -292,9 +292,14 @@ func TestDockerRuntimeCreateIsolation(t *testing.T) {
 			if stub.gotHost.Runtime != "" && stub.gotHost.Isolation != "" {
 				t.Errorf("both Runtime (%q) and Isolation (%q) set; must never both be set", stub.gotHost.Runtime, stub.gotHost.Isolation)
 			}
-			// Other HostConfig fields are untouched by the isolation mapping.
-			if !reflect.DeepEqual(stub.gotHost.SecurityOpt, []string{"no-new-privileges:true"}) {
-				t.Errorf("SecurityOpt = %v, want unchanged", stub.gotHost.SecurityOpt)
+			// no-new-privileges (SecurityOpt) is a Linux-only option that a Windows
+			// daemon rejects, so it is applied on Linux and dropped on Windows.
+			var wantSecOpt []string
+			if tt.osType != "windows" {
+				wantSecOpt = []string{"no-new-privileges:true"}
+			}
+			if !reflect.DeepEqual(stub.gotHost.SecurityOpt, wantSecOpt) {
+				t.Errorf("SecurityOpt = %v, want %v", stub.gotHost.SecurityOpt, wantSecOpt)
 			}
 			if stub.gotHost.NetworkMode != "none" {
 				t.Errorf("NetworkMode = %q, want unchanged \"none\"", stub.gotHost.NetworkMode)

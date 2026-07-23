@@ -59,6 +59,13 @@ type broker struct {
 	// the event bus. An empty value disables the gate (see docs/DESIGN.md §8).
 	appToken string
 
+	// iso is the host's effective isolation posture — the operator allow-list
+	// intersected with the levels the daemon can actually run — computed once at
+	// construction (see detectIsolation). The create path validates a requested
+	// level against it so the host never accepts an isolation it cannot launch,
+	// and the read surface advertises it.
+	iso policy.IsolationCapabilities
+
 	// now is the clock used to compute time remaining; injectable for tests.
 	now func() time.Time
 }
@@ -67,7 +74,40 @@ type broker struct {
 // and event bus. appToken gates contract creation and the bus; an empty value
 // disables that gate.
 func newBroker(store *contract.Store, rt runtime.Runtime, pol *policy.Config, b *bus.Bus, logger *slog.Logger, appToken string) *broker {
-	return &broker{store: store, rt: rt, pol: pol, bus: b, logger: logger, appToken: appToken, now: time.Now}
+	br := &broker{store: store, rt: rt, pol: pol, bus: b, logger: logger, appToken: appToken, now: time.Now}
+	br.iso = br.detectIsolation(context.Background())
+	return br
+}
+
+// detectIsolation queries the daemon for its registered runtimes and container OS,
+// computes the isolation levels the host can actually provide, and intersects them
+// with the operator's allow-list to get the effective posture the create path
+// enforces and the read surface advertises. Any policy-allowed level the host
+// cannot run is dropped and logged as a startup WARNING, so the daemon never
+// accepts an isolation it cannot launch; a configured default that is unavailable
+// falls back to shared with its own warning. Detection is best-effort: if the
+// daemon info call fails, it falls back to the levels derivable from the
+// already-detected container OS (shared always, plus vm on a windows daemon) and
+// warns.
+func (b *broker) detectIsolation(ctx context.Context) policy.IsolationCapabilities {
+	info, err := b.rt.DaemonInfo(ctx)
+	caps := policy.HostCapabilities{Runtimes: info.Runtimes, OS: string(info.OS)}
+	if err != nil {
+		// Fall back to the cached container OS so at least the OS-derived levels
+		// (shared, and vm on a windows daemon) remain available when the daemon
+		// info query fails.
+		caps = policy.HostCapabilities{OS: string(b.rt.ContainerOS())}
+		b.logger.Warn("isolation capability detection: daemon info unavailable, using conservative OS-derived defaults", "error", err)
+	}
+	supported := policy.SupportedIsolations(caps)
+	ic, dropped := b.pol.EffectiveIsolation(supported)
+	for _, lvl := range dropped {
+		b.logger.Warn("isolation level allowed by policy but not available on this host; dropping it from the accepted set", "isolation", lvl.String())
+	}
+	if configured := b.pol.DefaultIsolation(); ic.Default() != configured {
+		b.logger.Warn("default isolation level not available on this host; falling back to shared", "configured_default", configured.String(), "effective_default", ic.Default().String())
+	}
+	return ic
 }
 
 // routes registers the contract lifecycle endpoints on mux. Creating a contract
@@ -222,13 +262,14 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve the isolation level: an omitted level selects the policy default;
+	// Resolve the isolation level: an omitted level selects the effective default;
 	// any other level must parse, be a level Wisp supports today (confidential is
-	// known but rejected), and be one the operator permits — else a client error
-	// (400), mirroring the image/network validation shape. This is spec + policy
-	// only: a later task maps the level to a container runtime, so today every
-	// accepted level still launches under runc.
-	isolation := b.pol.DefaultIsolation()
+	// known but rejected), and be in the host's EFFECTIVE allowed set — the
+	// operator allow-list intersected with the levels this daemon can actually run
+	// (see detectIsolation) — else a client error (400), mirroring the
+	// image/network validation shape. The host never accepts a level it cannot
+	// launch, even if the operator allow-listed it.
+	isolation := b.iso.Default()
 	if req.Isolation != "" {
 		level, err := policy.ParseIsolation(req.Isolation)
 		if err != nil {
@@ -239,7 +280,7 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if !b.pol.AllowsIsolation(level) {
+		if !b.iso.Allows(level) {
 			writeError(w, http.StatusBadRequest, "isolation not allowed: "+string(level))
 			return
 		}
@@ -325,7 +366,22 @@ func (b *broker) images(w http.ResponseWriter, r *http.Request) {
 			PidsLimit:     b.pol.Limits.PidsLimit,
 			Networks:      b.pol.Limits.Networks,
 		},
+		Isolation: isolationResponse{
+			Supported: isolationStrings(b.iso.Levels()),
+			Default:   b.iso.Default().String(),
+		},
 	})
+}
+
+// isolationStrings renders the effective isolation levels as their canonical
+// lowercase names for the discovery document, always returning a non-nil slice so
+// the JSON is an array (never null) even when nothing is allowed.
+func isolationStrings(levels []policy.Isolation) []string {
+	out := make([]string, 0, len(levels))
+	for _, l := range levels {
+		out = append(out, l.String())
+	}
+	return out
 }
 
 // imagesResponse is the GET /images discovery document.
@@ -337,6 +393,12 @@ type imagesResponse struct {
 	Images  []string       `json:"images"`
 	Default string         `json:"default"`
 	Limits  limitsResponse `json:"limits"`
+
+	// Isolation advertises the host's EFFECTIVE isolation posture — the levels it
+	// will actually accept (operator allow-list intersected with what the daemon
+	// can run) and the default applied when a create omits one — so an agent can
+	// report the host's real capabilities upward rather than the raw policy list.
+	Isolation isolationResponse `json:"isolation"`
 }
 
 // limitsResponse mirrors policy.Limits in the discovery document's JSON shape.
@@ -346,6 +408,18 @@ type limitsResponse struct {
 	MaxMemoryMB   int      `json:"max_memory_mb"`
 	PidsLimit     int      `json:"pids_limit"`
 	Networks      []string `json:"networks"`
+}
+
+// isolationResponse is the isolation section of the discovery document: the
+// effective set of levels this host accepts and the default level.
+type isolationResponse struct {
+	// Supported is the effective set of isolation levels this host will accept —
+	// the operator allow-list intersected with the levels the daemon can actually
+	// run — in the operator's configured order.
+	Supported []string `json:"supported"`
+
+	// Default is the isolation level applied when a create omits one.
+	Default string `json:"default"`
 }
 
 // provision boots the container for c, runs its userdata, and drives the

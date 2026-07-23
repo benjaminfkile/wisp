@@ -120,6 +120,48 @@ func TestDockerRuntimeContainerOS(t *testing.T) {
 	}
 }
 
+// TestDockerRuntimeDaemonInfo verifies DaemonInfo is backed by the Docker
+// client's Info call: it surfaces the daemon's registered runtime names (sorted)
+// and container OS, mapping an unknown OSType to linux and wrapping an Info error.
+func TestDockerRuntimeDaemonInfo(t *testing.T) {
+	t.Run("runtimes and os", func(t *testing.T) {
+		stub := infoStubClient{info: system.Info{
+			OSType: "linux",
+			Runtimes: map[string]system.RuntimeWithStatus{
+				"runsc": {}, "runc": {}, "kata-runtime": {},
+			},
+		}}
+		d := NewDockerRuntimeWithClient(stub)
+		got, err := d.DaemonInfo(context.Background())
+		if err != nil {
+			t.Fatalf("DaemonInfo: %v", err)
+		}
+		want := []string{"kata-runtime", "runc", "runsc"} // sorted for stable output
+		if !reflect.DeepEqual(got.Runtimes, want) {
+			t.Errorf("Runtimes = %v, want %v", got.Runtimes, want)
+		}
+		if got.OS != OSLinux {
+			t.Errorf("OS = %q, want linux", got.OS)
+		}
+	})
+	t.Run("windows os", func(t *testing.T) {
+		rt := NewDockerRuntimeWithClient(infoStubClient{info: system.Info{OSType: "windows"}})
+		got, err := rt.DaemonInfo(context.Background())
+		if err != nil {
+			t.Fatalf("DaemonInfo: %v", err)
+		}
+		if got.OS != OSWindows {
+			t.Errorf("OS = %q, want windows", got.OS)
+		}
+	})
+	t.Run("info error is wrapped", func(t *testing.T) {
+		rt := NewDockerRuntimeWithClient(infoStubClient{infoErr: errors.New("no daemon")})
+		if _, err := rt.DaemonInfo(context.Background()); err == nil {
+			t.Fatal("DaemonInfo with Info error = nil, want an error")
+		}
+	})
+}
+
 // TestIsImageOSMismatch verifies the daemon's OS/platform rejection is
 // recognized (case-insensitively) while unrelated errors and nil are not, so a
 // higher layer can map only genuine mismatches to a clear OS-aware error.

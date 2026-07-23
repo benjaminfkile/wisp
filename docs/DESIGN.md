@@ -174,9 +174,16 @@ At create time (§4) the client sends `image`, `network`, and `resources`:
 - **ttl_seconds** — required; clamped down to `limits.max_ttl_seconds` when set.
 
 Any consumer can discover what it may request via the unauthenticated `GET /images` (§10), which
-returns `{ os, images, default, limits }`. `os` is the daemon's detected container OS mode
+returns `{ os, images, default, limits, isolation }`. `os` is the daemon's detected container OS mode
 (`"linux"` or `"windows"`) so a consumer knows what this host serves; `default` is the
-OS-appropriate base image (the Windows base on a windows-mode host, the Linux base otherwise). A
+OS-appropriate base image (the Windows base on a windows-mode host, the Linux base otherwise);
+`isolation` is `{ supported, default }`, the host's **effective** isolation posture — the operator
+allow-list intersected with the levels the daemon can actually run, so a consumer only ever sees
+(and requests) levels this host can launch. The host detects its runnable levels at startup from the
+daemon's registered runtimes and OS (`shared` always; `sandboxed` when the gVisor runtime `runsc` is
+registered; `vm` when a Kata runtime is registered on a Linux daemon or the daemon runs Windows
+containers via Hyper-V), drops any policy-allowed level it cannot run with a startup warning, and
+rejects a create requesting an unavailable level. A
 Docker daemon is fixed in one mode by the operator — Wisp only detects it and never switches it —
 so an image whose OS does not match is rejected. Wisp cannot know an arbitrary image's OS up front,
 so it attempts the create and maps the daemon's OS/platform rejection to a clear
@@ -252,7 +259,7 @@ WS     /contracts/:id/shell           interactive PTY console
 
 POST   /events                        publish an event to the bus
 WS     /events                        subscribe (with filter)
-GET    /images                        os + allow-list + default + limits (unauthenticated, §7)
+GET    /images                        os + allow-list + default + limits + effective isolation (unauthenticated, §7)
 GET    /healthz                       liveness
 
 Auth: Authorization: Bearer <contract token> on contract-scoped calls;

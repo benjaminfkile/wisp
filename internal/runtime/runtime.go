@@ -203,6 +203,23 @@ const (
 	OSWindows ContainerOS = "windows"
 )
 
+// DaemonInfo carries the capability-relevant facts about the container backend
+// the daemon exposes: the OCI runtimes it has registered (by name, e.g. "runc",
+// "runsc", "kata-runtime") and its container OS mode. The startup
+// isolation-capability detection reads this to decide which isolation levels the
+// host can actually provide (see policy.SupportedIsolations). Unlike
+// ContainerOS — a value cached once at construction — DaemonInfo is a live query
+// and so can fail when the daemon is unreachable.
+type DaemonInfo struct {
+	// Runtimes is the set of registered OCI runtime names as reported by the
+	// daemon, in no particular order (the DockerRuntime sorts them for stable
+	// output). An empty slice means the daemon reported no named runtimes.
+	Runtimes []string
+
+	// OS is the daemon's container OS mode ("linux" or "windows").
+	OS ContainerOS
+}
+
 // Runtime abstracts the container backend. Implementations must be safe for
 // concurrent use by multiple goroutines.
 type Runtime interface {
@@ -264,6 +281,15 @@ type Runtime interface {
 	// so this is detected once and does not change while the runtime is live.
 	// Server and policy layers read it to stay OS-aware.
 	ContainerOS() ContainerOS
+
+	// DaemonInfo reports the daemon's registered OCI runtimes and container OS so
+	// the daemon can advertise only the isolation levels it can actually provide.
+	// It queries the backend live (the DockerRuntime backs it with the Docker
+	// client's Info call), so it may return an error when the daemon is
+	// unreachable; callers fall back to a conservative, OS-derived capability set
+	// in that case. See policy.SupportedIsolations for how the result maps to
+	// isolation levels.
+	DaemonInfo(ctx context.Context) (DaemonInfo, error)
 }
 
 // ShellStream is the duplex byte stream of an interactive shell exec (see

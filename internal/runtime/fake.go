@@ -103,6 +103,17 @@ type Fake struct {
 	// DaemonInfoErr, when set, is returned by DaemonInfo so tests can exercise the
 	// daemon-unreachable path and the caller's conservative fallback.
 	DaemonInfoErr error
+
+	// GPUDevices is the set of GPUs reported by GPUs. It is nil by default, so a
+	// freshly constructed Fake models a GPU-less host (combined with the default
+	// runtimes, which do not include NVIDIARuntimeName); GPU-capability tests set
+	// it to model enumerated hardware.
+	GPUDevices []GPUDevice
+
+	// GPUErr, when set, is returned by GPUs so tests can drive the
+	// enumeration-failure path (nvidia-smi absent or garbage), which the caller
+	// degrades to "no GPU support".
+	GPUErr error
 }
 
 // defaultFakeRuntimes is the permissive runtime set DaemonInfo reports when the
@@ -150,6 +161,20 @@ func (f *Fake) DaemonInfo(ctx context.Context) (DaemonInfo, error) {
 	out := make([]string, len(runtimes))
 	copy(out, runtimes)
 	return DaemonInfo{Runtimes: out, OS: os}, nil
+}
+
+// GPUs implements Runtime, reporting the Fake's configured GPUDevices (or GPUErr
+// when set). It never shells out — tests model an enumerated GPU host by setting
+// GPUDevices and a GPU-less or broken host by leaving it nil or setting GPUErr.
+func (f *Fake) GPUs(ctx context.Context) ([]GPUDevice, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.GPUErr != nil {
+		return nil, f.GPUErr
+	}
+	out := make([]GPUDevice, len(f.GPUDevices))
+	copy(out, f.GPUDevices)
+	return out, nil
 }
 
 // lazyInit ensures the container map exists so the zero value is usable.

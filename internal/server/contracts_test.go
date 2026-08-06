@@ -1330,6 +1330,156 @@ func TestImagesAdvertisesWindowsDefault(t *testing.T) {
 	}
 }
 
+// gpuServer builds a handler over a fake runtime carrying the given registered
+// runtimes and enumerated GPUs, so the GPU-block advertising can be exercised
+// without a real daemon or NVIDIA tooling. The GPU posture is computed once at
+// broker construction (inside New), so the fake must be configured before the
+// call — hence a dedicated helper rather than the shared testServer.
+func gpuServer(t *testing.T, pol *policy.Config, runtimes []string, devices []runtime.GPUDevice) http.Handler {
+	t.Helper()
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	fake.Runtimes = runtimes
+	fake.GPUDevices = devices
+	return New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, pol, bus.New(nil), "")
+}
+
+// getImages GETs /images and decodes it, failing the test on a non-200.
+func getImages(t *testing.T, h http.Handler) imagesResponse {
+	t.Helper()
+	rec := do(t, h, http.MethodGet, "/images", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got imagesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return got
+}
+
+// On an NVIDIA host with devices enumerated, GET /images advertises a supported
+// GPU block with the enumerated devices (field-for-field the wire contract), the
+// effective per-lease cap, and shared-only attach.
+func TestImagesGPUBlockSupported(t *testing.T) {
+	devices := []runtime.GPUDevice{
+		{ID: "GPU-1111", Class: "nvidia-geforce-rtx-4090", VRAMMB: 24564},
+		{ID: "GPU-2222", Class: "nvidia-a100-sxm4-80gb", VRAMMB: 81920},
+	}
+	h := gpuServer(t, policy.Default(), []string{"runc", "nvidia"}, devices)
+	got := getImages(t, h)
+
+	if !got.GPU.Supported {
+		t.Fatalf("gpu.supported = false, want true (body has %+v)", got.GPU)
+	}
+	if got.GPU.MaxGPUs != 2 {
+		t.Errorf("gpu.max_gpus = %d, want 2 (all detected, no operator cap)", got.GPU.MaxGPUs)
+	}
+	if !reflect.DeepEqual(got.GPU.Isolations, []string{"shared"}) {
+		t.Errorf("gpu.isolations = %v, want [shared]", got.GPU.Isolations)
+	}
+	want := []gpuDeviceResponse{
+		{ID: "GPU-1111", Class: "nvidia-geforce-rtx-4090", VRAMMB: 24564},
+		{ID: "GPU-2222", Class: "nvidia-a100-sxm4-80gb", VRAMMB: 81920},
+	}
+	if !reflect.DeepEqual(got.GPU.Devices, want) {
+		t.Errorf("gpu.devices = %+v, want %+v", got.GPU.Devices, want)
+	}
+}
+
+// An operator per-lease cap below the detected count is reflected in the
+// advertised max_gpus while still listing every enumerated device.
+func TestImagesGPUBlockOperatorCap(t *testing.T) {
+	pol := policy.Default()
+	pol.Limits.MaxGPUs = 1
+	devices := []runtime.GPUDevice{
+		{ID: "GPU-1111", Class: "nvidia-l4", VRAMMB: 24564},
+		{ID: "GPU-2222", Class: "nvidia-l4", VRAMMB: 24564},
+	}
+	got := getImages(t, gpuServer(t, pol, []string{"runc", "nvidia"}, devices))
+
+	if !got.GPU.Supported {
+		t.Fatal("gpu.supported = false, want true")
+	}
+	if got.GPU.MaxGPUs != 1 {
+		t.Errorf("gpu.max_gpus = %d, want 1 (operator cap below detected count)", got.GPU.MaxGPUs)
+	}
+	if len(got.GPU.Devices) != 2 {
+		t.Errorf("gpu.devices len = %d, want 2 (the cap limits per-lease use, not enumeration)", len(got.GPU.Devices))
+	}
+}
+
+// TestImagesGPUBlockGPULessHost verifies the block is ALWAYS present: a host
+// without the NVIDIA runtime advertises supported=false with an empty (non-null)
+// devices array, max_gpus 0, and no attach isolations. The default fake reports
+// runc/runsc/kata but never nvidia.
+func TestImagesGPUBlockGPULessHost(t *testing.T) {
+	got := getImages(t, gpuServer(t, policy.Default(), nil, nil))
+
+	if got.GPU.Supported {
+		t.Error("gpu.supported = true, want false on a GPU-less host")
+	}
+	if got.GPU.MaxGPUs != 0 {
+		t.Errorf("gpu.max_gpus = %d, want 0", got.GPU.MaxGPUs)
+	}
+	if got.GPU.Devices == nil {
+		t.Error("gpu.devices = null, want an empty array (the block is always present)")
+	}
+	if len(got.GPU.Devices) != 0 {
+		t.Errorf("gpu.devices = %+v, want empty", got.GPU.Devices)
+	}
+	if got.GPU.Isolations == nil || len(got.GPU.Isolations) != 0 {
+		t.Errorf("gpu.isolations = %v, want an empty array", got.GPU.Isolations)
+	}
+}
+
+// TestImagesGPUBlockRawJSON verifies the wire-contract field NAMES exactly (the
+// surface wisp-agent scrapes), independent of the Go struct tags, and that the
+// block is always present even on a GPU-less host.
+func TestImagesGPUBlockRawJSON(t *testing.T) {
+	rec := do(t, gpuServer(t, policy.Default(), nil, nil), http.MethodGet, "/images", "")
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	block, ok := raw["gpu"]
+	if !ok {
+		t.Fatal("/images response has no top-level \"gpu\" object")
+	}
+	var gpu map[string]json.RawMessage
+	if err := json.Unmarshal(block, &gpu); err != nil {
+		t.Fatalf("decode gpu block: %v", err)
+	}
+	for _, field := range []string{"supported", "devices", "max_gpus", "isolations"} {
+		if _, ok := gpu[field]; !ok {
+			t.Errorf("gpu block missing wire-contract field %q", field)
+		}
+	}
+	// devices must be [] (not null) so a consumer can iterate unconditionally.
+	if string(gpu["devices"]) != "[]" {
+		t.Errorf("gpu.devices raw = %s, want []", gpu["devices"])
+	}
+}
+
+// TestImagesGPUEnumerationFailureDegrades verifies a GPU-detection failure (the
+// NVIDIA runtime present but nvidia-smi enumeration erroring) degrades to
+// supported=false rather than failing startup or the request.
+func TestImagesGPUEnumerationFailureDegrades(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	fake.Runtimes = []string{"runc", "nvidia"}
+	fake.GPUErr = errors.New("nvidia-smi: garbage output")
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, policy.Default(), bus.New(nil), "")
+
+	got := getImages(t, h)
+	if got.GPU.Supported {
+		t.Error("gpu.supported = true, want false when enumeration fails")
+	}
+	if len(got.GPU.Devices) != 0 {
+		t.Errorf("gpu.devices = %+v, want empty on enumeration failure", got.GPU.Devices)
+	}
+}
+
 // On a windows-mode host, an omitted image on create boots the Windows base
 // image (the OS-aware default) rather than the Linux base.
 func TestCreateDefaultsToWindowsBaseImage(t *testing.T) {

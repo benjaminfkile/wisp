@@ -78,6 +78,20 @@ type Limits struct {
 	// PidsLimit caps the number of processes. Zero means no cap.
 	PidsLimit int
 
+	// MaxGPUs caps the number of GPUs a single lease may request. Zero means no
+	// operator cap — a lease may use up to all detected devices — which is also the
+	// default when unconfigured, mirroring how the other Max* limits treat zero as
+	// "no cap". The EFFECTIVE per-lease cap advertised on /images is
+	// min(MaxGPUs, detected device count); see EffectiveGPU.
+	MaxGPUs int
+
+	// GPUsDisabled turns GPU leasing off entirely regardless of detected hardware.
+	// The zero value (false) leaves GPU leasing ENABLED — the default when
+	// unconfigured — so an operator opts out explicitly, mirroring how a zero
+	// numeric limit imposes no cap. When true the host advertises supported=false
+	// even with GPUs present (see EffectiveGPU).
+	GPUsDisabled bool
+
 	// Networks is the allow-list of network names a client may request.
 	Networks []string
 
@@ -278,6 +292,13 @@ type fileLimits struct {
 	MaxMemoryMB   int      `json:"max_memory_mb"`
 	PidsLimit     int      `json:"pids_limit"`
 	Networks      []string `json:"networks"`
+	// MaxGPUs caps per-lease GPU count (0 = no operator cap → all detected);
+	// GPUsDisabled turns GPU leasing off entirely. Both are optional: an omitted
+	// max_gpus is uncapped and an omitted gpus_disabled leaves GPU leasing enabled
+	// — the default when unconfigured (see EffectiveGPU). They need no Load
+	// fallback because their zero values already are the defaults.
+	MaxGPUs      int  `json:"max_gpus"`
+	GPUsDisabled bool `json:"gpus_disabled"`
 	// Isolations gates the isolation levels a client may request; DefaultIsolation
 	// is the level applied when a create omits one. Both are optional: an omitted
 	// list falls back to shared-only and an omitted default falls back to shared
@@ -317,6 +338,8 @@ func Load(path string) (*Config, error) {
 			MaxCPUs:          fc.Limits.MaxCPUs,
 			MaxMemoryMB:      fc.Limits.MaxMemoryMB,
 			PidsLimit:        fc.Limits.PidsLimit,
+			MaxGPUs:          fc.Limits.MaxGPUs,
+			GPUsDisabled:     fc.Limits.GPUsDisabled,
 			Networks:         fc.Limits.Networks,
 			Isolations:       fc.Limits.Isolations,
 			DefaultIsolation: fc.Limits.DefaultIsolation,
@@ -360,6 +383,11 @@ func (c *Config) validate() error {
 		if !validNetworks[n] {
 			return fmt.Errorf("invalid network %q (want none, open, or egress)", n)
 		}
+	}
+	// A negative GPU cap is a config error; zero (no operator cap) and positive
+	// caps are both valid (see EffectiveGPU).
+	if c.Limits.MaxGPUs < 0 {
+		return fmt.Errorf("limits.max_gpus must not be negative, got %d", c.Limits.MaxGPUs)
 	}
 	// Every configured isolation level (and the default) must be a recognized
 	// level so a typo in the config is rejected at load, not at create time. A

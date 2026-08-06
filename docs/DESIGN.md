@@ -156,6 +156,8 @@ and conservative resource/TTL ceilings: TTL 3600 s, 4 CPUs, 4096 MB, 512 pids).
     "max_cpus": 4,             // fraction of host cores; 0 ⇒ no cap; built-in default 4
     "max_memory_mb": 4096,     // 0 ⇒ no cap; built-in default 4096
     "pids_limit": 512,         // 0 ⇒ no cap; built-in default 512
+    "max_gpus": 0,             // per-lease GPU cap; 0 / omitted ⇒ no cap (all detected)
+    "gpus_disabled": false,    // true turns GPU leasing off entirely; omitted ⇒ enabled
     "networks": ["none", "open"],        // which of none/open/egress a client may request
     "isolations": ["shared"],            // which of shared/sandboxed/vm a client may request
     "default_isolation": "shared"        // applied when a create omits isolation
@@ -164,8 +166,17 @@ and conservative resource/TTL ceilings: TTL 3600 s, 4 CPUs, 4096 MB, 512 pids).
 ```
 
 On load Wisp validates: the allow-list is non-empty, the default image is in it, every network is one
-of `none` / `open` / `egress`, and every configured isolation level and the default are valid
-(`shared` / `sandboxed` / `vm`). An example lives at `examples/wisp.config.json`.
+of `none` / `open` / `egress`, every configured isolation level and the default are valid
+(`shared` / `sandboxed` / `vm`), and `max_gpus` is not negative. An example lives at
+`examples/wisp.config.json`.
+
+**GPUs.** GPU leasing is an operator-gated, host-detected dimension, computed the same data-driven way
+as isolation. `max_gpus` caps the GPUs a single lease may request (`0`/omitted ⇒ no operator cap → all
+detected devices, mirroring the other `max_*` limits); `gpus_disabled: true` turns GPU leasing off
+entirely regardless of hardware (omitted ⇒ enabled, the default). At startup Wisp detects GPU support —
+the daemon must advertise the `nvidia` runtime **and** `nvidia-smi` must enumerate at least one device —
+intersects it with the operator config, and advertises the result on `GET /images`; a detection failure
+degrades to unsupported (a startup log line, never a fatal error).
 
 At create time (§4) the client sends `image`, `network`, `isolation`, and `resources`:
 
@@ -184,7 +195,14 @@ At create time (§4) the client sends `image`, `network`, `isolation`, and `reso
 - **ttl_seconds** — required; clamped down to `limits.max_ttl_seconds` when set.
 
 Any consumer can discover what it may request via the unauthenticated `GET /images` (§10), which
-returns `{ os, images, default, limits, isolation }`. `os` is the daemon's detected container OS mode
+returns `{ os, images, default, limits, isolation, gpu }`. The `gpu` block is **always present** and
+carries the host's effective GPU posture: `{ supported, devices, max_gpus, isolations }` — `supported`
+is whether GPUs may be leased at all; `devices` is the enumerated GPUs (`[{ id, class, vram_mb }]`,
+`class` a normalized product name like `nvidia-geforce-rtx-4090`); `max_gpus` is the effective per-lease
+cap (`min(operator cap, detected count)`); and `isolations` lists the isolation levels at which GPU
+attach is available (**at most `["shared"]`** in v1 — computed as data so a future VM/Kata passthrough
+backend needs only to flip that slot). An unsupported host reports `supported:false`, `devices:[]`,
+`max_gpus:0`. `os` is the daemon's detected container OS mode
 (`"linux"` or `"windows"`) so a consumer knows what this host serves; `default` is the
 OS-appropriate base image (the Windows base on a windows-mode host, the Linux base otherwise);
 `isolation` is `{ supported, default }`, the host's **effective** isolation posture — the operator
@@ -269,7 +287,7 @@ WS     /contracts/:id/shell           interactive PTY console
 
 POST   /events                        publish an event to the bus
 WS     /events                        subscribe (with filter)
-GET    /images                        os + allow-list + default + limits + effective isolation (unauthenticated, §7)
+GET    /images                        os + allow-list + default + limits + effective isolation + gpu (unauthenticated, §7)
 GET    /healthz                       liveness
 
 Auth: Authorization: Bearer <contract token> on contract-scoped calls;

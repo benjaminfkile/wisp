@@ -8,6 +8,8 @@
     "max_cpus": 0,
     "max_memory_mb": 0,
     "pids_limit": 0,
+    "max_gpus": 0,
+    "gpus_disabled": false,
     "networks": ["none", "open"],
     "isolations": ["shared"],
     "default_isolation": "shared"

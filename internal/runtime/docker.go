@@ -25,6 +25,11 @@ type DockerRuntime struct {
 	// construction (and re-detected on reconnect). The daemon never switches
 	// modes at runtime, so a cached value stays correct for the runtime's life.
 	containerOS ContainerOS
+
+	// gpuRunner runs nvidia-smi for GPU enumeration (see GPUs). It defaults to the
+	// real execRunner; keeping it a field lets the enumeration seam be swapped
+	// without touching the Docker client.
+	gpuRunner CommandRunner
 }
 
 // NewDockerRuntime constructs a DockerRuntime using the ambient Docker
@@ -34,7 +39,7 @@ func NewDockerRuntime() (*DockerRuntime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("runtime: docker client: %w", err)
 	}
-	d := &DockerRuntime{cli: cli}
+	d := &DockerRuntime{cli: cli, gpuRunner: execRunner{}}
 	d.detectContainerOS(context.Background())
 	return d, nil
 }
@@ -42,7 +47,7 @@ func NewDockerRuntime() (*DockerRuntime, error) {
 // NewDockerRuntimeWithClient wraps a pre-built Docker API client. It exists so
 // callers (and tests that supply a stub client) can inject their own client.
 func NewDockerRuntimeWithClient(cli client.APIClient) *DockerRuntime {
-	d := &DockerRuntime{cli: cli}
+	d := &DockerRuntime{cli: cli, gpuRunner: execRunner{}}
 	d.detectContainerOS(context.Background())
 	return d
 }
@@ -91,6 +96,16 @@ func (d *DockerRuntime) DaemonInfo(ctx context.Context) (DaemonInfo, error) {
 		os = OSWindows
 	}
 	return DaemonInfo{Runtimes: runtimes, OS: os}, nil
+}
+
+// GPUs implements Runtime by enumerating the host's GPUs via nvidia-smi behind
+// the runtime's CommandRunner (see enumerateGPUs). It does not itself gate on the
+// daemon advertising the "nvidia" runtime — that daemon-side half of GPU support
+// is DaemonInfo.Runtimes, combined with these devices by policy.EffectiveGPU. On
+// a GPU-less host nvidia-smi is absent, so this returns an error the caller
+// degrades to "no GPU support".
+func (d *DockerRuntime) GPUs(ctx context.Context) ([]GPUDevice, error) {
+	return enumerateGPUs(ctx, d.gpuRunner)
 }
 
 // Close releases the underlying Docker client resources.

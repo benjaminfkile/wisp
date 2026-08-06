@@ -290,6 +290,16 @@ type Runtime interface {
 	// in that case. See policy.SupportedIsolations for how the result maps to
 	// isolation levels.
 	DaemonInfo(ctx context.Context) (DaemonInfo, error)
+
+	// GPUs enumerates the physical GPUs the host exposes (the DockerRuntime backs
+	// it with nvidia-smi behind a CommandRunner). It is the hardware-side half of
+	// GPU capability detection; the daemon-side half is the "nvidia" runtime in
+	// DaemonInfo.Runtimes (see NVIDIARuntimeName). It returns an error when
+	// enumeration fails (no NVIDIA tooling, or unparseable output), which callers
+	// degrade to "no GPU support" rather than a fatal error; success with no GPUs
+	// yields an empty slice. See policy.EffectiveGPU for how the devices combine
+	// with the operator's config.
+	GPUs(ctx context.Context) ([]GPUDevice, error)
 }
 
 // ShellStream is the duplex byte stream of an interactive shell exec (see

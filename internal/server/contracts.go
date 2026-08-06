@@ -66,6 +66,12 @@ type broker struct {
 	// and the read surface advertises it.
 	iso policy.IsolationCapabilities
 
+	// gpu is the host's effective GPU posture — the operator's GPU config
+	// intersected with the daemon's NVIDIA runtime and the enumerated devices —
+	// computed once at construction (see detectGPU). The read surface advertises it
+	// (the /images "gpu" block); a later task's create path enforces it.
+	gpu policy.GPUCapabilities
+
 	// now is the clock used to compute time remaining; injectable for tests.
 	now func() time.Time
 }
@@ -76,6 +82,7 @@ type broker struct {
 func newBroker(store *contract.Store, rt runtime.Runtime, pol *policy.Config, b *bus.Bus, logger *slog.Logger, appToken string) *broker {
 	br := &broker{store: store, rt: rt, pol: pol, bus: b, logger: logger, appToken: appToken, now: time.Now}
 	br.iso = br.detectIsolation(context.Background())
+	br.gpu = br.detectGPU(context.Background())
 	return br
 }
 
@@ -108,6 +115,63 @@ func (b *broker) detectIsolation(ctx context.Context) policy.IsolationCapabiliti
 		b.logger.Warn("default isolation level not available on this host; falling back to shared", "configured_default", configured.String(), "effective_default", ic.Default().String())
 	}
 	return ic
+}
+
+// detectGPU computes the host's effective GPU posture once at startup, the same
+// data-driven way detectIsolation computes the isolation posture. GPU support has
+// two halves: the daemon advertising the NVIDIA runtime (from DaemonInfo) and
+// nvidia-smi enumerating at least one device (from Runtime.GPUs). Only when the
+// daemon reports the NVIDIA runtime does it bother enumerating — a GPU-less host
+// has no nvidia-smi, so a needless shell-out and scary log line are avoided; the
+// policy layer still re-derives support authoritatively from the runtimes+devices
+// data (see policy.EffectiveGPU). Detection is best-effort: any failure (daemon
+// info unavailable, enumeration erroring) degrades to supported=false with a
+// startup log line, never an error. Capacity the operator withheld (leasing
+// disabled, or a cap below the device count) is logged, mirroring
+// EffectiveIsolation's dropped-levels warning.
+func (b *broker) detectGPU(ctx context.Context) policy.GPUCapabilities {
+	info, err := b.rt.DaemonInfo(ctx)
+	if err != nil {
+		// Without daemon info the NVIDIA runtime cannot be confirmed; degrade to no
+		// GPU support rather than probing hardware the daemon may not even expose.
+		b.logger.Warn("gpu detection: daemon info unavailable; advertising no GPU support", "error", err)
+	}
+	var devices []policy.GPUDevice
+	if err == nil && hasRuntime(info.Runtimes, runtime.NVIDIARuntimeName) {
+		rtDevices, gerr := b.rt.GPUs(ctx)
+		if gerr != nil {
+			b.logger.Warn("gpu detection: nvidia-smi enumeration failed; advertising no GPU support", "error", gerr)
+		}
+		for _, d := range rtDevices {
+			devices = append(devices, policy.GPUDevice{ID: d.ID, Class: d.Class, VRAMMB: d.VRAMMB})
+		}
+	}
+
+	caps, drop := b.pol.EffectiveGPU(policy.GPUHostCapabilities{Runtimes: info.Runtimes, Devices: devices})
+	if drop.Disabled {
+		b.logger.Warn("GPU leasing disabled by operator policy though the host has usable GPUs; advertising no GPU support", "detected_devices", drop.Detected)
+	}
+	if drop.Capped {
+		b.logger.Warn("operator GPU cap is below the detected device count; capping per-lease GPUs", "detected_devices", drop.Detected, "max_gpus", drop.Cap)
+	}
+	if caps.Supported() {
+		b.logger.Info("GPU support enabled", "devices", drop.Detected, "max_gpus", caps.MaxGPUs())
+	} else {
+		b.logger.Info("GPU support not available on this host", "detected_devices", drop.Detected)
+	}
+	return caps
+}
+
+// hasRuntime reports whether name is in the daemon's registered runtime list. It
+// is the local equivalent of the plain-string runtime-name match the policy layer
+// does; the broker uses it only to decide whether to bother enumerating GPUs.
+func hasRuntime(runtimes []string, name string) bool {
+	for _, r := range runtimes {
+		if r == name {
+			return true
+		}
+	}
+	return false
 }
 
 // routes registers the contract lifecycle endpoints on mux. Creating a contract
@@ -370,7 +434,32 @@ func (b *broker) images(w http.ResponseWriter, r *http.Request) {
 			Supported: isolationStrings(b.iso.Levels()),
 			Default:   b.iso.Default().String(),
 		},
+		GPU: gpuBlock(b.gpu),
 	})
+}
+
+// gpuBlock renders the host's effective GPU posture as the /images "gpu" block,
+// field-for-field per the wire contract (see docs/DESIGN.md §7). The block is
+// ALWAYS present: an unsupported host advertises supported=false with an empty
+// devices array and max_gpus=0. devices and isolations are always non-nil so the
+// JSON carries arrays (never null). "isolations" is the levels at which GPU
+// attach is available — at most ["shared"] in v1, computed as data so a future
+// vm/kata backend needs no change here (see policy.gpuAttachByIsolation).
+func gpuBlock(g policy.GPUCapabilities) gpuResponse {
+	devices := g.Devices()
+	out := gpuResponse{
+		Supported:  g.Supported(),
+		Devices:    make([]gpuDeviceResponse, 0, len(devices)),
+		MaxGPUs:    g.MaxGPUs(),
+		Isolations: make([]string, 0),
+	}
+	for _, d := range devices {
+		out.Devices = append(out.Devices, gpuDeviceResponse{ID: d.ID, Class: d.Class, VRAMMB: d.VRAMMB})
+	}
+	for _, lvl := range g.Isolations() {
+		out.Isolations = append(out.Isolations, lvl.String())
+	}
+	return out
 }
 
 // isolationStrings renders the effective isolation levels as their canonical
@@ -399,6 +488,12 @@ type imagesResponse struct {
 	// can run) and the default applied when a create omits one — so an agent can
 	// report the host's real capabilities upward rather than the raw policy list.
 	Isolation isolationResponse `json:"isolation"`
+
+	// GPU advertises the host's EFFECTIVE GPU posture (see gpuResponse). It is the
+	// surface wisp-agent scrapes to report GPU capacity upward, so its field names
+	// match the wire contract exactly. The block is always present, even on a
+	// GPU-less host (supported=false, devices=[], max_gpus=0).
+	GPU gpuResponse `json:"gpu"`
 }
 
 // limitsResponse mirrors policy.Limits in the discovery document's JSON shape.
@@ -420,6 +515,40 @@ type isolationResponse struct {
 
 	// Default is the isolation level applied when a create omits one.
 	Default string `json:"default"`
+}
+
+// gpuResponse is the "gpu" section of the discovery document — the host's
+// effective GPU posture, per the wire contract (authoritative across repos):
+// whether GPUs may be leased, the enumerated devices, the effective per-lease
+// cap (min of operator cap and detected count), and the isolation levels at which
+// GPU attach is available (at most ["shared"] in v1).
+type gpuResponse struct {
+	// Supported reports whether GPUs may be leased on this host at all.
+	Supported bool `json:"supported"`
+
+	// Devices is the enumerated GPUs; an empty (but non-null) array when
+	// unsupported.
+	Devices []gpuDeviceResponse `json:"devices"`
+
+	// MaxGPUs is the effective per-lease GPU cap; 0 when unsupported.
+	MaxGPUs int `json:"max_gpus"`
+
+	// Isolations lists the isolation levels at which GPU attach is available on
+	// this host (a non-null array; at most ["shared"] in v1).
+	Isolations []string `json:"isolations"`
+}
+
+// gpuDeviceResponse is one enumerated GPU in the discovery document, matching the
+// wire contract's device shape exactly.
+type gpuDeviceResponse struct {
+	// ID is the GPU's globally-unique identifier ("GPU-<uuid>").
+	ID string `json:"id"`
+
+	// Class is the normalized product name (opaque to consumers).
+	Class string `json:"class"`
+
+	// VRAMMB is the device's total video memory in mebibytes.
+	VRAMMB int `json:"vram_mb"`
 }
 
 // provision boots the container for c, runs its userdata, and drives the

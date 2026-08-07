@@ -4,7 +4,7 @@
 implemented on branch `secure-lease-isolation`. This document records what has been tested, how,
 the bugs that testing found, and what remains to test.
 
-Last updated: 2026-07-23.
+Last updated: 2026-08-07.
 
 ## The model under test
 
@@ -126,7 +126,35 @@ Validated:
   would make this repeatable.
 - **Confidential tier (`confidential`).** Not implemented — reserved and rejected today. Future work,
   requires TEE hardware + remote attestation.
-- **GPU isolation.** Future — runc GPU passthrough first, then Kata + VFIO.
+
+## GPU isolation
+
+GPU leasing (v1) is the first hardware dimension layered on top of this isolation model. It leases
+**whole devices exclusively** and selects the attach mechanism from the isolation level the same
+data-driven way this model selects the container runtime (see `docs/DESIGN.md` §7). Its isolation
+posture:
+
+- **What v1 ships — runc passthrough, the weakest boundary.** The only GPU backend is `shared`/runc,
+  which attaches whole devices via Docker `DeviceRequests` (the SDK form of `docker run --gpus
+  device=<id>`). This is passthrough with **no additional boundary**: the NVIDIA driver surface (the
+  `/dev/nvidia*` device nodes and the kernel driver behind them) is exposed directly to the lease, so a
+  GPU lease is only as isolated as `shared`/runc itself. GPU attach is therefore advertised at `shared`
+  **only** — the capability block's `gpu.isolations` is at most `["shared"]` in v1.
+- **What is planned — VM passthrough, with a possible middle tier.** The `vm` slot in the attach seam
+  (`internal/runtime/gpu_attach.go`) exists but has no backend yet. The intended VM backend is **Kata
+  Containers + VFIO whole-GPU passthrough**, which hands the physical device to a microVM guest — a far
+  stronger boundary than runc passthrough. **gVisor `nvproxy`** is a possible middle tier: it
+  intermediates the NVIDIA ioctl surface from a `sandboxed` guest without full VM cost. Adding either is
+  implementing the strategy in the seam and flipping the corresponding entry of the policy attach map to
+  `true`; nothing on the create path changes.
+- **What cannot be verified in CI — no GPU hardware.** The CI/runner container has no GPU and no NVIDIA
+  tooling, so none of the GPU paths run against real hardware here. The v1 test strategy is therefore
+  **fakes-based**: `nvidia-smi` enumeration sits behind a `CommandRunner` seam exercised with canned
+  CSV output; the allocator, the create-path validation (reject-not-clamp, the `409` exhaustion case),
+  the `wisp.gpus` restart reconcile, and the attach seam (`DeviceRequests` for `shared`, the typed
+  `ErrGPUAttachUnsupported` for `vm`) are all unit-tested without a daemon or a device. A real end-to-end
+  GPU lease — like `vm`/Kata below — needs GPU hardware and is untested in CI. This record documents that
+  gap rather than papering over it.
 
 ## Quick reproduction notes
 

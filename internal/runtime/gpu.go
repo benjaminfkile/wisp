@@ -47,7 +47,7 @@ const (
 // block).
 type GPUDevice struct {
 	// ID is the GPU's globally-unique identifier as reported by nvidia-smi (e.g.
-	// "GPU-1b2c3d4e-..."). It is the handle a later task pins a lease to.
+	// "GPU-1b2c3d4e-..."). It is the handle the allocator pins a lease to.
 	ID string
 
 	// Class is the normalized product name: lowercased with whitespace runs

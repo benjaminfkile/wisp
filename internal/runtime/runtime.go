@@ -48,6 +48,14 @@ const ContractLabel = "wisp.contract"
 // TTL, since there is nothing to reap against.
 const ExpiresAtLabel = "wisp.expires_at"
 
+// GPUsLabel is the Docker label carrying the comma-joined GPU device IDs a lease
+// was exclusively assigned. It is written at create time alongside ContractLabel
+// and ExpiresAtLabel so a wispd restart can rebuild the device allocator's
+// occupancy from surviving containers' labels alone and never double-assign a
+// device already held by a pre-existing lease (see ListLeased and the startup
+// reconcile). It is omitted when a lease holds no GPUs.
+const GPUsLabel = "wisp.gpus"
+
 // ErrNotFound is returned when an operation references a container id that the
 // runtime does not know about (never created, or already destroyed).
 var ErrNotFound = errors.New("runtime: container not found")

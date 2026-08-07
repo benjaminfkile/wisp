@@ -63,9 +63,14 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, pol *policy
 	// contract.expiring / .expired through the same bus (see docs/DESIGN.md §6).
 	eventBus := bus.New(logger)
 
+	// The daemon bundles the HTTP handler with the shared store/runtime/allocator
+	// so the reconcile and the reaper below operate on the SAME GPU device
+	// allocator the create path allocates from (see server.NewDaemon).
+	daemon := server.NewDaemon(logger, store, rt, pol, eventBus, cfg.AppToken)
+
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           server.New(logger, store, rt, pol, eventBus, cfg.AppToken),
+		Handler:           daemon.Handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -75,17 +80,21 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, pol *policy
 	// Rebuild tracking for containers a previous wispd left behind (matched by
 	// their wisp.contract label), BEFORE the reaper starts, so an orphaned lease
 	// is either reaped or resumed on the reaper's first sweep instead of running
-	// unbounded with no daemon enforcing its TTL (see server.Reconcile).
-	server.Reconcile(ctx, store, rt, logger)
+	// unbounded with no daemon enforcing its TTL. This also rebuilds the GPU
+	// allocator's occupancy from the wisp.gpus labels so a restart never
+	// double-assigns a device a surviving lease still holds (see daemon.Reconcile).
+	daemon.Reconcile(ctx)
 
 	// The TTL reaper reconciles tracked contracts on boot and then drives
 	// expiring/expired transitions on a ticker until shutdown. Its lifecycle
-	// hook republishes those transitions onto the event bus.
+	// hook republishes those transitions onto the event bus; its ReleaseGPUs hook
+	// returns an expired lease's devices to the allocator.
 	rp := reaper.New(store, rt, reaper.Options{
-		Lead:     cfg.ExpiringLead,
-		Interval: cfg.ReapInterval,
-		Logger:   logger,
-		Notify:   server.LifecycleNotify(eventBus, logger),
+		Lead:        cfg.ExpiringLead,
+		Interval:    cfg.ReapInterval,
+		Logger:      logger,
+		Notify:      server.LifecycleNotify(eventBus, logger),
+		ReleaseGPUs: daemon.ReleaseGPUs,
 	})
 	go rp.Run(ctx)
 

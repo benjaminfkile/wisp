@@ -3,6 +3,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/contract"
+	"github.com/benjaminfkile/wisp/internal/gpu"
 	"github.com/benjaminfkile/wisp/internal/policy"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
@@ -35,10 +37,59 @@ import (
 // The returned handler is stdlib-only (net/http ServeMux); richer routing can
 // be layered in later tasks.
 func New(logger *slog.Logger, store *contract.Store, rt runtime.Runtime, pol *policy.Config, eventBus *bus.Bus, appToken string) http.Handler {
+	return NewDaemon(logger, store, rt, pol, eventBus, appToken).Handler
+}
+
+// Daemon bundles the HTTP handler with the stateful pieces the wispd process
+// must share across its background workers — the contract store, the container
+// runtime, and the exclusive GPU device allocator — so the startup reconcile and
+// the TTL reaper operate on the SAME allocator the HTTP create path allocates
+// from. That single shared allocator is what makes the whole-device exclusivity
+// guarantee hold end to end: a device freed by a released or reaped lease is
+// immediately reusable, and a restart rebuilds occupancy from container labels
+// instead of double-assigning a device a surviving lease still holds.
+type Daemon struct {
+	// Handler is the root HTTP handler, ready to serve.
+	Handler http.Handler
+
+	store  *contract.Store
+	rt     runtime.Runtime
+	alloc  *gpu.Allocator
+	logger *slog.Logger
+}
+
+// NewDaemon builds the HTTP surface and returns it alongside the shared
+// components main wires the reconcile and reaper to. See New for the argument
+// semantics; New is the thin wrapper that returns only the handler for callers
+// (tests) that need nothing more.
+func NewDaemon(logger *slog.Logger, store *contract.Store, rt runtime.Runtime, pol *policy.Config, eventBus *bus.Bus, appToken string) *Daemon {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
-	newBroker(store, rt, pol, eventBus, logger, appToken).routes(mux)
-	return requestLogger(logger, mux)
+	br := newBroker(store, rt, pol, eventBus, logger, appToken)
+	br.routes(mux)
+	return &Daemon{
+		Handler: requestLogger(logger, mux),
+		store:   store,
+		rt:      rt,
+		alloc:   br.alloc,
+		logger:  logger,
+	}
+}
+
+// Reconcile rebuilds in-memory contract tracking AND GPU allocator occupancy
+// from the labels of containers a previous wispd left behind. It binds the
+// daemon's shared allocator so a rediscovered lease's devices are reserved before
+// any new create can allocate. Callers MUST run it before the reaper starts (see
+// the package Reconcile).
+func (d *Daemon) Reconcile(ctx context.Context) {
+	Reconcile(ctx, d.store, d.rt, d.alloc, d.logger)
+}
+
+// ReleaseGPUs frees the GPU devices a contract held back to the shared allocator.
+// It is idempotent (the allocator's Free is) and is wired into the reaper as its
+// ReleaseGPUs hook so an expired lease's devices return to the pool.
+func (d *Daemon) ReleaseGPUs(ids []string) {
+	d.alloc.Free(ids)
 }
 
 // healthz is a liveness probe returning {"status":"ok"}.

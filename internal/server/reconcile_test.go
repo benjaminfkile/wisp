@@ -38,7 +38,7 @@ func TestReconcileRebuildsTrackingEntry(t *testing.T) {
 		leased("cont-1", "contract-1", strconv.FormatInt(expiry.Unix(), 10)),
 	}
 
-	Reconcile(context.Background(), store, fake, discardLogger())
+	Reconcile(context.Background(), store, fake, nil, discardLogger())
 
 	c, err := store.Get("contract-1")
 	if err != nil {
@@ -69,7 +69,7 @@ func TestReconcileSkipsMalformedLabels(t *testing.T) {
 		leased("cont-good", "contract-good", "1900000000"),      // valid
 	}
 
-	Reconcile(context.Background(), store, fake, discardLogger())
+	Reconcile(context.Background(), store, fake, nil, discardLogger())
 
 	for _, skipped := range []string{"contract-missing", "contract-bad"} {
 		if _, err := store.Get(skipped); !errors.Is(err, contract.ErrNotFound) {
@@ -91,7 +91,7 @@ func TestReconcileToleratesListError(t *testing.T) {
 	fake := runtime.NewFake()
 	fake.ListLeasedErr = errors.New("docker unreachable")
 
-	Reconcile(context.Background(), store, fake, discardLogger())
+	Reconcile(context.Background(), store, fake, nil, discardLogger())
 
 	if got := len(store.List()); got != 0 {
 		t.Fatalf("tracked contracts = %d, want 0 on list error", got)
@@ -120,7 +120,7 @@ func TestReconcileThenReaperExpiresStaleAndKeepsValid(t *testing.T) {
 		Labels: labels("contract-valid", strconv.FormatInt(now.Add(time.Hour).Unix(), 10)),
 	})
 
-	Reconcile(ctx, store, fake, discardLogger())
+	Reconcile(ctx, store, fake, nil, discardLogger())
 
 	// The reconcile learns each contract's runtime container id from ListLeased.
 	staleC, err := store.Get("contract-stale")

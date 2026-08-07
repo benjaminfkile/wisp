@@ -4,9 +4,11 @@ import (
 	"context"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/benjaminfkile/wisp/internal/contract"
+	"github.com/benjaminfkile/wisp/internal/gpu"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
@@ -28,7 +30,14 @@ import (
 // bad label never blocks recovery of the rest. A failure to even list containers
 // is logged and returns without adopting anything — a best-effort recovery must
 // never keep the daemon from starting.
-func Reconcile(ctx context.Context, store *contract.Store, rt runtime.Runtime, logger *slog.Logger) {
+//
+// alloc, when non-nil, is the exclusive GPU device allocator: for each adopted
+// lease carrying GPU devices (the wisp.gpus label), Reconcile reserves those
+// devices in the allocator so a restarted wispd never re-hands a device a
+// surviving lease still holds. A reserved device id the host no longer detects
+// (e.g. a GPU removed since the container launched) is logged and skipped rather
+// than crashing the reconcile. Pass nil on a host with no GPU allocator wired.
+func Reconcile(ctx context.Context, store *contract.Store, rt runtime.Runtime, alloc *gpu.Allocator, logger *slog.Logger) {
 	containers, err := rt.ListLeased(ctx)
 	if err != nil {
 		logger.Error("reconcile: list leased containers", "error", err)
@@ -53,17 +62,56 @@ func Reconcile(ctx context.Context, store *contract.Store, rt runtime.Runtime, l
 				"contract_id", id, "container_id", lc.ID, "expires_at", lc.Labels[expiresAtLabel])
 			continue
 		}
-		if _, err := store.Adopt(contract.AdoptParams{ID: id, ContainerID: lc.ID, ExpiresAt: expiresAt}); err != nil {
+		gpuIDs := parseGPUsLabel(lc.Labels[gpusLabel])
+		if _, err := store.Adopt(contract.AdoptParams{ID: id, ContainerID: lc.ID, ExpiresAt: expiresAt, GPUDeviceIDs: gpuIDs}); err != nil {
 			logger.Error("reconcile: adopt contract", "contract_id", id, "container_id", lc.ID, "error", err)
 			continue
 		}
+		// Rebuild allocator occupancy so a device a surviving lease still holds is
+		// never re-assigned. A device id the host no longer detects is logged and
+		// skipped — the reconcile must not crash on stale hardware.
+		if alloc != nil && len(gpuIDs) > 0 {
+			if unknown := alloc.Reserve(gpuIDs); len(unknown) > 0 {
+				logger.Warn("reconcile: lease references GPU device(s) no longer detected; skipping those",
+					"contract_id", id, "container_id", lc.ID, "devices", strings.Join(unknown, ","))
+			}
+		}
 		adopted++
 		logger.Info("reconcile: adopted pre-existing leased container",
-			"contract_id", id, "container_id", lc.ID, "expires_at", expiresAt)
+			"contract_id", id, "container_id", lc.ID, "expires_at", expiresAt, "gpus", strings.Join(gpuIDs, ","))
 	}
 	if adopted > 0 {
 		logger.Info("reconcile: rebuilt tracking for pre-existing leases", "count", adopted)
 	}
+}
+
+// gpusLabelValue joins a lease's assigned GPU device IDs into the comma-separated
+// wisp.gpus label value. It returns "" for a lease with no GPUs so the caller can
+// omit the label entirely. Device IDs are opaque "GPU-<uuid>" strings that never
+// contain a comma, so the join is unambiguous (see parseGPUsLabel for the split).
+func gpusLabelValue(ids []string) string {
+	return strings.Join(ids, ",")
+}
+
+// parseGPUsLabel splits a wisp.gpus label value back into device IDs, preserving
+// the written order and dropping empty segments so a trailing comma or an empty
+// value yields no IDs. It is the read half of the wisp.gpus round-trip the
+// startup reconcile relies on.
+func parseGPUsLabel(v string) []string {
+	if v == "" {
+		return nil
+	}
+	out := make([]string, 0)
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // parseExpiresAt parses a wisp.expires_at label value (a contract's absolute

@@ -27,6 +27,12 @@ type CreateParams struct {
 	// satisfies it. Opaque to the store.
 	Isolation string
 
+	// GPUDeviceIDs are the whole GPU devices the allocator exclusively assigned to
+	// this lease (see docs/DESIGN.md §7); empty when the lease holds no GPUs. The
+	// store records them so status reads can surface them and so a terminal-state
+	// path can free them back to the allocator. Opaque to the store.
+	GPUDeviceIDs []string
+
 	// Meta is arbitrary client-supplied metadata echoed back on status reads.
 	// Opaque to the store.
 	Meta map[string]any
@@ -83,15 +89,16 @@ func (s *Store) Create(p CreateParams) (Contract, error) {
 
 	created := s.now()
 	c := &Contract{
-		ID:        s.newID(),
-		TTL:       p.TTL,
-		Image:     p.Image,
-		Isolation: p.Isolation,
-		Meta:      p.Meta,
-		State:     StateRequested,
-		CreatedAt: created,
-		ExpiresAt: created.Add(p.TTL),
-		Token:     s.newToken(),
+		ID:           s.newID(),
+		TTL:          p.TTL,
+		Image:        p.Image,
+		Isolation:    p.Isolation,
+		GPUDeviceIDs: cloneIDs(p.GPUDeviceIDs),
+		Meta:         p.Meta,
+		State:        StateRequested,
+		CreatedAt:    created,
+		ExpiresAt:    created.Add(p.TTL),
+		Token:        s.newToken(),
 	}
 	s.contracts[c.ID] = c
 	return *c, nil
@@ -113,6 +120,12 @@ type AdoptParams struct {
 	// ExpiresAt is the contract's absolute expiry, recovered from the container's
 	// wisp.expires_at label.
 	ExpiresAt time.Time
+
+	// GPUDeviceIDs are the whole GPU devices the lease held, recovered from the
+	// container's wisp.gpus label, so the reconciled contract surfaces them on
+	// status reads and frees them back to the allocator when it is reaped. Empty
+	// when the lease held no GPUs.
+	GPUDeviceIDs []string
 }
 
 // Adopt records a tracking entry for a pre-existing container discovered during
@@ -131,14 +144,27 @@ func (s *Store) Adopt(p AdoptParams) (Contract, error) {
 		return *c, nil
 	}
 	c := &Contract{
-		ID:          p.ID,
-		State:       StateReady,
-		ContainerID: p.ContainerID,
-		ExpiresAt:   p.ExpiresAt,
-		CreatedAt:   s.now(),
+		ID:           p.ID,
+		State:        StateReady,
+		ContainerID:  p.ContainerID,
+		ExpiresAt:    p.ExpiresAt,
+		GPUDeviceIDs: cloneIDs(p.GPUDeviceIDs),
+		CreatedAt:    s.now(),
 	}
 	s.contracts[p.ID] = c
 	return *c, nil
+}
+
+// cloneIDs returns a copy of ids so a stored contract's device-ID slice never
+// aliases the caller's slice; a nil or empty input yields nil so a GPU-less
+// contract carries no slice.
+func cloneIDs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, len(ids))
+	copy(out, ids)
+	return out
 }
 
 // Get returns a copy of the contract with the given id, or ErrNotFound.

@@ -15,6 +15,7 @@ import (
 
 	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/contract"
+	"github.com/benjaminfkile/wisp/internal/gpu"
 	"github.com/benjaminfkile/wisp/internal/policy"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
@@ -30,6 +31,13 @@ const contractLabel = runtime.ContractLabel
 // can rebuild the contract's TTL tracking from the container's labels alone (see
 // reconcile). Defined in the runtime package for the same reason as contractLabel.
 const expiresAtLabel = runtime.ExpiresAtLabel
+
+// gpusLabel is the container label carrying the comma-joined GPU device IDs a
+// lease was exclusively assigned, written at create time next to contractLabel
+// so a wispd restart can rebuild the device allocator's occupancy from the
+// container's labels alone (see reconcile). Defined in the runtime package for
+// the same reason as contractLabel.
+const gpusLabel = runtime.GPUsLabel
 
 // noNewPrivilegesOpt is the Docker security option applied to every leased
 // container so a process inside it cannot gain privileges via setuid binaries
@@ -72,6 +80,14 @@ type broker struct {
 	// (the /images "gpu" block); a later task's create path enforces it.
 	gpu policy.GPUCapabilities
 
+	// alloc assigns whole GPU devices exclusively from the detected inventory. It
+	// is built once at construction from the effective GPU posture's device IDs and
+	// is the single source of truth for which device is held by which lease: the
+	// create path (a later task) allocates from it, and every terminal path
+	// (release, provision failure, and the reaper's expiry) frees back to it. The
+	// startup reconcile rebuilds its occupancy from surviving containers' labels.
+	alloc *gpu.Allocator
+
 	// now is the clock used to compute time remaining; injectable for tests.
 	now func() time.Time
 }
@@ -83,7 +99,22 @@ func newBroker(store *contract.Store, rt runtime.Runtime, pol *policy.Config, b 
 	br := &broker{store: store, rt: rt, pol: pol, bus: b, logger: logger, appToken: appToken, now: time.Now}
 	br.iso = br.detectIsolation(context.Background())
 	br.gpu = br.detectGPU(context.Background())
+	// Build the exclusive device allocator over the effective GPU inventory so the
+	// create path can assign whole devices and every terminal path can free them.
+	// A GPU-less host yields an empty allocator whose Free/Allocate are harmless
+	// no-ops.
+	br.alloc = gpu.NewAllocator(gpuDeviceIDs(br.gpu.Devices()))
 	return br
+}
+
+// gpuDeviceIDs extracts the stable device IDs from the effective GPU posture's
+// devices, in detection order, to seed the allocator's inventory.
+func gpuDeviceIDs(devices []policy.GPUDevice) []string {
+	ids := make([]string, 0, len(devices))
+	for _, d := range devices {
+		ids = append(ids, d.ID)
+	}
+	return ids
 }
 
 // detectIsolation queries the daemon for its registered runtimes and container OS,
@@ -265,7 +296,13 @@ type statusResponse struct {
 	ContractID          string         `json:"contract_id"`
 	Status              string         `json:"status"`
 	TTLSecondsRemaining int            `json:"ttl_seconds_remaining"`
-	Meta                map[string]any `json:"meta,omitempty"`
+
+	// Gpus is the whole GPU devices this contract was exclusively assigned, by
+	// their stable device IDs — the wire field name the dashboard reads. Omitted
+	// when the lease holds no GPUs (a GPU-less lease carries no "gpus" key).
+	Gpus []string `json:"gpus,omitempty"`
+
+	Meta map[string]any `json:"meta,omitempty"`
 }
 
 // launchSpec is the launch configuration resolved from a create request against
@@ -615,6 +652,12 @@ func (b *broker) fail(ctx context.Context, id, containerID string) {
 			b.logger.Error("kill container after failed provision", "contract_id", id, "error", err)
 		}
 	}
+	// Free any GPU devices the failed lease was assigned so a provisioning failure
+	// never strands a device as permanently occupied. Read the contract for its
+	// authoritative device set; Free is idempotent and a no-op for a GPU-less lease.
+	if c, err := b.store.Get(id); err == nil {
+		b.alloc.Free(c.GPUDeviceIDs)
+	}
 	if _, err := b.store.UpdateState(id, contract.StateExpired); err != nil {
 		b.logger.Error("mark contract expired", "contract_id", id, "error", err)
 	}
@@ -701,6 +744,9 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 			b.logger.Error("kill container on release", "contract_id", c.ID, "error", err)
 		}
 	}
+	// Return any exclusively-held GPU devices to the allocator. Free is idempotent,
+	// so a lease the reaper later also sweeps never double-frees a device.
+	b.alloc.Free(c.GPUDeviceIDs)
 
 	c, err = b.store.UpdateState(c.ID, contract.StateReleased)
 	if err != nil {
@@ -897,6 +943,7 @@ func (b *broker) statusOf(c contract.Contract) statusResponse {
 		ContractID:          c.ID,
 		Status:              string(c.State),
 		TTLSecondsRemaining: remaining,
+		Gpus:                c.GPUDeviceIDs,
 		Meta:                c.Meta,
 	}
 }
@@ -977,6 +1024,13 @@ func createOptions(spec launchSpec, c contract.Contract, os runtime.ContainerOS)
 	// kept defensive) since there would be nothing to reap against.
 	if c.TTL > 0 && !c.ExpiresAt.IsZero() {
 		labels[expiresAtLabel] = strconv.FormatInt(c.ExpiresAt.Unix(), 10)
+	}
+	// Record the exclusively-assigned GPU device IDs so the startup reconcile can
+	// rebuild the allocator's occupancy from this container's labels alone and
+	// never double-assign a device this live lease still holds (see reconcile).
+	// Omitted when the lease holds no GPUs.
+	if v := gpusLabelValue(c.GPUDeviceIDs); v != "" {
+		labels[gpusLabel] = v
 	}
 	opts := runtime.CreateOptions{
 		Labels: labels,

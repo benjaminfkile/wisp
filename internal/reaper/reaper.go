@@ -66,6 +66,14 @@ type Options struct {
 	// on the reaper's own goroutine, so it must not block for long.
 	Notify func(Event)
 
+	// ReleaseGPUs, when set, is called with a contract's assigned GPU device IDs
+	// as the reaper expires it, so the exclusive device allocator reclaims them
+	// (see gpu.Allocator.Free). It runs on the reaper's own goroutine and must be
+	// idempotent — the allocator's Free is — so a contract already released and
+	// freed elsewhere is never double-freed into a re-assignable state. Nil on a
+	// host with no GPU allocator wired.
+	ReleaseGPUs func(ids []string)
+
 	// Logger receives operational logs. Defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -80,6 +88,10 @@ type Reaper struct {
 	interval time.Duration
 	now      func() time.Time
 	logger   *slog.Logger
+
+	// releaseGPUs reclaims an expired contract's GPU devices back to the
+	// allocator; nil when no GPU allocator is wired. See Options.ReleaseGPUs.
+	releaseGPUs func(ids []string)
 
 	mu     sync.RWMutex
 	notify func(Event)
@@ -100,13 +112,14 @@ func New(store *contract.Store, rt runtime.Runtime, opts Options) *Reaper {
 		opts.Logger = slog.Default()
 	}
 	return &Reaper{
-		store:    store,
-		rt:       rt,
-		lead:     opts.Lead,
-		interval: opts.Interval,
-		now:      opts.Now,
-		logger:   opts.Logger,
-		notify:   opts.Notify,
+		store:       store,
+		rt:          rt,
+		lead:        opts.Lead,
+		interval:    opts.Interval,
+		now:         opts.Now,
+		logger:      opts.Logger,
+		notify:      opts.Notify,
+		releaseGPUs: opts.ReleaseGPUs,
 	}
 }
 
@@ -170,6 +183,12 @@ func (r *Reaper) expire(ctx context.Context, c contract.Contract, now time.Time)
 		if err := r.rt.Kill(ctx, c.ContainerID); err != nil && !errors.Is(err, runtime.ErrNotFound) {
 			r.logger.Error("reaper: kill container", "contract_id", c.ID, "error", err)
 		}
+	}
+	// Reclaim any whole GPU devices the lease held so an expired lease's devices
+	// return to the allocator for reuse. The allocator's Free is idempotent, so a
+	// lease already released and freed elsewhere is safe to free again here.
+	if r.releaseGPUs != nil && len(c.GPUDeviceIDs) > 0 {
+		r.releaseGPUs(c.GPUDeviceIDs)
 	}
 	r.transition(c, contract.StateExpired, now)
 }

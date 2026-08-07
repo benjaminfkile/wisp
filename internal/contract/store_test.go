@@ -43,6 +43,59 @@ func TestStoreCreateGet(t *testing.T) {
 	}
 }
 
+// Create persists the exclusively-assigned GPU device IDs, Get surfaces them,
+// and the stored slice does not alias the caller's input (mutating the input
+// after Create must not change stored state).
+func TestStoreCreatePersistsGPUDeviceIDs(t *testing.T) {
+	s := NewStore()
+	input := []string{"GPU-aaa", "GPU-bbb"}
+
+	c, err := s.Create(CreateParams{TTL: time.Hour, GPUDeviceIDs: input})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !reflect.DeepEqual(c.GPUDeviceIDs, []string{"GPU-aaa", "GPU-bbb"}) {
+		t.Fatalf("GPUDeviceIDs = %v, want [GPU-aaa GPU-bbb]", c.GPUDeviceIDs)
+	}
+
+	// Mutating the caller's slice must not affect the stored contract.
+	input[0] = "GPU-tampered"
+	got, err := s.Get(c.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.GPUDeviceIDs[0] != "GPU-aaa" {
+		t.Errorf("stored GPUDeviceIDs aliased caller slice: %v", got.GPUDeviceIDs)
+	}
+
+	// A GPU-less create carries no device slice.
+	none, err := s.Create(CreateParams{TTL: time.Hour})
+	if err != nil {
+		t.Fatalf("Create (no gpus): %v", err)
+	}
+	if none.GPUDeviceIDs != nil {
+		t.Errorf("GPUDeviceIDs = %v, want nil for a GPU-less contract", none.GPUDeviceIDs)
+	}
+}
+
+// Adopt recovers the GPU device IDs from a reconciled lease so the rebuilt
+// contract surfaces them and can free them when reaped.
+func TestStoreAdoptRecoversGPUDeviceIDs(t *testing.T) {
+	s := NewStore()
+	c, err := s.Adopt(AdoptParams{
+		ID:           "contract-1",
+		ContainerID:  "cont-1",
+		ExpiresAt:    time.Unix(2_000_000_000, 0),
+		GPUDeviceIDs: []string{"GPU-xyz"},
+	})
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if !reflect.DeepEqual(c.GPUDeviceIDs, []string{"GPU-xyz"}) {
+		t.Errorf("GPUDeviceIDs = %v, want [GPU-xyz]", c.GPUDeviceIDs)
+	}
+}
+
 func TestStoreCreateInvalidTTL(t *testing.T) {
 	s := NewStore()
 	for _, ttl := range []time.Duration{0, -time.Second} {

@@ -52,6 +52,64 @@ func readyContract(t *testing.T, store *contract.Store, fake *runtime.Fake, ttl 
 	return c, cid
 }
 
+// When the reaper expires a lease holding GPU devices, it invokes ReleaseGPUs
+// with that lease's exact device IDs so they return to the allocator. A lease
+// with no GPUs never triggers the hook.
+func TestReaperReleasesGPUsOnExpiry(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	ctx := context.Background()
+
+	// A GPU-holding lease already past its TTL, adopted with a live container.
+	past := time.Unix(1_000_000_000, 0)
+	cid, err := fake.Create(ctx, "wisp-base", runtime.CreateOptions{})
+	if err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+	if _, err := store.Adopt(contract.AdoptParams{
+		ID:           "gpu-contract",
+		ContainerID:  cid,
+		ExpiresAt:    past,
+		GPUDeviceIDs: []string{"GPU-0", "GPU-1"},
+	}); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	// A GPU-less lease also past its TTL, so both are expired in the same sweep.
+	if _, err := store.Adopt(contract.AdoptParams{ID: "plain-contract", ExpiresAt: past}); err != nil {
+		t.Fatalf("Adopt plain: %v", err)
+	}
+
+	var freed [][]string
+	rp := New(store, fake, Options{
+		Logger:      discardLogger(),
+		Now:         func() time.Time { return past.Add(time.Hour) },
+		ReleaseGPUs: func(ids []string) { freed = append(freed, ids) },
+	})
+	rp.Tick(ctx)
+
+	if c, _ := store.Get("gpu-contract"); c.State != contract.StateExpired {
+		t.Fatalf("gpu-contract state = %q, want expired", c.State)
+	}
+	if len(freed) != 1 {
+		t.Fatalf("ReleaseGPUs called %d times, want 1 (only the GPU-holding lease)", len(freed))
+	}
+	if want := []string{"GPU-0", "GPU-1"}; !equalStrings(freed[0], want) {
+		t.Fatalf("freed = %v, want %v", freed[0], want)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // TestReaperExpiringWarning: a ready contract inside the lead window is moved to
 // expiring, its container is left running, and the hook fires.
 func TestReaperExpiringWarning(t *testing.T) {

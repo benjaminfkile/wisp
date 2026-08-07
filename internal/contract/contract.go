@@ -132,6 +132,15 @@ type Contract struct {
 	// a container is provisioned.
 	ContainerID string
 
+	// GPUDeviceIDs are the whole GPU devices this contract was exclusively
+	// assigned, by their stable device IDs (see docs/DESIGN.md §7). Empty when the
+	// lease holds no GPUs. Wisp owns the assignment: the allocator hands out these
+	// specific IDs at create time and reclaims them when the contract reaches a
+	// terminal state. The set is fixed for the contract's life and is surfaced on
+	// status reads as "gpus" and persisted on the container's wisp.gpus label so a
+	// restart can rebuild allocator occupancy.
+	GPUDeviceIDs []string
+
 	// CreatedAt is when the contract was created.
 	CreatedAt time.Time
 

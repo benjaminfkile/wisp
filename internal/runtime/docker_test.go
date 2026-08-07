@@ -310,3 +310,55 @@ func TestDockerRuntimeCreateIsolation(t *testing.T) {
 		})
 	}
 }
+
+// TestDockerRuntimeCreateGPUDeviceRequests verifies DockerRuntime.Create maps the
+// exclusively-assigned GPU device IDs onto HostConfig.Resources.DeviceRequests —
+// the nvidia driver, the explicit device IDs, and the "gpu" capability (the SDK
+// equivalent of `docker run --gpus device=...`) — for the shared/runc launch
+// mechanism, and leaves DeviceRequests nil for a GPU-less lease.
+func TestDockerRuntimeCreateGPUDeviceRequests(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("shared attaches assigned devices", func(t *testing.T) {
+		stub := &createStubClient{osType: "linux"}
+		d := NewDockerRuntimeWithClient(stub)
+		opts := CreateOptions{
+			Isolation: IsolationShared,
+			Resources: Resources{GPUDeviceIDs: []string{"GPU-a", "GPU-b"}},
+		}
+		if _, err := d.Create(ctx, "img", opts); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		want := []container.DeviceRequest{{
+			Driver:       "nvidia",
+			DeviceIDs:    []string{"GPU-a", "GPU-b"},
+			Capabilities: [][]string{{"gpu"}},
+		}}
+		if !reflect.DeepEqual(stub.gotHost.Resources.DeviceRequests, want) {
+			t.Fatalf("DeviceRequests = %+v, want %+v", stub.gotHost.Resources.DeviceRequests, want)
+		}
+	})
+
+	t.Run("no gpus leaves DeviceRequests nil", func(t *testing.T) {
+		stub := &createStubClient{osType: "linux"}
+		d := NewDockerRuntimeWithClient(stub)
+		if _, err := d.Create(ctx, "img", CreateOptions{Isolation: IsolationShared}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if stub.gotHost.Resources.DeviceRequests != nil {
+			t.Fatalf("DeviceRequests = %+v, want nil for a GPU-less lease", stub.gotHost.Resources.DeviceRequests)
+		}
+	})
+
+	t.Run("gpus at a vm launch mechanism fail the create", func(t *testing.T) {
+		stub := &createStubClient{osType: "linux"}
+		d := NewDockerRuntimeWithClient(stub)
+		opts := CreateOptions{
+			Isolation: IsolationVM,
+			Resources: Resources{GPUDeviceIDs: []string{"GPU-a"}},
+		}
+		if _, err := d.Create(ctx, "img", opts); !errors.Is(err, ErrGPUAttachUnsupported) {
+			t.Fatalf("Create error = %v, want ErrGPUAttachUnsupported", err)
+		}
+	})
+}

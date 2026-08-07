@@ -320,6 +320,18 @@ func (d *DockerRuntime) Create(ctx context.Context, image string, opts CreateOpt
 	runtimeName, isolationMode := launchMechanism(opts.Isolation, d.containerOS)
 	host.Runtime = runtimeName
 	host.Isolation = container.Isolation(isolationMode)
+	// Attach any exclusively-assigned GPU devices through the per-launch-mechanism
+	// seam rather than an inline isolation check: shared/runc yields nvidia
+	// DeviceRequests, and a mechanism with no GPU backend yet (vm/kata) surfaces the
+	// typed ErrGPUAttachUnsupported (see gpuAttachment). No devices → no seam call,
+	// so DeviceRequests stays nil for the common GPU-less lease.
+	if len(opts.Resources.GPUDeviceIDs) > 0 {
+		reqs, err := gpuAttachment(opts.Isolation, opts.Resources.GPUDeviceIDs)
+		if err != nil {
+			return "", err
+		}
+		host.Resources.DeviceRequests = reqs
+	}
 	resp, err := d.cli.ContainerCreate(ctx, cfg, host, nil, nil, "")
 	if err != nil {
 		return "", fmt.Errorf("runtime: create container: %w", err)

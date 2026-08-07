@@ -40,6 +40,138 @@ func gpuBroker(t *testing.T, ids ...string) (*broker, http.Handler, *contract.St
 	return b, mux, store, fake
 }
 
+// A create requesting resources.gpus is accepted on a GPU-capable host: the
+// requested count of whole devices is exclusively allocated, recorded on the
+// contract, passed through to the runtime as GPUDeviceIDs, written as the
+// wisp.gpus label, and surfaced end-to-end on the status read.
+func TestCreateWithGPUsHappyPath(t *testing.T) {
+	b, h, store, fake := gpuBroker(t, "GPU-0", "GPU-1")
+
+	created := createContract(t, h, `{"ttl_seconds":600,"resources":{"gpus":1}}`)
+
+	c, _ := store.Get(created.ContractID)
+	if !reflect.DeepEqual(c.GPUDeviceIDs, []string{"GPU-0"}) {
+		t.Fatalf("contract GPUDeviceIDs = %v, want [GPU-0]", c.GPUDeviceIDs)
+	}
+	// The assigned device reached the runtime as a pass-through on the container's
+	// Resources, mirroring how cpus/memory are asserted against the Fake.
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	if !reflect.DeepEqual(fc.Opts.Resources.GPUDeviceIDs, []string{"GPU-0"}) {
+		t.Fatalf("runtime GPUDeviceIDs = %v, want [GPU-0]", fc.Opts.Resources.GPUDeviceIDs)
+	}
+	if got := fc.Opts.Labels[gpusLabel]; got != "GPU-0" {
+		t.Errorf("wisp.gpus label = %q, want \"GPU-0\"", got)
+	}
+	// One device is now held; one remains free.
+	if b.alloc.Available() != 1 {
+		t.Errorf("Available() = %d, want 1 (one device held)", b.alloc.Available())
+	}
+
+	// The status read surfaces the assigned device under the "gpus" wire field.
+	rec := do(t, h, http.MethodGet, "/contracts/"+created.ContractID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	list, ok := body["gpus"].([]any)
+	if !ok || len(list) != 1 || list[0] != "GPU-0" {
+		t.Fatalf("status gpus = %v, want [GPU-0]", body["gpus"])
+	}
+}
+
+// A GPU request on a host with no GPU support is REJECTED (400), never clamped to
+// zero, and reserves nothing.
+func TestCreateGPUsRejectedUnsupportedHost(t *testing.T) {
+	// A fake with no enumerated devices models a GPU-less host (supported=false).
+	b, h, store, _ := gpuBroker(t)
+	before := len(store.List())
+
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":600,"resources":{"gpus":1}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if b.alloc.Available() != 0 {
+		t.Errorf("Available() = %d, want 0 (nothing to allocate on a GPU-less host)", b.alloc.Available())
+	}
+	if len(store.List()) != before {
+		t.Errorf("a rejected GPU create must record no contract")
+	}
+}
+
+// A GPU request above the effective per-lease cap is REJECTED (400), never
+// clamped down, and reserves no device.
+func TestCreateGPUsRejectedOverMax(t *testing.T) {
+	b, h, store, _ := gpuBroker(t, "GPU-0", "GPU-1")
+	before := len(store.List())
+
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":600,"resources":{"gpus":3}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if b.alloc.Available() != 2 {
+		t.Errorf("Available() = %d, want 2 (over-ask reserves nothing)", b.alloc.Available())
+	}
+	if len(store.List()) != before {
+		t.Errorf("a rejected over-ask must record no contract")
+	}
+}
+
+// A GPU request at an isolation level whose attach map entry is false is REJECTED
+// (400) even though the level itself is allowed on the host — v1 attaches GPUs
+// only at shared. Nothing is reserved.
+func TestCreateGPUsRejectedWrongIsolation(t *testing.T) {
+	// Allow vm in policy and advertise the Kata runtime so vm passes the isolation
+	// gate; the GPU attach map still forbids a GPU there (only shared attaches).
+	pol := policy.Default()
+	pol.Limits.Isolations = []string{"shared", "vm"}
+	store := contract.NewStore()
+	fake := gpuFake("GPU-0", "GPU-1")
+	fake.Runtimes = []string{"runc", "kata-runtime", runtime.NVIDIARuntimeName}
+	b := newBroker(store, fake, pol, bus.New(nil), discardLogger(), "")
+	mux := http.NewServeMux()
+	b.routes(mux)
+
+	rec := do(t, mux, http.MethodPost, "/contracts", `{"ttl_seconds":600,"isolation":"vm","resources":{"gpus":1}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if b.alloc.Available() != 2 {
+		t.Errorf("Available() = %d, want 2 (wrong-isolation reserves nothing)", b.alloc.Available())
+	}
+	if len(store.List()) != 0 {
+		t.Errorf("a rejected wrong-isolation create must record no contract")
+	}
+}
+
+// When the allocator is exhausted (every advertised device already held by a live
+// lease) a within-limits GPU request is a 409 capacity conflict, distinct from the
+// 400 over-ask, and records no contract.
+func TestCreateGPUsAllocatorExhausted(t *testing.T) {
+	b, h, store, _ := gpuBroker(t, "GPU-0")
+	// Occupy the only device so the next request finds none free.
+	if _, err := b.alloc.Allocate(1); err != nil {
+		t.Fatalf("pre-Allocate: %v", err)
+	}
+	before := len(store.List())
+
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":600,"resources":{"gpus":1}}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if b.alloc.Available() != 0 {
+		t.Errorf("Available() = %d, want 0 (exhausted, unchanged)", b.alloc.Available())
+	}
+	if len(store.List()) != before {
+		t.Errorf("an exhausted-allocator create must record no contract")
+	}
+}
+
 // The broker's allocator is seeded from the detected GPU inventory in detection
 // order, so the create path allocates from real devices.
 func TestBrokerAllocatorSeededFromDetectedGPUs(t *testing.T) {

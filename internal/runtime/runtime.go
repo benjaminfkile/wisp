@@ -175,6 +175,15 @@ type Resources struct {
 
 	// PidsLimit is the maximum number of processes allowed in the container.
 	PidsLimit int64
+
+	// GPUDeviceIDs are the stable IDs of the whole GPUs to attach exclusively to
+	// the container (see docs/DESIGN.md §7). Empty attaches no GPU — the common
+	// case. Wisp owns the assignment: the allocator hands these specific IDs to the
+	// create path, which passes them through here. The runtime maps a non-empty
+	// list to the device-attachment strategy for its launch mechanism (see
+	// gpuAttachment); for the shared/runc mechanism that is Docker DeviceRequests
+	// with the nvidia driver and these explicit device IDs.
+	GPUDeviceIDs []string
 }
 
 // ExecResult is the outcome of a synchronous exec: fully buffered stdout and

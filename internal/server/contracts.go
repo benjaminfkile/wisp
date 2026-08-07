@@ -247,6 +247,13 @@ type resourcesRequest struct {
 	CPUs     float64 `json:"cpus"`
 	MemoryMB int     `json:"memory_mb"`
 	Pids     int     `json:"pids"`
+
+	// Gpus is the count of whole, exclusively-assigned GPUs the lease requests
+	// (default 0). Unlike the other dimensions it is REJECTED, never clamped, when
+	// it exceeds what the host allows: gpus is billing-meaningful upstream, so
+	// silently reducing it would misprice a lease. Wisp turns this count into a set
+	// of specific device IDs via the exclusive allocator (see create).
+	Gpus int `json:"gpus"`
 }
 
 // createRequest is the POST /contracts body (see docs/DESIGN.md §4, §7). The
@@ -397,6 +404,23 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve GPUs: resources.gpus is a count of whole, exclusively-assigned GPUs.
+	// Unlike cpus/memory/pids it is REJECTED, never clamped — gpus is
+	// billing-meaningful upstream, so silently reducing the count would misprice a
+	// lease. A positive count is rejected with a 400 when the host supports no GPUs,
+	// when it exceeds the effective per-lease cap, or when GPU attach is not
+	// available at the resolved isolation level (the task-1 attach map; v1: only
+	// shared). Only after those checks pass does it consume real capacity: the
+	// allocator hands out that many free device IDs, and an exhausted allocator (the
+	// host advertises GPUs but every device is held by another live lease) maps to a
+	// 409 capacity conflict, not a 400. Allocation happens last, immediately before
+	// the contract records the IDs, so a rejected create never reserves a device.
+	gpuDeviceIDs, code, msg := b.allocateGPUs(req.Resources.Gpus, isolation)
+	if code != 0 {
+		writeError(w, code, msg)
+		return
+	}
+
 	// The policy caps the contract: the requested TTL and resources are clamped
 	// down to any configured maximum (see docs/DESIGN.md §7).
 	ttl := b.pol.ClampTTL(time.Duration(req.TTLSeconds) * time.Second)
@@ -411,14 +435,18 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c, err := b.store.Create(contract.CreateParams{
-		TTL:       ttl,
-		Image:     image,
-		Isolation: string(spec.isolation),
-		Meta:      req.Meta,
+		TTL:          ttl,
+		Image:        image,
+		Isolation:    string(spec.isolation),
+		GPUDeviceIDs: gpuDeviceIDs,
+		Meta:         req.Meta,
 	})
 	if err != nil {
 		// The only error Create returns for a positive TTL is ErrInvalidTTL,
-		// already guarded above; treat anything here as a server fault.
+		// already guarded above; treat anything here as a server fault. Return any
+		// devices already reserved above so a store failure never strands them: the
+		// contract that would own (and later free) them was never recorded.
+		b.alloc.Free(gpuDeviceIDs)
 		b.logger.Error("create contract", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not create contract")
 		return
@@ -450,6 +478,45 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		Token:      c.Token,
 		Status:     string(c.State),
 	})
+}
+
+// allocateGPUs validates a lease's requested GPU count against the host's
+// effective posture and, when valid, exclusively reserves that many device IDs
+// from the allocator. It returns the assigned device IDs on success (nil for a
+// zero request) with code 0; on rejection it returns a zero-length slice, the HTTP
+// status to write, and a client-facing message.
+//
+// The requested count is REJECTED, never clamped (unlike cpus/memory/pids): gpus
+// is billing-meaningful upstream, so silently reducing it would misprice a lease.
+// A positive count is a 400 when the host has no GPU support, when it exceeds the
+// effective per-lease cap (min of operator cap and detected devices), or when GPU
+// attach is unavailable at the resolved isolation level — the task-1 policy attach
+// map, which advertises only shared in v1, so a GPU request at any stronger level
+// is rejected here rather than reaching the runtime's (unreachable-in-v1) vm attach
+// seam. Only after those checks does it consume capacity; an exhausted allocator
+// (every advertised device already held by another live lease) is a 409 conflict,
+// distinct from the 400 over-ask, since the ask itself was within limits.
+func (b *broker) allocateGPUs(count int, isolation policy.Isolation) (ids []string, code int, msg string) {
+	if count <= 0 {
+		return nil, 0, ""
+	}
+	if !b.gpu.Supported() {
+		return nil, http.StatusBadRequest, "gpus requested but this host has no GPU support"
+	}
+	if count > b.gpu.MaxGPUs() {
+		return nil, http.StatusBadRequest, fmt.Sprintf("gpus requested (%d) exceeds the maximum allowed (%d)", count, b.gpu.MaxGPUs())
+	}
+	if !b.gpu.Attach(isolation) {
+		return nil, http.StatusBadRequest, fmt.Sprintf("gpus not available at isolation level %q", isolation.String())
+	}
+	assigned, err := b.alloc.Allocate(count)
+	if err != nil {
+		// The only error Allocate returns is insufficient free devices: the host
+		// advertises GPU capacity but every device is currently held by another live
+		// lease. That is a transient capacity conflict, not a malformed request.
+		return nil, http.StatusConflict, "no GPU devices currently available"
+	}
+	return assigned, 0, ""
 }
 
 // images handles GET /images: the unauthenticated discovery document any
@@ -1044,6 +1111,11 @@ func createOptions(spec launchSpec, c contract.Contract, os runtime.ContainerOS)
 			NanoCPUs:    int64(spec.cpus * 1e9),
 			MemoryBytes: int64(spec.memoryMB) * bytesPerMB,
 			PidsLimit:   int64(spec.pids),
+			// Pass the exclusively-assigned GPU devices through to the runtime, which
+			// maps them to its launch mechanism's attachment strategy (nvidia
+			// DeviceRequests for shared/runc; see runtime.gpuAttachment). Empty for a
+			// GPU-less lease, leaving no device attachment.
+			GPUDeviceIDs: c.GPUDeviceIDs,
 		},
 		// Always harden leased containers against setuid privilege escalation.
 		SecurityOpt: []string{noNewPrivilegesOpt},

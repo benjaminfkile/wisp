@@ -176,7 +176,9 @@ detected devices, mirroring the other `max_*` limits); `gpus_disabled: true` tur
 entirely regardless of hardware (omitted ⇒ enabled, the default). At startup Wisp detects GPU support —
 the daemon must advertise the `nvidia` runtime **and** `nvidia-smi` must enumerate at least one device —
 intersects it with the operator config, and advertises the result on `GET /images`; a detection failure
-degrades to unsupported (a startup log line, never a fatal error).
+degrades to unsupported (a startup log line, never a fatal error). The full v1 GPU model — detection,
+the capability block's wire shape, the create-path semantics, the exclusive allocator, restart
+reconcile, and the per-launch-mechanism attachment seam — is the **GPU leasing (v1)** subsection below.
 
 At create time (§4) the client sends `image`, `network`, `isolation`, and `resources`:
 
@@ -222,6 +224,128 @@ skip it, a client builds its own image `FROM wisp-base` with its tools baked in 
 adds that tag to the allow-list. That image is just data — Wisp still never knows what's inside.
 So: bare-and-generic by default, warm-and-ready by choice; the pre-baked image is configuration,
 never part of Wisp.
+
+### GPU leasing (v1)
+
+GPUs are the first **host-detected, operator-gated hardware dimension** a lease can request. The v1
+model is deliberately narrow — *whole-device exclusive leases on a single isolation tier* — and every
+seam that a richer model would touch (VM passthrough, per-isolation attach) is present as **data**, so
+growing it later is filling a slot, not rewiring the create path. It builds directly on the isolation
+model above: GPU attach is selected from the isolation level the same data-driven way the container
+runtime is, and the capability posture is computed as *policy ∩ host* exactly like the isolation
+posture.
+
+**The v1 model: whole devices, exclusive.** A GPU is leased as a *whole device* — two live contracts
+never share a device ID. The marketplace above wisp only ever asks for a **count** (`resources.gpus`);
+wisp turns that count into a set of specific, currently-free device IDs and reserves them exclusively
+until the owning contract reaches a terminal state. There is no fractional / MIG / time-sliced sharing
+in v1. Whole-device exclusivity is what makes the count billing-meaningful upstream and keeps the
+allocator a plain set of opaque IDs.
+
+**Detection (two halves, behind an interface).** A host supports GPU leasing iff **both** signals
+agree: the daemon advertises the `nvidia` OCI runtime (the NVIDIA Container Runtime is installed and
+registered — the daemon-side half, read from `docker info` runtimes), **and** `nvidia-smi` enumerates
+at least one device (the hardware half). `nvidia-smi` is the only vendor tool wired in v1 and it sits
+behind a narrow `CommandRunner` seam (`internal/runtime/gpu.go`): the enumeration+parse logic is
+unit-tested with canned CSV output, so nothing shells out for real in tests — the CI/runner container
+has no GPU and no NVIDIA tooling. Enumeration runs `nvidia-smi --query-gpu=uuid,name,memory.total
+--format=csv,noheader,nounits` and parses each row into `{ID, Class, VRAMMB}`, where `Class` is the
+product name normalized to an opaque lowercase-hyphenated label (`NVIDIA GeForce RTX 4090` →
+`nvidia-geforce-rtx-4090`). Detection is **best-effort**: a missing daemon-info call, an absent
+`nvidia-smi`, or an unparseable line all degrade to *unsupported* with a single startup log line —
+never a fatal error. wisp only bothers enumerating when the daemon reports the `nvidia` runtime, so a
+GPU-less host avoids a needless shell-out and scary log line; the policy layer still re-derives support
+authoritatively from the runtimes + devices data.
+
+**Operator policy knobs.** Two config knobs gate leasing (see the `limits` block above), both optional
+and both mirroring the `max_*`/"zero = no cap" convention of the other limits: `max_gpus` caps the GPUs a single lease may
+request (`0`/omitted ⇒ no operator cap → all detected devices), and `gpus_disabled: true` turns GPU
+leasing off entirely regardless of hardware (omitted ⇒ enabled, the default). `EffectiveGPU` intersects
+these with the detected host facts to yield the **effective posture**: supported iff the host supports
+GPUs *and* the operator did not disable leasing; effective per-lease cap = `min(operator cap, detected
+count)`. Capacity the policy withholds (leasing disabled with GPUs present, or a cap below the device
+count) is logged at startup, mirroring the isolation model's dropped-levels warning. A negative
+`max_gpus` is a config-load error.
+
+**The capability block on `GET /images`.** The discovery document (§10) always carries a `gpu` block —
+present even on a GPU-less host — with this exact wire shape:
+
+```jsonc
+"gpu": {
+  "supported": true,                       // may GPUs be leased on this host at all?
+  "devices": [                             // the enumerated GPUs (always an array, never null)
+    { "id": "GPU-<uuid>", "class": "nvidia-geforce-rtx-4090", "vram_mb": 24564 }
+  ],
+  "max_gpus": 1,                           // effective per-lease cap = min(operator cap, detected count)
+  "isolations": ["shared"]                 // isolation levels at which GPU attach is available
+}
+```
+
+An unsupported host reports the empty shape `{ "supported": false, "devices": [], "max_gpus": 0,
+"isolations": [] }`. `devices` and `isolations` are always non-null arrays so a consumer never has to
+distinguish `null` from `[]`. `isolations` is the crux of the forward-compat design: it lists the
+isolation levels at which a GPU can be attached, computed **as data** from a per-level attach map, and
+in v1 it is **at most `["shared"]`**. This is the surface wisp-agent scrapes to report GPU capacity
+upward, so the field names are the authoritative wire contract across repos.
+
+**Create-path semantics: reject, don't clamp.** `resources.gpus` on `POST /contracts` (§4) is a count,
+and unlike `cpus`/`memory_mb`/`pids` it is **rejected, never clamped**: those dimensions are shaped to
+fit, but silently reducing a GPU count would misprice a billing-meaningful lease, so an over-ask is an
+error the caller must see. A positive count is a **`400`** when the host has no GPU support, when it
+exceeds the effective per-lease cap, or when GPU attach is **not available at the resolved isolation
+level** — the last check reads the same per-level attach map the capability block advertises (v1: only
+`shared`), so a GPU request at `sandboxed`/`vm` is refused at the create path and never reaches an
+attach mechanism that has no backend. Isolation gating is therefore **data, not an inline
+`isolation == "shared"` check** anywhere. Only after all three checks pass does the request consume real
+capacity: the allocator hands out that many free device IDs. An exhausted allocator — the host
+advertises GPUs but every device is already held by another live lease — is a **`409`** capacity
+conflict, distinct from the `400` over-ask, because the ask itself was within limits. Allocation
+happens last, immediately before the contract records the IDs, so a rejected create never strands a
+device. The assigned device IDs are echoed on `GET /contracts/:id` as a `gpus` array (omitted for a
+GPU-less lease).
+
+**The allocator.** `internal/gpu.Allocator` is a concurrency-safe, whole-device exclusive allocator
+over the detected inventory of opaque device-ID strings. It is deliberately **backend-agnostic** — it
+carries no runc/Docker/VFIO assumptions, only IDs — so the same allocator serves today's runc path and
+a future VM path unchanged. `Allocate(n)` is atomic (all `n` reserved in detection order, or none, with
+an `*InsufficientDevicesError` the create path maps to the `409`); `Free` is idempotent, so a lease the
+reaper sweeps after a release never double-frees; `Reserve` re-occupies specific IDs during startup
+reconcile. A single shared allocator instance is threaded through the create path, every terminal path
+(release, provision-failure, and the reaper's expiry hook), and the reconcile — that one shared
+instance is what makes whole-device exclusivity hold across all of them.
+
+**Restart reconcile via the `wisp.gpus` label.** A lease's assigned device IDs are written at create
+time into a `wisp.gpus` container label (comma-joined, alongside `wisp.contract` and
+`wisp.expires_at`; device IDs never contain a comma, so the join is unambiguous). On startup, after a
+crash or restart, the reconcile (§13, `internal/server/reconcile.go`) lists surviving leased
+containers, re-adopts each contract, and `Reserve`s its `wisp.gpus` devices back into the allocator —
+so a restarted wispd never re-hands a device a surviving lease still holds. A device ID the host no
+longer detects (e.g. a GPU physically removed since the container launched) is logged and skipped
+rather than crashing the reconcile. This must run before the reaper starts, exactly like the rest of
+reconcile.
+
+**The per-launch-mechanism attachment seam (the Kata intent).** Attaching a GPU is done *differently by
+each launch mechanism*, exactly like the isolation level selects the container runtime (above). The
+mapping lives in one place — `gpuAttachment(isolation, deviceIDs)` in `internal/runtime/gpu_attach.go`
+— kept structurally parallel to `launchMechanism`, so the two dimensions of a launch (its runtime and
+its device attachment) are selected the same data-driven way. v1 ships exactly **one** GPU backend:
+`shared`/runc, which attaches whole devices via Docker `DeviceRequests` naming the `nvidia` driver, the
+explicit device IDs, and the `gpu` capability — the SDK equivalent of `docker run --gpus
+device=<id>,<id>`. Naming explicit device IDs (not a count) is what makes the attach exclusive to the
+allocator-chosen devices. The `vm` slot **exists** but has no backend yet, returning the typed
+`ErrGPUAttachUnsupported`; that slot is the intended insertion point for **Kata Containers + VFIO
+whole-GPU passthrough** as the VM backend. Because attach is never gated on `isolation == "shared"`
+inline, adding VM-backed passthrough later is confined to two edits: implement the Kata + VFIO strategy
+in this seam and flip the `vm` entry of the policy attach map (`gpuAttachByIsolation`) to `true` — the
+capability block, the create-path gate, and every call site pick it up with no further change. (In v1
+the create path already rejects a GPU request at any non-`shared` level, so the `vm` slot's error is
+unreachable through the create path — but it is the honest typed answer for a mechanism that cannot
+attach a GPU, and it is exercised directly by unit tests.)
+
+**Isolation posture in v1.** Because the only GPU backend is `shared`/runc, GPU leasing is available at
+**shared isolation only** — the weakest boundary, where the GPU driver surface is exposed to the lease.
+The testing record (`docs/ISOLATION_TESTING.md`) documents what v1 ships, what is planned (Kata + VFIO;
+gVisor `nvproxy` as a possible middle tier), and why none of it can be verified in CI (no GPU hardware).
 
 ## 8. Auth & security
 

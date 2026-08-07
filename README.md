@@ -87,7 +87,7 @@ Any consumer can discover what it may request via the **unauthenticated**
 
 ```sh
 curl -s localhost:8080/images
-# {"images":["wisp-base"],"default":"wisp-base","os":"linux","limits":{"max_ttl_seconds":3600,...,"networks":["none","open"]},"isolation":{"supported":["shared"],"default":"shared"}}
+# {"images":["wisp-base"],"default":"wisp-base","os":"linux","limits":{"max_ttl_seconds":3600,...,"networks":["none","open"]},"isolation":{"supported":["shared"],"default":"shared"},"gpu":{"supported":false,"devices":[],"max_gpus":0,"isolations":[]}}
 ```
 
 The `os` field reports the Docker daemon's current container mode (`linux` or
@@ -107,6 +107,34 @@ actually run (`shared` always; `sandboxed` when the gVisor runtime `runsc` is
 registered; `vm` on a Kata-enabled Linux daemon or a Windows daemon via Hyper-V),
 and `default` is the level applied when a create omits `isolation`. A consumer
 only ever sees, and can only request, levels this host can launch.
+
+## GPU leasing
+
+GPUs are an operator-gated, host-detected dimension a lease can request as a
+**count** (`resources.gpus`); wisp assigns **whole devices exclusively** — no two
+live leases share a device. What a host needs to lease GPUs in v1:
+
+- **NVIDIA driver + [`nvidia-container-toolkit`](https://github.com/NVIDIA/nvidia-container-toolkit)**,
+  configured so the Docker daemon registers the `nvidia` runtime. wisp detects
+  GPU support from two signals: the daemon advertising that runtime **and**
+  `nvidia-smi` enumerating at least one device. Missing either ⇒ GPU leasing is
+  advertised as unsupported (a startup log line, never a fatal error).
+- **Shared isolation only.** v1 attaches GPUs via `docker run --gpus`-style
+  device requests under runc; no sandboxed/VM GPU backend exists yet, so GPU
+  attach is available at `shared` isolation only.
+- **Config knobs** (`WISP_CONFIG` `limits`, both optional):
+  - `max_gpus` — per-lease GPU cap; `0`/omitted ⇒ no operator cap (all detected
+    devices). Must not be negative.
+  - `gpus_disabled` — `true` turns GPU leasing off entirely regardless of
+    hardware; omitted ⇒ enabled.
+
+Unlike `cpus`/`memory_mb`/`pids` (which are clamped), an over-large `gpus`
+request is **rejected** (`400`), never silently reduced. `GET /images` carries a
+`gpu` block advertising the effective posture — `{ supported, devices, max_gpus,
+isolations }`. See [`docs/DESIGN.md` §7](docs/DESIGN.md) for the full model
+(detection, allocator, restart reconcile, and the Kata + VFIO seam), and
+[`docs/ISOLATION_TESTING.md`](docs/ISOLATION_TESTING.md) for the isolation
+posture and CI limits.
 
 ## Auth
 

@@ -77,13 +77,13 @@ type broker struct {
 	// gpu is the host's effective GPU posture — the operator's GPU config
 	// intersected with the daemon's NVIDIA runtime and the enumerated devices —
 	// computed once at construction (see detectGPU). The read surface advertises it
-	// (the /images "gpu" block); a later task's create path enforces it.
+	// (the /images "gpu" block) and the create path enforces it (see allocateGPUs).
 	gpu policy.GPUCapabilities
 
 	// alloc assigns whole GPU devices exclusively from the detected inventory. It
 	// is built once at construction from the effective GPU posture's device IDs and
 	// is the single source of truth for which device is held by which lease: the
-	// create path (a later task) allocates from it, and every terminal path
+	// create path allocates from it (see allocateGPUs), and every terminal path
 	// (release, provision failure, and the reaper's expiry) frees back to it. The
 	// startup reconcile rebuilds its occupancy from surviving containers' labels.
 	alloc *gpu.Allocator

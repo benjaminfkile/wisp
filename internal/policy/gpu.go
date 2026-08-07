@@ -5,7 +5,7 @@ package policy
 // reports plain facts — the daemon's registered runtimes and the enumerated
 // devices — and this file intersects them with the operator's GPU config to get
 // the EFFECTIVE posture the read surface advertises (the /images "gpu" block) and
-// a later task's create path enforces (see docs/DESIGN.md §7).
+// the create path enforces (see docs/DESIGN.md §7).
 //
 // Policy stays free of a runtime import, exactly as the isolation capability does:
 // the caller passes the daemon's runtime names and the enumerated devices through
@@ -84,7 +84,7 @@ func gpuAttachByIsolation(supported bool) map[Isolation]bool {
 // at all, the enumerated devices, the effective per-lease cap, and the
 // per-isolation attach map. It is computed once at startup (see
 // Config.EffectiveGPU), then advertised on the read surface (the /images "gpu"
-// block) and consulted by a later task's create path.
+// block) and consulted by the create path.
 type GPUCapabilities struct {
 	supported bool
 	devices   []GPUDevice

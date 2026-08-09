@@ -1480,6 +1480,83 @@ func TestImagesGPUEnumerationFailureDegrades(t *testing.T) {
 	}
 }
 
+// GET /images advertises the operator's host capacity budgets and the live
+// non-terminal contract count in the "capacity" block; used_* are 0 until the
+// capacity allocator lands (sibling #566).
+func TestImagesCapacityBlockBudgets(t *testing.T) {
+	pol := policy.Default()
+	pol.Limits.MaxContracts = 5
+	pol.Limits.TotalCPUs = 16
+	pol.Limits.TotalMemoryMB = 32768
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, pol, bus.New(nil), "")
+
+	got := getImages(t, h)
+	if got.Capacity.MaxContracts != 5 || got.Capacity.TotalCPUs != 16 || got.Capacity.TotalMemoryMB != 32768 {
+		t.Errorf("capacity budgets = %+v, want max_contracts=5 total_cpus=16 total_memory_mb=32768", got.Capacity)
+	}
+	if got.Capacity.ActiveContracts != 0 {
+		t.Errorf("capacity.active_contracts = %d, want 0 (empty store)", got.Capacity.ActiveContracts)
+	}
+	if got.Capacity.UsedCPUs != 0 || got.Capacity.UsedMemoryMB != 0 {
+		t.Errorf("capacity used_* = {%v, %d}, want 0 (allocator lands in #566)", got.Capacity.UsedCPUs, got.Capacity.UsedMemoryMB)
+	}
+}
+
+// capacity.active_contracts counts only non-terminal contracts: a released or
+// expired contract still in the store is excluded.
+func TestImagesCapacityActiveContracts(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, policy.Default(), bus.New(nil), "")
+
+	// Two live contracts and one driven to a terminal state.
+	if _, err := store.Create(contract.CreateParams{TTL: time.Minute, Image: "wisp-base"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := store.Create(contract.CreateParams{TTL: time.Minute, Image: "wisp-base"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	term, err := store.Create(contract.CreateParams{TTL: time.Minute, Image: "wisp-base"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := store.UpdateState(term.ID, contract.StateReleased); err != nil {
+		t.Fatalf("UpdateState: %v", err)
+	}
+
+	got := getImages(t, h)
+	if got.Capacity.ActiveContracts != 2 {
+		t.Errorf("capacity.active_contracts = %d, want 2 (terminal contract excluded)", got.Capacity.ActiveContracts)
+	}
+}
+
+// TestImagesCapacityBlockRawJSON verifies the wire-contract field NAMES exactly
+// (the surface wisp-agent forwards and wisper-api consumes), independent of the
+// Go struct tags, and that the block is always present.
+func TestImagesCapacityBlockRawJSON(t *testing.T) {
+	h, _, _ := testServer(t)
+	rec := do(t, h, http.MethodGet, "/images", "")
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	block, ok := raw["capacity"]
+	if !ok {
+		t.Fatal("/images response has no top-level \"capacity\" object")
+	}
+	var capacity map[string]json.RawMessage
+	if err := json.Unmarshal(block, &capacity); err != nil {
+		t.Fatalf("decode capacity block: %v", err)
+	}
+	for _, field := range []string{"max_contracts", "active_contracts", "total_cpus", "used_cpus", "total_memory_mb", "used_memory_mb"} {
+		if _, ok := capacity[field]; !ok {
+			t.Errorf("capacity block missing wire-contract field %q", field)
+		}
+	}
+}
+
 // On a windows-mode host, an omitted image on create boots the Windows base
 // image (the OS-aware default) rather than the Linux base.
 func TestCreateDefaultsToWindowsBaseImage(t *testing.T) {

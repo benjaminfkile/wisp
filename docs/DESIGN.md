@@ -180,9 +180,15 @@ leases × `max_memory_mb` each can exceed real RAM, and contract count is unboun
 `total_cpus`, and `total_memory_mb` are operator-declared **host budgets** on that aggregate: concurrent
 contract count, total reserved CPU, and total reserved memory across all live leases. Each follows the
 `0`/omitted ⇒ unlimited convention, and when a total and its matching per-lease max are both set the
-total must be `>=` the per-lease max (a budget below one lease could never admit anything). Today these
-budgets are **advertised** on `GET /images` (the `capacity` block below); the aggregate allocator that
-tracks usage and enforces them at create time (a `409 at_capacity`) lands in a follow-up task.
+total must be `>=` the per-lease max (a budget below one lease could never admit anything). These
+budgets are **advertised** on `GET /images` (the `capacity` block below) and **enforced** at create
+time by a shared aggregate allocator: a create reserves its post-clamp cpus/memory and a contract slot
+against all three budgets all-or-nothing, and an exhausted budget is a **`409`** carrying an `at capacity`
+error (distinct from the GPU `409`). The reservation is the post-clamp resources actually applied to the
+container — an omitted dimension reserves the per-lease max when one is configured, else `0`, so an
+unbounded container on an unbudgeted dimension stays uncounted — and it is returned on release, TTL
+expiry, or a provisioning failure. Reserved usage does **not** yet survive a wispd restart: rebuilding it
+from container labels on reconcile lands in a follow-up task.
 
 **GPUs.** GPU leasing is an operator-gated, host-detected dimension, computed the same data-driven way
 as isolation. `max_gpus` caps the GPUs a single lease may request (`0`/omitted ⇒ no operator cap → all
@@ -236,8 +242,8 @@ so it attempts the create and maps the daemon's OS/platform rejection to a clear
 The `capacity` block is **always present** and carries the host's aggregate capacity posture:
 `{ max_contracts, active_contracts, total_cpus, used_cpus, total_memory_mb, used_memory_mb }` — the
 operator budgets (`max_contracts` / `total_cpus` / `total_memory_mb`, `0` ⇒ unlimited) alongside current
-usage (`active_contracts` is the live non-terminal contract count; `used_cpus` / `used_memory_mb` are
-`0` until the aggregate capacity allocator lands in a follow-up task). Like the `gpu` block its
+usage (`active_contracts` is the live non-terminal contract count; `used_cpus` / `used_memory_mb` are the
+aggregate capacity allocator's live reserved totals across those leases). Like the `gpu` block its
 snake_case field names are an **authoritative cross-repo wire contract** — wisp-agent forwards it
 verbatim and wisper-api consumes it — so they are kept in lockstep across repos.
 

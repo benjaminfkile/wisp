@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/benjaminfkile/wisp/internal/bus"
+	"github.com/benjaminfkile/wisp/internal/capacity"
 	"github.com/benjaminfkile/wisp/internal/contract"
 	"github.com/benjaminfkile/wisp/internal/gpu"
 	"github.com/benjaminfkile/wisp/internal/policy"
@@ -48,6 +49,15 @@ const noNewPrivilegesOpt = "no-new-privileges:true"
 // bytesPerMB converts a request's memory_mb (mebibytes) to the byte limit the
 // runtime expects.
 const bytesPerMB = 1024 * 1024
+
+// errAtCapacity is the stable 409 message returned when a create would exceed one
+// of the host's AGGREGATE capacity budgets (concurrent contracts, total CPU, or
+// total memory). It carries the stable "at capacity" token upstream matches on and
+// is deliberately DISTINCT from the GPU allocator's "no GPU devices currently
+// available" 409, so a caller can tell host-budget exhaustion from GPU exhaustion.
+// The ask itself was within the per-lease caps — the HOST is full — which is why
+// this is a 409 conflict, not a 400 rejection.
+const errAtCapacity = "host at capacity: contract, cpu, or memory budget exhausted"
 
 // broker wires the contract model to the Runtime over HTTP. It owns the
 // lifecycle of a contract: create + boot + run userdata on POST, report status
@@ -88,6 +98,14 @@ type broker struct {
 	// startup reconcile rebuilds its occupancy from surviving containers' labels.
 	alloc *gpu.Allocator
 
+	// cap enforces the host's AGGREGATE capacity budgets (max_contracts /
+	// total_cpus / total_memory_mb) across all live leases. Like alloc it is a
+	// single shared instance built once at construction and threaded through every
+	// path: the create path reserves against it (a 409 when a budget is exhausted),
+	// and release, provision failure, and the reaper's expiry free back to it. The
+	// read surface advertises its live usage (the /images "capacity" block).
+	cap *capacity.Allocator
+
 	// now is the clock used to compute time remaining; injectable for tests.
 	now func() time.Time
 }
@@ -104,6 +122,10 @@ func newBroker(store *contract.Store, rt runtime.Runtime, pol *policy.Config, b 
 	// A GPU-less host yields an empty allocator whose Free/Allocate are harmless
 	// no-ops.
 	br.alloc = gpu.NewAllocator(gpuDeviceIDs(br.gpu.Devices()))
+	// Build the aggregate capacity allocator over the operator's host budgets so the
+	// create path can admit leases only within them and every terminal path frees
+	// back. A zero budget on any dimension leaves it unbudgeted (never checked).
+	br.cap = capacity.NewAllocator(pol.Limits.MaxContracts, pol.Limits.TotalCPUs, pol.Limits.TotalMemoryMB)
 	return br
 }
 
@@ -404,25 +426,10 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve GPUs: resources.gpus is a count of whole, exclusively-assigned GPUs.
-	// Unlike cpus/memory/pids it is REJECTED, never clamped — gpus is
-	// billing-meaningful upstream, so silently reducing the count would misprice a
-	// lease. A positive count is rejected with a 400 when the host supports no GPUs,
-	// when it exceeds the effective per-lease cap, or when GPU attach is not
-	// available at the resolved isolation level (the task-1 attach map; v1: only
-	// shared). Only after those checks pass does it consume real capacity: the
-	// allocator hands out that many free device IDs, and an exhausted allocator (the
-	// host advertises GPUs but every device is held by another live lease) maps to a
-	// 409 capacity conflict, not a 400. Allocation happens last, immediately before
-	// the contract records the IDs, so a rejected create never reserves a device.
-	gpuDeviceIDs, code, msg := b.allocateGPUs(req.Resources.Gpus, isolation)
-	if code != 0 {
-		writeError(w, code, msg)
-		return
-	}
-
 	// The policy caps the contract: the requested TTL and resources are clamped
-	// down to any configured maximum (see docs/DESIGN.md §7).
+	// down to any configured maximum (see docs/DESIGN.md §7). Clamping happens
+	// BEFORE the capacity reservation so the reserved amounts are the POST-CLAMP
+	// cpus / memory actually applied to the container.
 	ttl := b.pol.ClampTTL(time.Duration(req.TTLSeconds) * time.Second)
 	spec := launchSpec{
 		image:     image,
@@ -434,19 +441,57 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		env:       env,
 	}
 
+	// Reserve host capacity against the aggregate budgets FIRST, then GPU devices.
+	// The reserved amounts are exactly spec.cpus / spec.memoryMB — the post-clamp
+	// values applied to the container: a request that omits a dimension has already
+	// inherited the per-lease max when one is configured (ClampCPUs / ClampMemoryMB),
+	// or reserves 0 when that dimension has no per-lease cap, so an unbounded
+	// container on an unbudgeted dimension stays uncounted (it still takes one
+	// contract slot). An exhausted budget is a 409 — the ask was within the per-lease
+	// caps, the HOST is full — distinct from the 400 over-asks above.
+	if !b.cap.TryReserve(spec.cpus, spec.memoryMB) {
+		writeError(w, http.StatusConflict, errAtCapacity)
+		return
+	}
+
+	// Resolve GPUs: resources.gpus is a count of whole, exclusively-assigned GPUs.
+	// Unlike cpus/memory/pids it is REJECTED, never clamped — gpus is
+	// billing-meaningful upstream, so silently reducing the count would misprice a
+	// lease. A positive count is rejected with a 400 when the host supports no GPUs,
+	// when it exceeds the effective per-lease cap, or when GPU attach is not
+	// available at the resolved isolation level (the task-1 attach map; v1: only
+	// shared). Only after those checks pass does it consume real capacity: the
+	// allocator hands out that many free device IDs, and an exhausted allocator (the
+	// host advertises GPUs but every device is held by another live lease) maps to a
+	// 409 capacity conflict, not a 400. Allocation happens after the capacity
+	// reservation and immediately before the contract records the IDs, so a rejected
+	// GPU request frees the capacity reservation and a rejected create never strands
+	// either resource ("allocation happens last" discipline).
+	gpuDeviceIDs, code, msg := b.allocateGPUs(req.Resources.Gpus, isolation)
+	if code != 0 {
+		// The capacity reserved just above would leak if we returned now; free it so
+		// a GPU rejection strands nothing.
+		b.cap.Free(spec.cpus, spec.memoryMB)
+		writeError(w, code, msg)
+		return
+	}
+
 	c, err := b.store.Create(contract.CreateParams{
-		TTL:          ttl,
-		Image:        image,
-		Isolation:    string(spec.isolation),
-		GPUDeviceIDs: gpuDeviceIDs,
-		Meta:         req.Meta,
+		TTL:              ttl,
+		Image:            image,
+		Isolation:        string(spec.isolation),
+		GPUDeviceIDs:     gpuDeviceIDs,
+		ReservedCPUs:     spec.cpus,
+		ReservedMemoryMB: spec.memoryMB,
+		Meta:             req.Meta,
 	})
 	if err != nil {
 		// The only error Create returns for a positive TTL is ErrInvalidTTL,
-		// already guarded above; treat anything here as a server fault. Return any
-		// devices already reserved above so a store failure never strands them: the
-		// contract that would own (and later free) them was never recorded.
+		// already guarded above; treat anything here as a server fault. Return the
+		// capacity and any devices reserved above so a store failure strands neither:
+		// the contract that would own (and later free) them was never recorded.
 		b.alloc.Free(gpuDeviceIDs)
+		b.cap.Free(spec.cpus, spec.memoryMB)
 		b.logger.Error("create contract", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not create contract")
 		return
@@ -546,10 +591,12 @@ func (b *broker) images(w http.ResponseWriter, r *http.Request) {
 // capacityBlock renders the host's capacity posture as the /images "capacity"
 // block, field-for-field per the wire contract (see docs/DESIGN.md §7). The
 // budgets (max_contracts / total_cpus / total_memory_mb) come from the operator
-// policy — 0 means unlimited — and active_contracts is the count of non-terminal
-// contracts currently in the store. used_cpus / used_memory_mb are emitted as 0
-// for now: the aggregate capacity allocator that tracks reserved CPU / memory
-// lands in the next task (sibling #566), which will source them here.
+// policy — 0 means unlimited. used_cpus / used_memory_mb are the LIVE aggregates
+// the capacity allocator reserves across active leases. active_contracts is the
+// count of non-terminal contracts in the store, the authoritative registry (it
+// also covers leases rediscovered by the startup reconcile, which the capacity
+// allocator does not re-count until the next task, #567); it equals the
+// allocator's reserved-contract count for every lease admitted through create.
 func (b *broker) capacityBlock() capacityResponse {
 	active := 0
 	for _, c := range b.store.List() {
@@ -561,11 +608,9 @@ func (b *broker) capacityBlock() capacityResponse {
 		MaxContracts:    b.pol.Limits.MaxContracts,
 		ActiveContracts: active,
 		TotalCPUs:       b.pol.Limits.TotalCPUs,
-		// TODO(#566): source used_cpus / used_memory_mb from the aggregate capacity
-		// allocator once it tracks reserved CPU / memory across live contracts.
-		UsedCPUs:      0,
-		TotalMemoryMB: b.pol.Limits.TotalMemoryMB,
-		UsedMemoryMB:  0,
+		UsedCPUs:        b.cap.UsedCPUs(),
+		TotalMemoryMB:   b.pol.Limits.TotalMemoryMB,
+		UsedMemoryMB:    b.cap.UsedMemoryMB(),
 	}
 }
 
@@ -681,8 +726,8 @@ type gpuResponse struct {
 // are snake_case and exact; keep them in lockstep with the other repos, exactly
 // as the "gpu" block's field names are a cross-repo wire contract. The budgets
 // come from operator policy (0 = unlimited); active_contracts is the live
-// non-terminal contract count. used_cpus / used_memory_mb are 0 until the
-// aggregate capacity allocator lands (sibling #566).
+// non-terminal contract count. used_cpus / used_memory_mb are the live aggregates
+// the capacity allocator reserves across active leases.
 type capacityResponse struct {
 	// MaxContracts is the operator's cap on concurrent contracts (0 = unlimited).
 	MaxContracts int `json:"max_contracts"`
@@ -695,8 +740,8 @@ type capacityResponse struct {
 	// unlimited).
 	TotalCPUs float64 `json:"total_cpus"`
 
-	// UsedCPUs is the aggregate CPU currently reserved across live contracts. Always
-	// 0 until the capacity allocator tracks it (sibling #566).
+	// UsedCPUs is the aggregate CPU currently reserved across live contracts (the
+	// capacity allocator's running total).
 	UsedCPUs float64 `json:"used_cpus"`
 
 	// TotalMemoryMB is the operator's aggregate memory budget in mebibytes across
@@ -704,8 +749,7 @@ type capacityResponse struct {
 	TotalMemoryMB int `json:"total_memory_mb"`
 
 	// UsedMemoryMB is the aggregate memory (mebibytes) currently reserved across
-	// live contracts. Always 0 until the capacity allocator tracks it (sibling
-	// #566).
+	// live contracts (the capacity allocator's running total).
 	UsedMemoryMB int `json:"used_memory_mb"`
 }
 
@@ -788,12 +832,21 @@ func (b *broker) fail(ctx context.Context, id, containerID string) {
 	}
 	// Free any GPU devices the failed lease was assigned so a provisioning failure
 	// never strands a device as permanently occupied. Read the contract for its
-	// authoritative device set; Free is idempotent and a no-op for a GPU-less lease.
-	if c, err := b.store.Get(id); err == nil {
+	// authoritative device set (and its reserved capacity); Free is idempotent and a
+	// no-op for a GPU-less lease.
+	c, cerr := b.store.Get(id)
+	if cerr == nil {
 		b.alloc.Free(c.GPUDeviceIDs)
 	}
 	if _, err := b.store.UpdateState(id, contract.StateExpired); err != nil {
 		b.logger.Error("mark contract expired", "contract_id", id, "error", err)
+		return
+	}
+	// Return the lease's reserved host capacity now that the contract is
+	// authoritatively expired. Gated on the successful transition above so it frees
+	// exactly once even if a concurrent reaper expiry races this failure path.
+	if cerr == nil {
+		b.cap.Free(c.ReservedCPUs, c.ReservedMemoryMB)
 	}
 }
 
@@ -888,6 +941,11 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not release contract")
 		return
 	}
+	// Return the lease's reserved host capacity now that the release is
+	// authoritative. The state-machine transition above serializes against a
+	// concurrent reaper expiry — only one side wins — so capacity frees exactly once
+	// per contract (see internal/capacity.Allocator.Free).
+	b.cap.Free(c.ReservedCPUs, c.ReservedMemoryMB)
 	// contract.released announces the client-initiated teardown (see
 	// docs/DESIGN.md §6). The reaper announces contract.expiring / contract.expired.
 	b.publishLifecycle(eventContractReleased, c)

@@ -88,13 +88,16 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, pol *policy
 	// The TTL reaper reconciles tracked contracts on boot and then drives
 	// expiring/expired transitions on a ticker until shutdown. Its lifecycle
 	// hook republishes those transitions onto the event bus; its ReleaseGPUs hook
-	// returns an expired lease's devices to the allocator.
+	// returns an expired lease's devices to the GPU allocator, and its
+	// ReleaseCapacity hook returns its reserved cpus / memory to the aggregate
+	// capacity allocator.
 	rp := reaper.New(store, rt, reaper.Options{
-		Lead:        cfg.ExpiringLead,
-		Interval:    cfg.ReapInterval,
-		Logger:      logger,
-		Notify:      server.LifecycleNotify(eventBus, logger),
-		ReleaseGPUs: daemon.ReleaseGPUs,
+		Lead:            cfg.ExpiringLead,
+		Interval:        cfg.ReapInterval,
+		Logger:          logger,
+		Notify:          server.LifecycleNotify(eventBus, logger),
+		ReleaseGPUs:     daemon.ReleaseGPUs,
+		ReleaseCapacity: daemon.ReleaseCapacity,
 	})
 	go rp.Run(ctx)
 

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/benjaminfkile/wisp/internal/bus"
+	"github.com/benjaminfkile/wisp/internal/capacity"
 	"github.com/benjaminfkile/wisp/internal/contract"
 	"github.com/benjaminfkile/wisp/internal/gpu"
 	"github.com/benjaminfkile/wisp/internal/policy"
@@ -55,6 +56,7 @@ type Daemon struct {
 	store  *contract.Store
 	rt     runtime.Runtime
 	alloc  *gpu.Allocator
+	cap    *capacity.Allocator
 	logger *slog.Logger
 }
 
@@ -72,6 +74,7 @@ func NewDaemon(logger *slog.Logger, store *contract.Store, rt runtime.Runtime, p
 		store:   store,
 		rt:      rt,
 		alloc:   br.alloc,
+		cap:     br.cap,
 		logger:  logger,
 	}
 }
@@ -90,6 +93,15 @@ func (d *Daemon) Reconcile(ctx context.Context) {
 // ReleaseGPUs hook so an expired lease's devices return to the pool.
 func (d *Daemon) ReleaseGPUs(ids []string) {
 	d.alloc.Free(ids)
+}
+
+// ReleaseCapacity returns a contract's reserved host capacity (its post-clamp
+// cpus / memory and its contract slot) to the shared capacity allocator. It is
+// wired into the reaper as its ReleaseCapacity hook so an expired lease's budget
+// is reclaimed. The reaper calls it only after the winning expired transition, so
+// a lease released and reaped in a race frees its capacity exactly once.
+func (d *Daemon) ReleaseCapacity(c contract.Contract) {
+	d.cap.Free(c.ReservedCPUs, c.ReservedMemoryMB)
 }
 
 // healthz is a liveness probe returning {"status":"ok"}.

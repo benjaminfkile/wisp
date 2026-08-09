@@ -33,6 +33,14 @@ type CreateParams struct {
 	// path can free them back to the allocator. Opaque to the store.
 	GPUDeviceIDs []string
 
+	// ReservedCPUs and ReservedMemoryMB are the POST-CLAMP host capacity the
+	// aggregate allocator reserved for this lease (see internal/capacity). The store
+	// records them so every terminal-state path can return the same amount to the
+	// capacity allocator. Opaque to the store; zero when nothing was reserved on
+	// that dimension.
+	ReservedCPUs     float64
+	ReservedMemoryMB int
+
 	// Meta is arbitrary client-supplied metadata echoed back on status reads.
 	// Opaque to the store.
 	Meta map[string]any
@@ -89,16 +97,18 @@ func (s *Store) Create(p CreateParams) (Contract, error) {
 
 	created := s.now()
 	c := &Contract{
-		ID:           s.newID(),
-		TTL:          p.TTL,
-		Image:        p.Image,
-		Isolation:    p.Isolation,
-		GPUDeviceIDs: cloneIDs(p.GPUDeviceIDs),
-		Meta:         p.Meta,
-		State:        StateRequested,
-		CreatedAt:    created,
-		ExpiresAt:    created.Add(p.TTL),
-		Token:        s.newToken(),
+		ID:               s.newID(),
+		TTL:              p.TTL,
+		Image:            p.Image,
+		Isolation:        p.Isolation,
+		GPUDeviceIDs:     cloneIDs(p.GPUDeviceIDs),
+		ReservedCPUs:     p.ReservedCPUs,
+		ReservedMemoryMB: p.ReservedMemoryMB,
+		Meta:             p.Meta,
+		State:            StateRequested,
+		CreatedAt:        created,
+		ExpiresAt:        created.Add(p.TTL),
+		Token:            s.newToken(),
 	}
 	s.contracts[c.ID] = c
 	return *c, nil

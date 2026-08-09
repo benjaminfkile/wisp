@@ -56,6 +56,19 @@ const ExpiresAtLabel = "wisp.expires_at"
 // reconcile). It is omitted when a lease holds no GPUs.
 const GPUsLabel = "wisp.gpus"
 
+// CPUsLabel and MemoryMBLabel are the Docker labels carrying a lease's POST-CLAMP
+// reserved CPU (as a fraction of host cores) and reserved memory (mebibytes) —
+// exactly the amounts the aggregate capacity allocator reserved for it (see
+// internal/capacity). They are written at create time alongside ContractLabel so a
+// wispd restart can rebuild aggregate capacity usage from surviving containers'
+// labels alone and never oversubscribe the host by under-counting a live lease
+// (see ListLeased and the startup reconcile). CPUsLabel is a decimal fraction;
+// MemoryMBLabel is a whole mebibyte count.
+const (
+	CPUsLabel     = "wisp.cpus"
+	MemoryMBLabel = "wisp.memory_mb"
+)
+
 // ErrNotFound is returned when an operation references a container id that the
 // runtime does not know about (never created, or already destroyed).
 var ErrNotFound = errors.New("runtime: container not found")

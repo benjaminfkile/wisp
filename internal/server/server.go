@@ -79,13 +79,13 @@ func NewDaemon(logger *slog.Logger, store *contract.Store, rt runtime.Runtime, p
 	}
 }
 
-// Reconcile rebuilds in-memory contract tracking AND GPU allocator occupancy
-// from the labels of containers a previous wispd left behind. It binds the
-// daemon's shared allocator so a rediscovered lease's devices are reserved before
-// any new create can allocate. Callers MUST run it before the reaper starts (see
-// the package Reconcile).
+// Reconcile rebuilds in-memory contract tracking, GPU allocator occupancy, AND
+// aggregate capacity usage from the labels of containers a previous wispd left
+// behind. It binds the daemon's shared allocators so a rediscovered lease's devices
+// and its cpus/memory budget are reserved before any new create can allocate.
+// Callers MUST run it before the reaper starts (see the package Reconcile).
 func (d *Daemon) Reconcile(ctx context.Context) {
-	Reconcile(ctx, d.store, d.rt, d.alloc, d.logger)
+	Reconcile(ctx, d.store, d.rt, d.alloc, d.cap, d.logger)
 }
 
 // ReleaseGPUs frees the GPU devices a contract held back to the shared allocator.

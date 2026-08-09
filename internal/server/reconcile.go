@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/benjaminfkile/wisp/internal/capacity"
 	"github.com/benjaminfkile/wisp/internal/contract"
 	"github.com/benjaminfkile/wisp/internal/gpu"
 	"github.com/benjaminfkile/wisp/internal/runtime"
@@ -37,7 +38,17 @@ import (
 // surviving lease still holds. A reserved device id the host no longer detects
 // (e.g. a GPU removed since the container launched) is logged and skipped rather
 // than crashing the reconcile. Pass nil on a host with no GPU allocator wired.
-func Reconcile(ctx context.Context, store *contract.Store, rt runtime.Runtime, alloc *gpu.Allocator, logger *slog.Logger) {
+//
+// cap, when non-nil, is the aggregate capacity allocator: for each adopted lease
+// Reconcile re-Reserves its POST-CLAMP cpus and memory (the wisp.cpus and
+// wisp.memory_mb labels) plus its one contract slot, exactly parallel to the GPU
+// Reserve, so a restarted wispd rebuilds aggregate usage from surviving containers
+// and never oversubscribes the host by under-counting a live lease. A missing or
+// malformed capacity label is logged and treated as 0 for that dimension; the
+// contract is still adopted and still counts toward max_contracts, so one bad
+// label never drops a lease from the budget. Pass nil when no capacity allocator
+// is wired.
+func Reconcile(ctx context.Context, store *contract.Store, rt runtime.Runtime, alloc *gpu.Allocator, cap *capacity.Allocator, logger *slog.Logger) {
 	containers, err := rt.ListLeased(ctx)
 	if err != nil {
 		logger.Error("reconcile: list leased containers", "error", err)
@@ -63,7 +74,18 @@ func Reconcile(ctx context.Context, store *contract.Store, rt runtime.Runtime, a
 			continue
 		}
 		gpuIDs := parseGPUsLabel(lc.Labels[gpusLabel])
-		if _, err := store.Adopt(contract.AdoptParams{ID: id, ContainerID: lc.ID, ExpiresAt: expiresAt, GPUDeviceIDs: gpuIDs}); err != nil {
+		// Recover the POST-CLAMP reserved capacity so the re-Reserve below restores
+		// exactly what create took. A missing or malformed label yields 0 for that
+		// dimension (the contract still counts one slot) and a single warning, so one
+		// bad label never drops the lease from the aggregate budget.
+		cpus, cpusOK := parseReservedCPUs(lc.Labels[cpusLabel])
+		memoryMB, memOK := parseReservedMemoryMB(lc.Labels[memoryMBLabel])
+		if !cpusOK || !memOK {
+			logger.Warn("reconcile: contract has missing or malformed capacity label(s); reserving what parsed",
+				"contract_id", id, "container_id", lc.ID,
+				"cpus", lc.Labels[cpusLabel], "memory_mb", lc.Labels[memoryMBLabel])
+		}
+		if _, err := store.Adopt(contract.AdoptParams{ID: id, ContainerID: lc.ID, ExpiresAt: expiresAt, GPUDeviceIDs: gpuIDs, ReservedCPUs: cpus, ReservedMemoryMB: memoryMB}); err != nil {
 			logger.Error("reconcile: adopt contract", "contract_id", id, "container_id", lc.ID, "error", err)
 			continue
 		}
@@ -76,9 +98,17 @@ func Reconcile(ctx context.Context, store *contract.Store, rt runtime.Runtime, a
 					"contract_id", id, "container_id", lc.ID, "devices", strings.Join(unknown, ","))
 			}
 		}
+		// Rebuild aggregate capacity usage so a restarted wispd never oversubscribes
+		// the host: re-Reserve this lease's contract slot plus its post-clamp cpus and
+		// memory, unconditionally (a reconciled lease already holds its capacity, even
+		// if a since-lowered budget would now reject it — see capacity.Allocator.Reserve).
+		if cap != nil {
+			cap.Reserve(cpus, memoryMB)
+		}
 		adopted++
 		logger.Info("reconcile: adopted pre-existing leased container",
-			"contract_id", id, "container_id", lc.ID, "expires_at", expiresAt, "gpus", strings.Join(gpuIDs, ","))
+			"contract_id", id, "container_id", lc.ID, "expires_at", expiresAt, "gpus", strings.Join(gpuIDs, ","),
+			"cpus", cpus, "memory_mb", memoryMB)
 	}
 	if adopted > 0 {
 		logger.Info("reconcile: rebuilt tracking for pre-existing leases", "count", adopted)
@@ -127,4 +157,36 @@ func parseExpiresAt(v string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return time.Unix(secs, 0), true
+}
+
+// parseReservedCPUs parses a wisp.cpus label value (a lease's post-clamp reserved
+// CPU as a decimal fraction of host cores) into a float. It reports ok=false for an
+// empty, non-numeric, or negative value so the reconcile can warn and re-Reserve 0
+// on that dimension rather than corrupt aggregate usage with a bad figure — the
+// read half of the wisp.cpus round-trip create writes.
+func parseReservedCPUs(v string) (float64, bool) {
+	if v == "" {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 {
+		return 0, false
+	}
+	return f, true
+}
+
+// parseReservedMemoryMB parses a wisp.memory_mb label value (a lease's post-clamp
+// reserved memory in whole mebibytes) into an int, with the same tolerance as
+// parseReservedCPUs: an empty, non-numeric, or negative value reports ok=false so
+// the reconcile re-Reserves 0 on that dimension. It is the read half of the
+// wisp.memory_mb round-trip create writes.
+func parseReservedMemoryMB(v string) (int, bool) {
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }

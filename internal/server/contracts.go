@@ -40,6 +40,15 @@ const expiresAtLabel = runtime.ExpiresAtLabel
 // the same reason as contractLabel.
 const gpusLabel = runtime.GPUsLabel
 
+// cpusLabel and memoryMBLabel are the container labels carrying a lease's
+// POST-CLAMP reserved CPU and memory — exactly the amounts reserved in the
+// aggregate capacity allocator — written at create time next to contractLabel so
+// a wispd restart can rebuild aggregate capacity usage from the container's labels
+// alone and never oversubscribe the host by under-counting a live lease (see
+// reconcile). Defined in the runtime package for the same reason as contractLabel.
+const cpusLabel = runtime.CPUsLabel
+const memoryMBLabel = runtime.MemoryMBLabel
+
 // noNewPrivilegesOpt is the Docker security option applied to every leased
 // container so a process inside it cannot gain privileges via setuid binaries
 // (e.g. sudo/su). It is safe, workload-agnostic hardening: it neither drops
@@ -595,8 +604,8 @@ func (b *broker) images(w http.ResponseWriter, r *http.Request) {
 // the capacity allocator reserves across active leases. active_contracts is the
 // count of non-terminal contracts in the store, the authoritative registry (it
 // also covers leases rediscovered by the startup reconcile, which the capacity
-// allocator does not re-count until the next task, #567); it equals the
-// allocator's reserved-contract count for every lease admitted through create.
+// allocator now re-Reserves too); it equals the allocator's reserved-contract count
+// for every lease admitted through create or rebuilt by the reconcile.
 func (b *broker) capacityBlock() capacityResponse {
 	active := 0
 	for _, c := range b.store.List() {
@@ -1197,11 +1206,13 @@ func envList(m map[string]string) ([]string, error) {
 // createOptions translates a resolved launch spec into the runtime's
 // CreateOptions: the resource caps, network policy, and security options
 // applied to the container, plus the labels correlating it back to its
-// contract. Two labels are written: wisp.contract carries the contract id, and
-// wisp.expires_at carries the contract's absolute expiry as Unix seconds so a
-// wispd restart can rebuild the TTL tracking for this container from its labels
-// alone (see reconcile); the expiry label is omitted when the contract has no
-// TTL, since there is nothing to reap against. Every leased container is hardened
+// contract. Labels written: wisp.contract carries the contract id; wisp.expires_at
+// carries the contract's absolute expiry as Unix seconds so a wispd restart can
+// rebuild the TTL tracking from its labels alone (omitted when the contract has no
+// TTL, since there is nothing to reap against); wisp.gpus carries the exclusively
+// assigned device IDs (omitted for a GPU-less lease); and wisp.cpus / wisp.memory_mb
+// carry the POST-CLAMP reserved capacity so the restart's reconcile re-Reserves the
+// same aggregate usage (see reconcile). Every leased container is hardened
 // with no-new-privileges so a process inside it cannot escalate via setuid
 // binaries. It always sets the keep-alive command — chosen for the daemon's
 // container OS — so the container outlives its provisioning step. WorkingDir,
@@ -1224,6 +1235,14 @@ func createOptions(spec launchSpec, c contract.Contract, os runtime.ContainerOS)
 	if v := gpusLabelValue(c.GPUDeviceIDs); v != "" {
 		labels[gpusLabel] = v
 	}
+	// Record the POST-CLAMP reserved cpus / memory — exactly what was reserved in
+	// the capacity allocator — so the startup reconcile can re-Reserve the same
+	// aggregate usage from this container's labels alone and never oversubscribe the
+	// host by under-counting this live lease (see reconcile). Always written (even a
+	// "0" reservation on an unbudgeted dimension) so the round-trip restores exactly
+	// what create took.
+	labels[cpusLabel] = strconv.FormatFloat(c.ReservedCPUs, 'f', -1, 64)
+	labels[memoryMBLabel] = strconv.Itoa(c.ReservedMemoryMB)
 	opts := runtime.CreateOptions{
 		Labels: labels,
 		// Run the keep-alive as the container's main process so it stays up for

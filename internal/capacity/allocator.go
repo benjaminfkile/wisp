@@ -113,9 +113,9 @@ func (a *Allocator) Free(cpus float64, memoryMB int) {
 // create is admitted — the aggregate mirror of gpu.Allocator.Reserve. Unlike
 // TryReserve it does not check the budgets: a reconciled lease already holds its
 // capacity, so it is counted unconditionally (usage may legitimately sit at or
-// above a since-lowered budget until those leases drain). It is wired fully in the
-// next task (#567), which persists a lease's reserved cpus/memory on its container
-// labels so the reconcile can re-Reserve them here.
+// above a since-lowered budget until those leases drain). The startup reconcile
+// calls it once per adopted lease, re-Reserving the post-clamp cpus/memory it
+// recovers from the container's wisp.cpus and wisp.memory_mb labels.
 func (a *Allocator) Reserve(cpus float64, memoryMB int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

@@ -300,9 +300,9 @@ type createResponse struct {
 
 // statusResponse is returned by GET /contracts/:id and DELETE /contracts/:id.
 type statusResponse struct {
-	ContractID          string         `json:"contract_id"`
-	Status              string         `json:"status"`
-	TTLSecondsRemaining int            `json:"ttl_seconds_remaining"`
+	ContractID          string `json:"contract_id"`
+	Status              string `json:"status"`
+	TTLSecondsRemaining int    `json:"ttl_seconds_remaining"`
 
 	// Gpus is the whole GPU devices this contract was exclusively assigned, by
 	// their stable device IDs — the wire field name the dashboard reads. Omitted
@@ -538,8 +538,35 @@ func (b *broker) images(w http.ResponseWriter, r *http.Request) {
 			Supported: isolationStrings(b.iso.Levels()),
 			Default:   b.iso.Default().String(),
 		},
-		GPU: gpuBlock(b.gpu),
+		GPU:      gpuBlock(b.gpu),
+		Capacity: b.capacityBlock(),
 	})
+}
+
+// capacityBlock renders the host's capacity posture as the /images "capacity"
+// block, field-for-field per the wire contract (see docs/DESIGN.md §7). The
+// budgets (max_contracts / total_cpus / total_memory_mb) come from the operator
+// policy — 0 means unlimited — and active_contracts is the count of non-terminal
+// contracts currently in the store. used_cpus / used_memory_mb are emitted as 0
+// for now: the aggregate capacity allocator that tracks reserved CPU / memory
+// lands in the next task (sibling #566), which will source them here.
+func (b *broker) capacityBlock() capacityResponse {
+	active := 0
+	for _, c := range b.store.List() {
+		if !c.State.Terminal() {
+			active++
+		}
+	}
+	return capacityResponse{
+		MaxContracts:    b.pol.Limits.MaxContracts,
+		ActiveContracts: active,
+		TotalCPUs:       b.pol.Limits.TotalCPUs,
+		// TODO(#566): source used_cpus / used_memory_mb from the aggregate capacity
+		// allocator once it tracks reserved CPU / memory across live contracts.
+		UsedCPUs:      0,
+		TotalMemoryMB: b.pol.Limits.TotalMemoryMB,
+		UsedMemoryMB:  0,
+	}
 }
 
 // gpuBlock renders the host's effective GPU posture as the /images "gpu" block,
@@ -598,6 +625,12 @@ type imagesResponse struct {
 	// match the wire contract exactly. The block is always present, even on a
 	// GPU-less host (supported=false, devices=[], max_gpus=0).
 	GPU gpuResponse `json:"gpu"`
+
+	// Capacity advertises the host's aggregate capacity posture — the operator's
+	// host budgets (max_contracts / total_cpus / total_memory_mb) and current usage
+	// — so an agent can report and schedule against real host headroom rather than
+	// per-lease caps alone. The block is always present (see capacityResponse).
+	Capacity capacityResponse `json:"capacity"`
 }
 
 // limitsResponse mirrors policy.Limits in the discovery document's JSON shape.
@@ -640,6 +673,40 @@ type gpuResponse struct {
 	// Isolations lists the isolation levels at which GPU attach is available on
 	// this host (a non-null array; at most ["shared"] in v1).
 	Isolations []string `json:"isolations"`
+}
+
+// capacityResponse is the "capacity" section of the discovery document — the
+// host's aggregate capacity posture, per the wire contract (authoritative across
+// repos: wisp-agent forwards it verbatim, wisper-api consumes it). Field names
+// are snake_case and exact; keep them in lockstep with the other repos, exactly
+// as the "gpu" block's field names are a cross-repo wire contract. The budgets
+// come from operator policy (0 = unlimited); active_contracts is the live
+// non-terminal contract count. used_cpus / used_memory_mb are 0 until the
+// aggregate capacity allocator lands (sibling #566).
+type capacityResponse struct {
+	// MaxContracts is the operator's cap on concurrent contracts (0 = unlimited).
+	MaxContracts int `json:"max_contracts"`
+
+	// ActiveContracts is the count of non-terminal contracts currently in the
+	// store.
+	ActiveContracts int `json:"active_contracts"`
+
+	// TotalCPUs is the operator's aggregate CPU budget across all contracts (0 =
+	// unlimited).
+	TotalCPUs float64 `json:"total_cpus"`
+
+	// UsedCPUs is the aggregate CPU currently reserved across live contracts. Always
+	// 0 until the capacity allocator tracks it (sibling #566).
+	UsedCPUs float64 `json:"used_cpus"`
+
+	// TotalMemoryMB is the operator's aggregate memory budget in mebibytes across
+	// all contracts (0 = unlimited).
+	TotalMemoryMB int `json:"total_memory_mb"`
+
+	// UsedMemoryMB is the aggregate memory (mebibytes) currently reserved across
+	// live contracts. Always 0 until the capacity allocator tracks it (sibling
+	// #566).
+	UsedMemoryMB int `json:"used_memory_mb"`
 }
 
 // gpuDeviceResponse is one enumerated GPU in the discovery document, matching the

@@ -41,6 +41,12 @@ func TestDefaultConfig(t *testing.T) {
 	if c.Limits.PidsLimit != 512 {
 		t.Errorf("PidsLimit = %d, want 512", c.Limits.PidsLimit)
 	}
+	// The host capacity budgets default to 0/unlimited so existing operator configs
+	// keep their current behavior (enforcement lands in a later task).
+	if c.Limits.MaxContracts != 0 || c.Limits.TotalCPUs != 0 || c.Limits.TotalMemoryMB != 0 {
+		t.Errorf("capacity budgets = {%d, %v, %d}, want all 0/unlimited",
+			c.Limits.MaxContracts, c.Limits.TotalCPUs, c.Limits.TotalMemoryMB)
+	}
 	// A request over a ceiling is clamped down to it.
 	if got := c.ClampTTL(100 * time.Hour); got != time.Hour {
 		t.Errorf("ClampTTL = %v, want 1h", got)
@@ -331,6 +337,79 @@ func TestLoadRejectsUnknownField(t *testing.T) {
 	path := writeConfig(t, `{"images": {"allow": ["a"]}, "presets": {}}`)
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load with unknown field = nil, want error")
+	}
+}
+
+func TestLoadCapacityBudgets(t *testing.T) {
+	// The host capacity budgets parse from the limits block.
+	path := writeConfig(t, `{
+	  "images": { "allow": ["wisp-base"] },
+	  "limits": { "max_contracts": 10, "total_cpus": 32, "total_memory_mb": 65536, "max_cpus": 4, "max_memory_mb": 4096 }
+	}`)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Limits.MaxContracts != 10 || c.Limits.TotalCPUs != 32 || c.Limits.TotalMemoryMB != 65536 {
+		t.Errorf("capacity budgets = {%d, %v, %d}, want {10, 32, 65536}",
+			c.Limits.MaxContracts, c.Limits.TotalCPUs, c.Limits.TotalMemoryMB)
+	}
+}
+
+func TestLoadCapacityDefaultsUnlimited(t *testing.T) {
+	// Omitted budgets are 0/unlimited, matching the zero-means-uncapped convention.
+	path := writeConfig(t, `{"images": {"allow": ["wisp-base"]}}`)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Limits.MaxContracts != 0 || c.Limits.TotalCPUs != 0 || c.Limits.TotalMemoryMB != 0 {
+		t.Errorf("capacity budgets = {%d, %v, %d}, want all 0/unlimited",
+			c.Limits.MaxContracts, c.Limits.TotalCPUs, c.Limits.TotalMemoryMB)
+	}
+}
+
+func TestLoadRejectsNegativeCapacityBudgets(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"max_contracts", `{"images": {"allow": ["a"]}, "limits": {"max_contracts": -1}}`},
+		{"total_cpus", `{"images": {"allow": ["a"]}, "limits": {"total_cpus": -0.5}}`},
+		{"total_memory_mb", `{"images": {"allow": ["a"]}, "limits": {"total_memory_mb": -1}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, tc.body)
+			if _, err := Load(path); err == nil {
+				t.Fatalf("Load with negative %s = nil, want error", tc.name)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsTotalBelowPerLease(t *testing.T) {
+	// A total budget below its matching per-lease max could never admit one lease.
+	cpuPath := writeConfig(t, `{"images": {"allow": ["a"]}, "limits": {"max_cpus": 4, "total_cpus": 2}}`)
+	if _, err := Load(cpuPath); err == nil {
+		t.Fatal("Load with total_cpus < max_cpus = nil, want error")
+	}
+	memPath := writeConfig(t, `{"images": {"allow": ["a"]}, "limits": {"max_memory_mb": 4096, "total_memory_mb": 2048}}`)
+	if _, err := Load(memPath); err == nil {
+		t.Fatal("Load with total_memory_mb < max_memory_mb = nil, want error")
+	}
+}
+
+func TestLoadAllowsTotalEqualOrAbovePerLease(t *testing.T) {
+	// total == per-lease admits exactly one lease; total > per-lease admits more.
+	// Both are valid. A total set with no matching per-lease max is also fine.
+	for _, body := range []string{
+		`{"images": {"allow": ["a"]}, "limits": {"max_cpus": 4, "total_cpus": 4, "max_memory_mb": 4096, "total_memory_mb": 4096}}`,
+		`{"images": {"allow": ["a"]}, "limits": {"max_cpus": 4, "total_cpus": 8}}`,
+		`{"images": {"allow": ["a"]}, "limits": {"total_cpus": 2, "total_memory_mb": 1024}}`,
+	} {
+		if _, err := Load(writeConfig(t, body)); err != nil {
+			t.Errorf("Load(%s) = %v, want nil", body, err)
+		}
 	}
 }
 

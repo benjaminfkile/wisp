@@ -50,7 +50,7 @@ uses safe built-in defaults (allow-list of just `wisp-base`, networks `none` +
 ```json
 {
   "images": { "allow": ["wisp-base"], "default": "wisp-base" },
-  "limits": { "max_ttl_seconds": 3600, "max_cpus": 4, "max_memory_mb": 4096, "pids_limit": 512, "networks": ["none", "open"], "isolations": ["shared"], "default_isolation": "shared" }
+  "limits": { "max_ttl_seconds": 3600, "max_cpus": 4, "max_memory_mb": 4096, "pids_limit": 512, "max_contracts": 0, "total_cpus": 0, "total_memory_mb": 0, "networks": ["none", "open"], "isolations": ["shared"], "default_isolation": "shared" }
 }
 ```
 
@@ -58,6 +58,22 @@ A zero/empty numeric limit means **no cap** (the built-in defaults above are
 non-zero ceilings). On load Wisp validates that the allow-list is non-empty, the
 default image is in it, every network is one of `none` / `open` / `egress`, and
 every isolation level and the default are valid (`shared` / `sandboxed` / `vm`).
+
+`max_cpus` / `max_memory_mb` / `pids_limit` are **per-lease** caps. Alongside
+them the operator can declare **host capacity budgets** — caps on aggregate load
+across *all* concurrent contracts:
+
+| Budget            | Bounds                                                | `0`/omitted |
+| ----------------- | ----------------------------------------------------- | ----------- |
+| `max_contracts`   | number of concurrent (non-terminal) contracts         | unlimited   |
+| `total_cpus`      | aggregate CPU (fraction of host cores) across leases   | unlimited   |
+| `total_memory_mb` | aggregate memory (MB) across leases                    | unlimited   |
+
+Budgets must not be negative, and when both a total and its matching per-lease
+max are set the total must be `>=` the per-lease max (a budget smaller than one
+lease could never admit anything). These budgets are **advertised** today (the
+`GET /images` `capacity` block below); create-time enforcement lands in a
+follow-up task.
 
 `POST /contracts` accepts:
 
@@ -87,7 +103,7 @@ Any consumer can discover what it may request via the **unauthenticated**
 
 ```sh
 curl -s localhost:8080/images
-# {"images":["wisp-base"],"default":"wisp-base","os":"linux","limits":{"max_ttl_seconds":3600,...,"networks":["none","open"]},"isolation":{"supported":["shared"],"default":"shared"},"gpu":{"supported":false,"devices":[],"max_gpus":0,"isolations":[]}}
+# {"images":["wisp-base"],"default":"wisp-base","os":"linux","limits":{"max_ttl_seconds":3600,...,"networks":["none","open"]},"isolation":{"supported":["shared"],"default":"shared"},"gpu":{"supported":false,"devices":[],"max_gpus":0,"isolations":[]},"capacity":{"max_contracts":0,"active_contracts":0,"total_cpus":0,"used_cpus":0,"total_memory_mb":0,"used_memory_mb":0}}
 ```
 
 The `os` field reports the Docker daemon's current container mode (`linux` or
@@ -107,6 +123,14 @@ actually run (`shared` always; `sandboxed` when the gVisor runtime `runsc` is
 registered; `vm` on a Kata-enabled Linux daemon or a Windows daemon via Hyper-V),
 and `default` is the level applied when a create omits `isolation`. A consumer
 only ever sees, and can only request, levels this host can launch.
+
+The `capacity` block advertises the host's aggregate capacity posture — the
+operator budgets (`max_contracts`, `total_cpus`, `total_memory_mb`; `0` means
+unlimited) alongside current usage (`active_contracts` is the live non-terminal
+contract count; `used_cpus` / `used_memory_mb` are `0` until the aggregate
+capacity allocator lands in a follow-up task). The block is authoritative across
+repos (an agent forwards it verbatim), so its snake_case field names are a wire
+contract.
 
 ## GPU leasing
 

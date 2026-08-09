@@ -78,6 +78,29 @@ type Limits struct {
 	// PidsLimit caps the number of processes. Zero means no cap.
 	PidsLimit int
 
+	// MaxContracts caps the number of concurrent (non-terminal) contracts the host
+	// admits, bounding contract count across the whole host rather than per lease.
+	// Zero means no cap — the default when unconfigured — mirroring how the other
+	// numeric limits treat zero as "no cap". Enforcement lands in a later task
+	// (siblings #566/#567); this field only declares the budget.
+	MaxContracts int
+
+	// TotalCPUs caps the aggregate CPU (as a fraction of host cores) reserved
+	// across all concurrent contracts, bounding total CPU load rather than per
+	// lease (which MaxCPUs already caps). Zero means no cap — the default when
+	// unconfigured. When both TotalCPUs and MaxCPUs are set, TotalCPUs must be >=
+	// MaxCPUs (a budget below one lease could never admit anything; see validate).
+	// Enforcement lands in a later task (siblings #566/#567).
+	TotalCPUs float64
+
+	// TotalMemoryMB caps the aggregate memory (mebibytes) reserved across all
+	// concurrent contracts, bounding total memory rather than per lease (which
+	// MaxMemoryMB already caps). Zero means no cap — the default when unconfigured.
+	// When both TotalMemoryMB and MaxMemoryMB are set, TotalMemoryMB must be >=
+	// MaxMemoryMB (see validate). Enforcement lands in a later task (siblings
+	// #566/#567).
+	TotalMemoryMB int
+
 	// MaxGPUs caps the number of GPUs a single lease may request. Zero means no
 	// operator cap — a lease may use up to all detected devices — which is also the
 	// default when unconfigured, mirroring how the other Max* limits treat zero as
@@ -292,6 +315,15 @@ type fileLimits struct {
 	MaxMemoryMB   int      `json:"max_memory_mb"`
 	PidsLimit     int      `json:"pids_limit"`
 	Networks      []string `json:"networks"`
+	// MaxContracts / TotalCPUs / TotalMemoryMB are the host capacity budgets: caps
+	// on aggregate load across ALL concurrent contracts (contract count, total
+	// CPUs, total memory), as opposed to the per-lease Max* caps above. All are
+	// optional: an omitted budget is 0 → unlimited, mirroring how a zero numeric
+	// limit means "no cap". They need no Load fallback because their zero values
+	// already are the defaults.
+	MaxContracts  int     `json:"max_contracts"`
+	TotalCPUs     float64 `json:"total_cpus"`
+	TotalMemoryMB int     `json:"total_memory_mb"`
 	// MaxGPUs caps per-lease GPU count (0 = no operator cap → all detected);
 	// GPUsDisabled turns GPU leasing off entirely. Both are optional: an omitted
 	// max_gpus is uncapped and an omitted gpus_disabled leaves GPU leasing enabled
@@ -338,6 +370,9 @@ func Load(path string) (*Config, error) {
 			MaxCPUs:          fc.Limits.MaxCPUs,
 			MaxMemoryMB:      fc.Limits.MaxMemoryMB,
 			PidsLimit:        fc.Limits.PidsLimit,
+			MaxContracts:     fc.Limits.MaxContracts,
+			TotalCPUs:        fc.Limits.TotalCPUs,
+			TotalMemoryMB:    fc.Limits.TotalMemoryMB,
 			MaxGPUs:          fc.Limits.MaxGPUs,
 			GPUsDisabled:     fc.Limits.GPUsDisabled,
 			Networks:         fc.Limits.Networks,
@@ -388,6 +423,25 @@ func (c *Config) validate() error {
 	// caps are both valid (see EffectiveGPU).
 	if c.Limits.MaxGPUs < 0 {
 		return fmt.Errorf("limits.max_gpus must not be negative, got %d", c.Limits.MaxGPUs)
+	}
+	// Host capacity budgets: a negative budget is a config error; zero means
+	// unlimited. When both a total budget and its matching per-lease max are set,
+	// the total must be >= the per-lease max — a budget smaller than a single lease
+	// could never admit anything.
+	if c.Limits.MaxContracts < 0 {
+		return fmt.Errorf("limits.max_contracts must not be negative, got %d", c.Limits.MaxContracts)
+	}
+	if c.Limits.TotalCPUs < 0 {
+		return fmt.Errorf("limits.total_cpus must not be negative, got %g", c.Limits.TotalCPUs)
+	}
+	if c.Limits.TotalMemoryMB < 0 {
+		return fmt.Errorf("limits.total_memory_mb must not be negative, got %d", c.Limits.TotalMemoryMB)
+	}
+	if c.Limits.TotalCPUs > 0 && c.Limits.MaxCPUs > 0 && c.Limits.TotalCPUs < c.Limits.MaxCPUs {
+		return fmt.Errorf("limits.total_cpus (%g) must be >= limits.max_cpus (%g)", c.Limits.TotalCPUs, c.Limits.MaxCPUs)
+	}
+	if c.Limits.TotalMemoryMB > 0 && c.Limits.MaxMemoryMB > 0 && c.Limits.TotalMemoryMB < c.Limits.MaxMemoryMB {
+		return fmt.Errorf("limits.total_memory_mb (%d) must be >= limits.max_memory_mb (%d)", c.Limits.TotalMemoryMB, c.Limits.MaxMemoryMB)
 	}
 	// Every configured isolation level (and the default) must be a recognized
 	// level so a typo in the config is rejected at load, not at create time. A

@@ -156,6 +156,9 @@ and conservative resource/TTL ceilings: TTL 3600 s, 4 CPUs, 4096 MB, 512 pids).
     "max_cpus": 4,             // fraction of host cores; 0 ⇒ no cap; built-in default 4
     "max_memory_mb": 4096,     // 0 ⇒ no cap; built-in default 4096
     "pids_limit": 512,         // 0 ⇒ no cap; built-in default 512
+    "max_contracts": 0,        // host budget: concurrent contracts; 0 / omitted ⇒ unlimited
+    "total_cpus": 0,           // host budget: aggregate CPU across leases; 0 / omitted ⇒ unlimited
+    "total_memory_mb": 0,      // host budget: aggregate memory across leases; 0 / omitted ⇒ unlimited
     "max_gpus": 0,             // per-lease GPU cap; 0 / omitted ⇒ no cap (all detected)
     "gpus_disabled": false,    // true turns GPU leasing off entirely; omitted ⇒ enabled
     "networks": ["none", "open"],        // which of none/open/egress a client may request
@@ -167,8 +170,19 @@ and conservative resource/TTL ceilings: TTL 3600 s, 4 CPUs, 4096 MB, 512 pids).
 
 On load Wisp validates: the allow-list is non-empty, the default image is in it, every network is one
 of `none` / `open` / `egress`, every configured isolation level and the default are valid
-(`shared` / `sandboxed` / `vm`), and `max_gpus` is not negative. An example lives at
+(`shared` / `sandboxed` / `vm`), `max_gpus` is not negative, and the host capacity budgets are not
+negative with each total `>=` its matching per-lease max when both are set. An example lives at
 `examples/wisp.config.json`.
+
+**Host capacity budgets.** `max_cpus` / `max_memory_mb` / `pids_limit` cap a **single lease**; the GPU
+allocator enforces per-device exclusivity — but nothing bounds **aggregate** load across contracts (N
+leases × `max_memory_mb` each can exceed real RAM, and contract count is unbounded). `max_contracts`,
+`total_cpus`, and `total_memory_mb` are operator-declared **host budgets** on that aggregate: concurrent
+contract count, total reserved CPU, and total reserved memory across all live leases. Each follows the
+`0`/omitted ⇒ unlimited convention, and when a total and its matching per-lease max are both set the
+total must be `>=` the per-lease max (a budget below one lease could never admit anything). Today these
+budgets are **advertised** on `GET /images` (the `capacity` block below); the aggregate allocator that
+tracks usage and enforces them at create time (a `409 at_capacity`) lands in a follow-up task.
 
 **GPUs.** GPU leasing is an operator-gated, host-detected dimension, computed the same data-driven way
 as isolation. `max_gpus` caps the GPUs a single lease may request (`0`/omitted ⇒ no operator cap → all
@@ -197,7 +211,7 @@ At create time (§4) the client sends `image`, `network`, `isolation`, and `reso
 - **ttl_seconds** — required; clamped down to `limits.max_ttl_seconds` when set.
 
 Any consumer can discover what it may request via the unauthenticated `GET /images` (§10), which
-returns `{ os, images, default, limits, isolation, gpu }`. The `gpu` block is **always present** and
+returns `{ os, images, default, limits, isolation, gpu, capacity }`. The `gpu` block is **always present** and
 carries the host's effective GPU posture: `{ supported, devices, max_gpus, isolations }` — `supported`
 is whether GPUs may be leased at all; `devices` is the enumerated GPUs (`[{ id, class, vram_mb }]`,
 `class` a normalized product name like `nvidia-geforce-rtx-4090`); `max_gpus` is the effective per-lease
@@ -218,6 +232,14 @@ Docker daemon is fixed in one mode by the operator — Wisp only detects it and 
 so an image whose OS does not match is rejected. Wisp cannot know an arbitrary image's OS up front,
 so it attempts the create and maps the daemon's OS/platform rejection to a clear
 `this host is in <os> container mode; the requested image is not compatible` error (a `400`).
+
+The `capacity` block is **always present** and carries the host's aggregate capacity posture:
+`{ max_contracts, active_contracts, total_cpus, used_cpus, total_memory_mb, used_memory_mb }` — the
+operator budgets (`max_contracts` / `total_cpus` / `total_memory_mb`, `0` ⇒ unlimited) alongside current
+usage (`active_contracts` is the live non-terminal contract count; `used_cpus` / `used_memory_mb` are
+`0` until the aggregate capacity allocator lands in a follow-up task). Like the `gpu` block its
+snake_case field names are an **authoritative cross-repo wire contract** — wisp-agent forwards it
+verbatim and wisper-api consumes it — so they are kept in lockstep across repos.
 
 **Cold-start escape hatch.** Installing a toolchain on every contract costs provisioning time. To
 skip it, a client builds its own image `FROM wisp-base` with its tools baked in and the operator
@@ -411,7 +433,7 @@ WS     /contracts/:id/shell           interactive PTY console
 
 POST   /events                        publish an event to the bus
 WS     /events                        subscribe (with filter)
-GET    /images                        os + allow-list + default + limits + effective isolation + gpu (unauthenticated, §7)
+GET    /images                        os + allow-list + default + limits + effective isolation + gpu + capacity (unauthenticated, §7)
 GET    /healthz                       liveness
 
 Auth: Authorization: Bearer <contract token> on contract-scoped calls;

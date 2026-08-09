@@ -141,6 +141,16 @@ type Contract struct {
 	// restart can rebuild allocator occupancy.
 	GPUDeviceIDs []string
 
+	// ReservedCPUs and ReservedMemoryMB are the POST-CLAMP host capacity this lease
+	// reserved against the aggregate budgets (see internal/capacity): exactly the
+	// cpus / memory applied to the container. They are recorded so every terminal
+	// path can return the SAME amount it reserved to the capacity allocator. Zero
+	// when the lease reserved nothing on that dimension (an unbudgeted per-lease
+	// dimension). Empty on contracts reconciled from Docker labels, where they do
+	// not survive the restart until the next task persists them (#567).
+	ReservedCPUs     float64
+	ReservedMemoryMB int
+
 	// CreatedAt is when the contract was created.
 	CreatedAt time.Time
 

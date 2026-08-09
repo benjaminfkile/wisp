@@ -74,6 +74,14 @@ type Options struct {
 	// host with no GPU allocator wired.
 	ReleaseGPUs func(ids []string)
 
+	// ReleaseCapacity, when set, is called with a contract as the reaper expires it
+	// so the aggregate capacity allocator reclaims the lease's reserved cpus /
+	// memory and contract slot (see capacity.Allocator.Free). Unlike ReleaseGPUs it
+	// fires only AFTER the winning expired transition, so a lease released and reaped
+	// in a race frees its capacity exactly once (the state machine admits one side).
+	// It runs on the reaper's own goroutine. Nil when no capacity allocator is wired.
+	ReleaseCapacity func(c contract.Contract)
+
 	// Logger receives operational logs. Defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -92,6 +100,10 @@ type Reaper struct {
 	// releaseGPUs reclaims an expired contract's GPU devices back to the
 	// allocator; nil when no GPU allocator is wired. See Options.ReleaseGPUs.
 	releaseGPUs func(ids []string)
+
+	// releaseCapacity reclaims an expired contract's reserved host capacity back to
+	// the aggregate allocator; nil when none is wired. See Options.ReleaseCapacity.
+	releaseCapacity func(c contract.Contract)
 
 	mu     sync.RWMutex
 	notify func(Event)
@@ -112,14 +124,15 @@ func New(store *contract.Store, rt runtime.Runtime, opts Options) *Reaper {
 		opts.Logger = slog.Default()
 	}
 	return &Reaper{
-		store:       store,
-		rt:          rt,
-		lead:        opts.Lead,
-		interval:    opts.Interval,
-		now:         opts.Now,
-		logger:      opts.Logger,
-		notify:      opts.Notify,
-		releaseGPUs: opts.ReleaseGPUs,
+		store:           store,
+		rt:              rt,
+		lead:            opts.Lead,
+		interval:        opts.Interval,
+		now:             opts.Now,
+		logger:          opts.Logger,
+		notify:          opts.Notify,
+		releaseGPUs:     opts.ReleaseGPUs,
+		releaseCapacity: opts.ReleaseCapacity,
 	}
 }
 
@@ -190,23 +203,33 @@ func (r *Reaper) expire(ctx context.Context, c contract.Contract, now time.Time)
 	if r.releaseGPUs != nil && len(c.GPUDeviceIDs) > 0 {
 		r.releaseGPUs(c.GPUDeviceIDs)
 	}
-	r.transition(c, contract.StateExpired, now)
+	// Reclaim the lease's reserved host capacity ONLY when this reaper wins the
+	// expired transition. The capacity allocator's Free (unlike the GPU allocator's)
+	// subtracts plain amounts and is not self-idempotent, so gating on the winning
+	// transition is what guarantees a lease released and reaped in a race frees its
+	// capacity exactly once (the store admits a single terminal transition).
+	if r.transition(c, contract.StateExpired, now) && r.releaseCapacity != nil {
+		r.releaseCapacity(c)
+	}
 }
 
-// transition moves the contract to next and, on success, fires the hook. A
-// rejected transition (the contract raced to a terminal state via DELETE, or
-// was deleted outright) is logged at debug and ignored: the store's state
-// machine is the source of truth.
-func (r *Reaper) transition(c contract.Contract, next contract.State, now time.Time) {
+// transition moves the contract to next and, on success, fires the hook. It
+// reports whether the move actually happened so a caller (see expire) can gate a
+// once-per-contract side effect on winning the transition. A rejected transition
+// (the contract raced to a terminal state via DELETE, or was deleted outright) is
+// logged at debug and ignored, returning false: the store's state machine is the
+// source of truth.
+func (r *Reaper) transition(c contract.Contract, next contract.State, now time.Time) bool {
 	if _, err := r.store.UpdateState(c.ID, next); err != nil {
 		if errors.Is(err, contract.ErrIllegalTransition) || errors.Is(err, contract.ErrNotFound) {
 			r.logger.Debug("reaper: skip transition", "contract_id", c.ID, "to", next, "error", err)
-			return
+			return false
 		}
 		r.logger.Error("reaper: transition", "contract_id", c.ID, "to", next, "error", err)
-		return
+		return false
 	}
 	r.fire(Event{ContractID: c.ID, From: c.State, To: next, At: now})
+	return true
 }
 
 // fire invokes the lifecycle hook if one is installed.

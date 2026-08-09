@@ -81,8 +81,9 @@ type Limits struct {
 	// MaxContracts caps the number of concurrent (non-terminal) contracts the host
 	// admits, bounding contract count across the whole host rather than per lease.
 	// Zero means no cap — the default when unconfigured — mirroring how the other
-	// numeric limits treat zero as "no cap". Enforcement lands in a later task
-	// (siblings #566/#567); this field only declares the budget.
+	// numeric limits treat zero as "no cap". Enforced at create time by the shared
+	// aggregate allocator (see internal/capacity), which rejects an over-budget
+	// create with a 409.
 	MaxContracts int
 
 	// TotalCPUs caps the aggregate CPU (as a fraction of host cores) reserved
@@ -90,15 +91,15 @@ type Limits struct {
 	// lease (which MaxCPUs already caps). Zero means no cap — the default when
 	// unconfigured. When both TotalCPUs and MaxCPUs are set, TotalCPUs must be >=
 	// MaxCPUs (a budget below one lease could never admit anything; see validate).
-	// Enforcement lands in a later task (siblings #566/#567).
+	// Enforced at create time by the shared aggregate allocator (internal/capacity).
 	TotalCPUs float64
 
 	// TotalMemoryMB caps the aggregate memory (mebibytes) reserved across all
 	// concurrent contracts, bounding total memory rather than per lease (which
 	// MaxMemoryMB already caps). Zero means no cap — the default when unconfigured.
 	// When both TotalMemoryMB and MaxMemoryMB are set, TotalMemoryMB must be >=
-	// MaxMemoryMB (see validate). Enforcement lands in a later task (siblings
-	// #566/#567).
+	// MaxMemoryMB (see validate). Enforced at create time by the shared aggregate
+	// allocator (internal/capacity).
 	TotalMemoryMB int
 
 	// MaxGPUs caps the number of GPUs a single lease may request. Zero means no

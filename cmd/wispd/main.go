@@ -82,7 +82,10 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, pol *policy
 	// is either reaped or resumed on the reaper's first sweep instead of running
 	// unbounded with no daemon enforcing its TTL. This also rebuilds the GPU
 	// allocator's occupancy from the wisp.gpus labels so a restart never
-	// double-assigns a device a surviving lease still holds (see daemon.Reconcile).
+	// double-assigns a device a surviving lease still holds, and re-Reserves each
+	// surviving lease's cpus/memory from the wisp.cpus and wisp.memory_mb labels so
+	// a restart never oversubscribes the host by under-counting live leases (see
+	// daemon.Reconcile).
 	daemon.Reconcile(ctx)
 
 	// The TTL reaper reconciles tracked contracts on boot and then drives

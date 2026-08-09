@@ -146,8 +146,9 @@ type Contract struct {
 	// cpus / memory applied to the container. They are recorded so every terminal
 	// path can return the SAME amount it reserved to the capacity allocator. Zero
 	// when the lease reserved nothing on that dimension (an unbudgeted per-lease
-	// dimension). Empty on contracts reconciled from Docker labels, where they do
-	// not survive the restart until the next task persists them (#567).
+	// dimension). Persisted on the container's wisp.cpus and wisp.memory_mb labels
+	// so a restart's reconcile re-Reserves the same amounts, and recovered onto
+	// contracts adopted from those labels.
 	ReservedCPUs     float64
 	ReservedMemoryMB int
 

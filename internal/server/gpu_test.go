@@ -317,7 +317,7 @@ func TestGPUsLabelRoundTripThroughReconcile(t *testing.T) {
 	fake := runtime.NewFake()
 	fake.LeasedContainers = []runtime.LeasedContainer{{ID: "cont-1", Labels: opts.Labels}}
 
-	Reconcile(ctx, store, fake, alloc, discardLogger())
+	Reconcile(ctx, store, fake, alloc, nil, discardLogger())
 
 	got, err := store.Get("contract-1")
 	if err != nil {
@@ -356,7 +356,7 @@ func TestReconcileRebuildsOccupancyAcrossRestart(t *testing.T) {
 		{ID: "cont-b", Labels: map[string]string{contractLabel: "contract-b", expiresAtLabel: expiry, gpusLabel: "GPU-2,GPU-gone"}},
 	}
 
-	Reconcile(ctx, store, fake, alloc, discardLogger())
+	Reconcile(ctx, store, fake, alloc, nil, discardLogger())
 
 	// Both leases are tracked, each carrying the device IDs from its label verbatim.
 	if got, _ := store.Get("contract-a"); !reflect.DeepEqual(got.GPUDeviceIDs, []string{"GPU-0", "GPU-1"}) {

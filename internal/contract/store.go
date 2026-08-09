@@ -136,6 +136,14 @@ type AdoptParams struct {
 	// status reads and frees them back to the allocator when it is reaped. Empty
 	// when the lease held no GPUs.
 	GPUDeviceIDs []string
+
+	// ReservedCPUs and ReservedMemoryMB are the POST-CLAMP host capacity the lease
+	// held, recovered from the container's wisp.cpus and wisp.memory_mb labels, so
+	// the reconciled contract returns the SAME amount to the capacity allocator when
+	// it is reaped as the reconcile re-Reserved for it. Zero when a label was missing
+	// or malformed (see the reconcile), which still counts one contract slot.
+	ReservedCPUs     float64
+	ReservedMemoryMB int
 }
 
 // Adopt records a tracking entry for a pre-existing container discovered during
@@ -154,12 +162,14 @@ func (s *Store) Adopt(p AdoptParams) (Contract, error) {
 		return *c, nil
 	}
 	c := &Contract{
-		ID:           p.ID,
-		State:        StateReady,
-		ContainerID:  p.ContainerID,
-		ExpiresAt:    p.ExpiresAt,
-		GPUDeviceIDs: cloneIDs(p.GPUDeviceIDs),
-		CreatedAt:    s.now(),
+		ID:               p.ID,
+		State:            StateReady,
+		ContainerID:      p.ContainerID,
+		ExpiresAt:        p.ExpiresAt,
+		GPUDeviceIDs:     cloneIDs(p.GPUDeviceIDs),
+		ReservedCPUs:     p.ReservedCPUs,
+		ReservedMemoryMB: p.ReservedMemoryMB,
+		CreatedAt:        s.now(),
 	}
 	s.contracts[p.ID] = c
 	return *c, nil

@@ -152,12 +152,13 @@ func gpuDeviceIDs(devices []policy.GPUDevice) []string {
 // computes the isolation levels the host can actually provide, and intersects them
 // with the operator's allow-list to get the effective posture the create path
 // enforces and the read surface advertises. Any policy-allowed level the host
-// cannot run is dropped and logged as a startup WARNING, so the daemon never
-// accepts an isolation it cannot launch; a configured default that is unavailable
-// falls back to shared with its own warning. Detection is best-effort: if the
-// daemon info call fails, it falls back to the levels derivable from the
-// already-detected container OS (shared always, plus vm on a windows daemon) and
-// warns.
+// cannot run is dropped and logged as a startup WARNING. When NONE of the
+// configured levels are runnable and the allow-list explicitly excluded shared,
+// the host is treated as degraded — it logs an ERROR and advertises an empty
+// isolation set rather than silently downgrading to the weakest tier. Detection
+// is best-effort: if the daemon info call fails, it falls back to the levels
+// derivable from the already-detected container OS (shared always, plus vm on a
+// windows daemon) and warns.
 func (b *broker) detectIsolation(ctx context.Context) policy.IsolationCapabilities {
 	info, err := b.rt.DaemonInfo(ctx)
 	caps := policy.HostCapabilities{Runtimes: info.Runtimes, OS: string(info.OS)}
@@ -173,8 +174,20 @@ func (b *broker) detectIsolation(ctx context.Context) policy.IsolationCapabiliti
 	for _, lvl := range dropped {
 		b.logger.Warn("isolation level allowed by policy but not available on this host; dropping it from the accepted set", "isolation", lvl.String())
 	}
+	if len(dropped) > 0 && len(ic.Levels()) == 0 {
+		// All configured isolation levels are unavailable on this host and the
+		// allow-list explicitly excluded shared. Refuse to silently downgrade to
+		// the weakest tier — that is the opposite of the operator's security
+		// intent. Advertise an empty isolation set (host degraded) so no images
+		// are offered under a weaker tier than the operator authorised.
+		b.logger.Error("configured isolation levels unavailable on this host; host will advertise no isolation for images (refusing silent downgrade to shared)",
+			"configured", b.pol.Limits.Isolations,
+			"unavailable", dropped)
+		return ic
+	}
 	if configured := b.pol.DefaultIsolation(); ic.Default() != configured {
-		b.logger.Warn("default isolation level not available on this host; falling back to shared", "configured_default", configured.String(), "effective_default", ic.Default().String())
+		b.logger.Warn("default isolation level not available on this host; using effective default",
+			"configured_default", configured.String(), "effective_default", ic.Default().String())
 	}
 	return ic
 }

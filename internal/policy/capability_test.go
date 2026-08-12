@@ -123,34 +123,103 @@ func TestEffectiveIsolationKeepsAvailable(t *testing.T) {
 	}
 }
 
-// TestEffectiveIsolationDefaultFallback verifies a configured default the host
-// cannot run falls back to the always-available shared baseline, adding shared to
-// the effective set when it was itself dropped, so the host always has a runnable
-// default.
-func TestEffectiveIsolationDefaultFallback(t *testing.T) {
+// TestEffectiveIsolationAllDropped verifies the fail-closed behaviour: when the
+// operator's allow-list is non-empty but none of the configured levels are
+// available on this host, the effective set is EMPTY and shared is NOT silently
+// injected. The caller is expected to log an ERROR and advertise no isolation.
+func TestEffectiveIsolationAllDropped(t *testing.T) {
 	cfg := &Config{
 		Limits: Limits{
-			// The operator only allowed vm and made it the default, but this host
-			// cannot run vm.
+			// Operator wants vm-only security; shared is explicitly excluded.
 			Isolations:       []string{"vm"},
 			DefaultIsolation: "vm",
 		},
 	}
+	// Host has no Kata runtime — vm is unavailable.
 	supported := SupportedIsolations(HostCapabilities{Runtimes: []string{"runc"}, OS: "linux"})
 	ic, dropped := cfg.EffectiveIsolation(supported)
 
 	if got := isoNames(dropped); !reflect.DeepEqual(got, []string{"vm"}) {
 		t.Errorf("dropped = %v, want [vm]", got)
 	}
-	// Default fell back to shared, which was added to the effective set.
-	if ic.Default() != IsolationShared {
-		t.Errorf("Default() = %q, want shared (fallback)", ic.Default())
+	// All configured levels unavailable: effective set must be empty.
+	if got := isoNames(ic.Levels()); len(got) != 0 {
+		t.Errorf("effective levels = %v, want empty (no silent downgrade to shared)", got)
 	}
-	if !ic.Allows(IsolationShared) {
-		t.Error("Allows(shared) = false, want true (added as the runnable fallback default)")
+	// shared must NOT be injected — the operator excluded it.
+	if ic.Allows(IsolationShared) {
+		t.Error("Allows(shared) = true, want false (operator excluded shared from allow-list)")
 	}
-	if got := isoNames(ic.Levels()); !reflect.DeepEqual(got, []string{"shared"}) {
-		t.Errorf("effective levels = %v, want [shared]", got)
+	// No runnable default.
+	if ic.Default() != "" {
+		t.Errorf("Default() = %q, want empty (no runnable default)", ic.Default())
+	}
+}
+
+// TestEffectiveIsolationDefaultDroppedOthersSurvive verifies that when the
+// operator's allow-list produces a non-empty intersection but the configured
+// default is not in it, the fallback uses the first remaining runnable level —
+// NOT shared — when shared was excluded from the allow-list.
+func TestEffectiveIsolationDefaultDroppedOthersSurvive(t *testing.T) {
+	cfg := &Config{
+		Limits: Limits{
+			// Operator allows sandboxed and vm (no shared), prefers vm as default.
+			// This host has gVisor (sandboxed) but no Kata (vm).
+			Isolations:       []string{"sandboxed", "vm"},
+			DefaultIsolation: "vm",
+		},
+	}
+	// Host supports shared + sandboxed; vm requires kata which is absent.
+	supported := SupportedIsolations(HostCapabilities{Runtimes: []string{"runc", "runsc"}, OS: "linux"})
+	ic, dropped := cfg.EffectiveIsolation(supported)
+
+	if got := isoNames(dropped); !reflect.DeepEqual(got, []string{"vm"}) {
+		t.Errorf("dropped = %v, want [vm]", got)
+	}
+	if got := isoNames(ic.Levels()); !reflect.DeepEqual(got, []string{"sandboxed"}) {
+		t.Errorf("effective levels = %v, want [sandboxed]", got)
+	}
+	// shared excluded from allow-list: must not be injected as a fallback default.
+	if ic.Allows(IsolationShared) {
+		t.Error("Allows(shared) = true, want false (shared excluded from allow-list)")
+	}
+	// Default falls to the first remaining runnable level, not shared.
+	if ic.Default() != IsolationSandboxed {
+		t.Errorf("Default() = %q, want sandboxed (first remaining runnable, not shared)", ic.Default())
+	}
+}
+
+// TestEffectiveIsolationSharedExplicitlyExcluded verifies that when the
+// operator's allow-list omits shared and the implicit default (empty
+// DefaultIsolation → shared) is therefore not in the allow-list, shared is not
+// injected into the effective set or used as the default.
+func TestEffectiveIsolationSharedExplicitlyExcluded(t *testing.T) {
+	cfg := &Config{
+		Limits: Limits{
+			// Operator listed only sandboxed — shared is explicitly excluded.
+			// DefaultIsolation is empty, which Config.DefaultIsolation() maps to
+			// shared, but shared is not in the allow-list.
+			Isolations:       []string{"sandboxed"},
+			DefaultIsolation: "",
+		},
+	}
+	// Host supports shared and sandboxed (gVisor present).
+	supported := SupportedIsolations(HostCapabilities{Runtimes: []string{"runc", "runsc"}, OS: "linux"})
+	ic, dropped := cfg.EffectiveIsolation(supported)
+
+	if len(dropped) != 0 {
+		t.Errorf("dropped = %v, want none", isoNames(dropped))
+	}
+	if got := isoNames(ic.Levels()); !reflect.DeepEqual(got, []string{"sandboxed"}) {
+		t.Errorf("effective levels = %v, want [sandboxed]", got)
+	}
+	// shared was not in the allow-list: it must not appear in the effective set.
+	if ic.Allows(IsolationShared) {
+		t.Error("Allows(shared) = true, want false (shared excluded from allow-list)")
+	}
+	// Default is the only allowed runnable level, not the implicit shared baseline.
+	if ic.Default() != IsolationSandboxed {
+		t.Errorf("Default() = %q, want sandboxed (not the implicit shared baseline)", ic.Default())
 	}
 }
 

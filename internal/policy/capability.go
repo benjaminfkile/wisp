@@ -105,14 +105,24 @@ func (ic IsolationCapabilities) Default() Isolation {
 // levels the host can actually provide (supported, from SupportedIsolations),
 // returning the effective posture plus the policy-allowed levels the host cannot
 // run (dropped), in allow-list order, so the caller can log a clear startup
-// warning for each. The default level is preserved when it survives the
-// intersection; otherwise it falls back to the always-available shared baseline
-// (which is added to the effective set when it was itself dropped), so the host
-// always has a runnable default and never advertises or accepts a level it cannot
-// launch.
+// warning for each.
+//
+// Default handling follows the operator's intent:
+//   - When the allow-list is empty/unset (legacy): shared is always offered and
+//     used as the default, preserving prior behaviour.
+//   - When the allow-list is non-empty and the intersection is non-empty: the
+//     configured default is kept if it survived; otherwise the fallback is shared
+//     only when the allow-list explicitly included shared (shared is always
+//     supported so ic.Allows(IsolationShared) is a reliable proxy for that), or
+//     the first remaining runnable level when shared was excluded.
+//   - When the allow-list is non-empty but the intersection is empty (all
+//     configured levels are unavailable): return an EMPTY IsolationCapabilities
+//     with no default rather than silently downgrading to shared. The caller must
+//     log an ERROR and treat the host as degraded (advertising no isolation).
 func (c *Config) EffectiveIsolation(supported map[Isolation]bool) (IsolationCapabilities, []Isolation) {
 	ic := IsolationCapabilities{allowed: map[Isolation]bool{}}
 	var dropped []Isolation
+	allowListEmpty := len(c.Limits.Isolations) == 0
 	for _, l := range c.Limits.Isolations {
 		lvl := Isolation(l)
 		if supported[lvl] {
@@ -125,16 +135,38 @@ func (c *Config) EffectiveIsolation(supported map[Isolation]bool) (IsolationCapa
 		}
 	}
 	def := c.DefaultIsolation()
-	if !ic.allowed[def] {
-		// The configured default was dropped (or never allowed) on this host; fall
-		// back to the always-supported shared baseline so a create that omits a
-		// level still resolves to a runnable one, adding shared to the effective set
-		// if it was itself dropped.
+	if ic.allowed[def] {
+		// Configured default survived the intersection — keep it.
+		ic.def = def
+		return ic, dropped
+	}
+	// The configured default did not survive. The path depends on whether the
+	// operator configured an explicit allow-list.
+	if allowListEmpty {
+		// No allow-list: legacy behaviour — always offer and default to shared.
 		def = IsolationShared
 		if !ic.allowed[IsolationShared] {
 			ic.allowed[IsolationShared] = true
 			ic.order = append([]Isolation{IsolationShared}, ic.order...)
 		}
+		ic.def = def
+		return ic, dropped
+	}
+	if len(ic.order) == 0 {
+		// All-dropped: every configured isolation level is unavailable on this host.
+		// Return empty capabilities — the caller must log an ERROR and advertise no
+		// isolation rather than silently downgrading to the weakest tier the operator
+		// did not authorise. ic.def remains the zero value (empty Isolation).
+		return ic, dropped
+	}
+	// Partial intersection: some configured levels are runnable but the default is
+	// not. Fall back to shared only when the allow-list included it (since shared is
+	// always supported, ic.allowed[IsolationShared] is a reliable proxy). Never
+	// inject shared when the operator excluded it from their allow-list.
+	if ic.allowed[IsolationShared] {
+		def = IsolationShared
+	} else {
+		def = ic.order[0]
 	}
 	ic.def = def
 	return ic, dropped

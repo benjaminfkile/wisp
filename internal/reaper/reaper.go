@@ -174,7 +174,10 @@ func (r *Reaper) Tick(ctx context.Context) {
 
 // reap applies at most one due transition to a single contract. A contract past
 // its TTL goes straight to expired (killing its container); a ready contract
-// inside the lead window is warned by moving it to expiring.
+// inside the lead window is warned by moving it to expiring; a contract whose
+// backing container has died out of band (docker kill / rm / OOM) is expired
+// on the same path, so its capacity and GPUs return to the allocators within a
+// few ticks rather than at TTL expiry.
 func (r *Reaper) reap(ctx context.Context, c contract.Contract) {
 	if c.State.Terminal() {
 		return
@@ -183,9 +186,39 @@ func (r *Reaper) reap(ctx context.Context, c contract.Contract) {
 	switch {
 	case !now.Before(c.ExpiresAt):
 		r.expire(ctx, c, now)
+	case r.containerDied(ctx, c):
+		// The container is gone or stopped before its TTL: route through the same
+		// expire path so capacity, GPUs, and the contract slot free exactly once
+		// via the state-machine gate. A distinct log line makes the death (as
+		// opposed to a TTL expiry) visible to operators.
+		r.logger.Info("reaper: container died before TTL; expiring contract",
+			"contract_id", c.ID, "container_id", c.ContainerID, "state", c.State)
+		r.expire(ctx, c, now)
 	case c.State == contract.StateReady && !now.Before(c.ExpiresAt.Add(-r.lead)):
 		r.transition(c, contract.StateExpiring, now)
 	}
+}
+
+// containerDied reports whether the contract's backing container has died out
+// of band and the contract should be reaped. It only inspects contracts in
+// StateReady or StateExpiring — the states where a running container is
+// EXPECTED — so a container mid-provision (created but not yet Started) is not
+// mistaken for a dead one, and a contract with no ContainerID yet is skipped.
+// A transport error from Inspect is treated as inconclusive: the reaper does
+// NOT reap the lease on a transient daemon blip and retries on the next tick.
+func (r *Reaper) containerDied(ctx context.Context, c contract.Contract) bool {
+	if c.ContainerID == "" {
+		return false
+	}
+	if c.State != contract.StateReady && c.State != contract.StateExpiring {
+		return false
+	}
+	state, err := r.rt.Inspect(ctx, c.ContainerID)
+	if err != nil {
+		r.logger.Debug("reaper: inspect container", "contract_id", c.ID, "container_id", c.ContainerID, "error", err)
+		return false
+	}
+	return state != runtime.LivenessRunning
 }
 
 // expire kills the contract's container (if one was provisioned) and marks the

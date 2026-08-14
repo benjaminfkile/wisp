@@ -89,6 +89,29 @@ type LeasedContainer struct {
 // exists but is not in the running state (not started, or already killed).
 var ErrNotRunning = errors.New("runtime: container not running")
 
+// LivenessState is Inspect's coarse view of a container's runtime state, boiled
+// down to the three cases the reaper acts on: still doing its job, or dead in a
+// way that means its backing contract should be reaped and its capacity freed.
+// Discrete non-running Docker statuses (created, exited, restarting, paused,
+// removing, dead) collapse into LivenessStopped — from the lease's point of view
+// they all mean the container is no longer serving execs.
+type LivenessState int
+
+const (
+	// LivenessRunning means the container exists and is running.
+	LivenessRunning LivenessState = iota
+
+	// LivenessStopped means the container exists but is not running (created,
+	// exited, dead, restarting, paused, or removing). The reaper treats it the
+	// same as LivenessGone: the backing contract is dead and must be reaped.
+	LivenessStopped
+
+	// LivenessGone means the container no longer exists — it was removed out of
+	// band (docker rm, or a Docker daemon's auto-remove after exit) or was never
+	// there in the first place. The reaper treats it the same as LivenessStopped.
+	LivenessGone
+)
+
 // CreateOptions carries the launch configuration for a container. All fields
 // are optional; the zero value creates a container from the given image with
 // the image's default command.
@@ -273,6 +296,16 @@ type Runtime interface {
 	// Kill forcibly stops and removes the container. After Kill the id is no
 	// longer valid.
 	Kill(ctx context.Context, id string) error
+
+	// Inspect reports whether the container is currently running, in the
+	// LivenessState terms above. A container that has stopped (exited, OOM,
+	// killed) reports LivenessStopped; a container that no longer exists
+	// (removed out of band) reports LivenessGone. Those two are ordinary
+	// observations, NOT errors, so the reaper's liveness sweep can treat them
+	// uniformly. An error signals a transport-level failure (e.g. the daemon
+	// is unreachable); the caller treats that as inconclusive and reads again
+	// on the next tick rather than reaping a lease on a transient blip.
+	Inspect(ctx context.Context, id string) (LivenessState, error)
 
 	// ListLeased returns every container (running or stopped) the runtime knows
 	// about that carries the Wisp contract label (ContractLabel), so the daemon

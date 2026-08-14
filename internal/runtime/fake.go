@@ -74,13 +74,24 @@ type Fake struct {
 	// should not mutate it concurrently with runtime calls.
 	ShellHandler ShellFunc
 
-	// CreateErr, StartErr, KillErr, EnsureImageErr, ListLeasedErr, when set, are
-	// returned by the corresponding method to let tests exercise error paths.
+	// CreateErr, StartErr, KillErr, EnsureImageErr, ListLeasedErr, InspectErr,
+	// when set, are returned by the corresponding method to let tests exercise
+	// error paths.
 	CreateErr      error
 	StartErr       error
 	KillErr        error
 	EnsureImageErr error
 	ListLeasedErr  error
+	InspectErr     error
+
+	// InspectOverrides lets a test force Inspect to report a specific
+	// LivenessState for a given container id, regardless of the container's
+	// tracked Started/Killed flags. It is the seam for the "container died out
+	// of band" scenario a Fake otherwise can't reach — the reaper's liveness
+	// sweep needs the runtime to report a container Wisp still thinks is alive
+	// as stopped or gone, so a test sets that mapping here. An entry mapping to
+	// LivenessGone stands in for a docker-rm.
+	InspectOverrides map[string]LivenessState
 
 	// LeasedContainers, when non-nil, is returned verbatim by ListLeased so
 	// tests can simulate containers that pre-exist a restart (labels and ids of
@@ -239,6 +250,33 @@ func (f *Fake) Start(ctx context.Context, id string) error {
 	}
 	c.Started = true
 	return nil
+}
+
+// Inspect implements Runtime. It reports LivenessRunning for a tracked
+// container that has been Started (and not Killed), LivenessStopped for a
+// tracked-but-not-started container, and LivenessGone for an unknown id. Tests
+// can override the reported state per id via InspectOverrides — the seam that
+// stands in for a container that died out of band (docker kill / rm) without
+// the Fake having to model daemon-side death itself. InspectErr, when set,
+// takes precedence and is returned so callers can exercise the transport-error
+// path (e.g. a daemon-unreachable blip).
+func (f *Fake) Inspect(ctx context.Context, id string) (LivenessState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.InspectErr != nil {
+		return LivenessRunning, f.InspectErr
+	}
+	if s, ok := f.InspectOverrides[id]; ok {
+		return s, nil
+	}
+	c, ok := f.containers[id]
+	if !ok {
+		return LivenessGone, nil
+	}
+	if c.Started && !c.Killed {
+		return LivenessRunning, nil
+	}
+	return LivenessStopped, nil
 }
 
 // Kill implements Runtime. After Kill the id is removed and no longer valid.

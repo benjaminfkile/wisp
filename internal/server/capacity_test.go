@@ -189,6 +189,77 @@ func TestReaperExpiryFreesCapacity(t *testing.T) {
 	}
 }
 
+// TestReaperReapsDeadContainerFreesCapacityAndImagesReflects covers ACs 149, 150,
+// and the "images capacity block reflects the free" acceptance criterion end to
+// end: a contract's backing container dies out of band (docker kill / rm); on
+// the reaper's next tick the contract is moved to a terminal state, its cpu /
+// memory / contract-slot capacity is freed, GET /contracts/{id} reports the
+// terminal state, and GET /images shows the reclaimed usage — all before the
+// TTL has any chance of firing.
+func TestReaperReapsDeadContainerFreesCapacityAndImagesReflects(t *testing.T) {
+	b, h, store, fake := capBroker(t, budgetPolicy(0, 4, 512))
+
+	created := createContract(t, h, `{"ttl_seconds":3600,"resources":{"cpus":2,"memory_mb":256}}`)
+	if b.cap.UsedCPUs() != 2 || b.cap.UsedMemoryMB() != 256 || b.cap.ActiveContracts() != 1 {
+		t.Fatalf("post-create usage = {%d, %v, %d}, want {1, 2, 256}",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+	if img := getImages(t, h); img.Capacity.UsedCPUs != 2 || img.Capacity.UsedMemoryMB != 256 || img.Capacity.ActiveContracts != 1 {
+		t.Fatalf("post-create /images capacity = {active %d, cpus %v, mem %d}, want {1, 2, 256}",
+			img.Capacity.ActiveContracts, img.Capacity.UsedCPUs, img.Capacity.UsedMemoryMB)
+	}
+
+	// Simulate a docker rm / docker kill out of band: the container is gone from
+	// the runtime but the contract is still ready. The TTL is an hour away — the
+	// only signal that can reap it is the liveness check.
+	c, _ := store.Get(created.ContractID)
+	fake.InspectOverrides = map[string]runtime.LivenessState{c.ContainerID: runtime.LivenessGone}
+
+	// Wire the reaper exactly as cmd/wispd does.
+	rp := reaper.New(store, fake, reaper.Options{
+		Now:             func() time.Time { return c.CreatedAt.Add(time.Minute) },
+		Logger:          discardLogger(),
+		ReleaseGPUs:     b.alloc.Free,
+		ReleaseCapacity: func(c contract.Contract) { b.cap.Free(c.ReservedCPUs, c.ReservedMemoryMB) },
+	})
+	// Multiple ticks: the second and third observe the same dead container. The
+	// state-machine gate on the winning expired transition must keep ReleaseCapacity
+	// firing EXACTLY ONCE across all three, so used cpus/memory land at zero — not
+	// underflow — and stay there.
+	rp.Tick(nil)
+	rp.Tick(nil)
+	rp.Tick(nil)
+
+	if got, _ := store.Get(created.ContractID); got.State != contract.StateExpired {
+		t.Fatalf("state = %q, want %q after dead-container reap", got.State, contract.StateExpired)
+	}
+	if b.cap.ActiveContracts() != 0 || b.cap.UsedCPUs() != 0 || b.cap.UsedMemoryMB() != 0 {
+		t.Fatalf("post-reap usage = {%d, %v, %d}, want all zero (exactly-once free)",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+
+	// GET /contracts/{id} reports the terminal state, not "ready".
+	rec := doAuth(t, h, http.MethodGet, "/contracts/"+created.ContractID, created.Token, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /contracts status = %d (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode status: %v (body: %s)", err, rec.Body.String())
+	}
+	if got.Status != string(contract.StateExpired) {
+		t.Errorf("GET /contracts status = %q, want %q", got.Status, contract.StateExpired)
+	}
+
+	// GET /images capacity block reflects the freed usage.
+	if img := getImages(t, h); img.Capacity.UsedCPUs != 0 || img.Capacity.UsedMemoryMB != 0 || img.Capacity.ActiveContracts != 0 {
+		t.Errorf("post-reap /images capacity = {active %d, cpus %v, mem %d}, want all zero",
+			img.Capacity.ActiveContracts, img.Capacity.UsedCPUs, img.Capacity.UsedMemoryMB)
+	}
+}
+
 // A create rejected because the GPU allocator is exhausted frees the capacity it
 // reserved moments earlier — neither a GPU device nor host capacity is stranded.
 func TestRejectedGPUCreateStrandsNoCapacity(t *testing.T) {

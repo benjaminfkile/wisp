@@ -119,6 +119,16 @@ func TestReconcileThenReaperExpiresStaleAndKeepsValid(t *testing.T) {
 	validCID, _ := fake.Create(ctx, "img", runtime.CreateOptions{
 		Labels: labels("contract-valid", strconv.FormatInt(now.Add(time.Hour).Unix(), 10)),
 	})
+	// The pre-existing containers a prior wispd would have left behind were
+	// running when it exited; Start them here so the reaper's liveness check
+	// (Inspect) sees them alive rather than misreading a created-but-not-started
+	// fake as a died-out-of-band container and reaping the still-valid one.
+	if err := fake.Start(ctx, staleCID); err != nil {
+		t.Fatalf("fake.Start stale: %v", err)
+	}
+	if err := fake.Start(ctx, validCID); err != nil {
+		t.Fatalf("fake.Start valid: %v", err)
+	}
 
 	Reconcile(ctx, store, fake, nil, nil, discardLogger())
 

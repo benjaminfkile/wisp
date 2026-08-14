@@ -356,6 +356,28 @@ func (d *DockerRuntime) Kill(ctx context.Context, id string) error {
 	return nil
 }
 
+// Inspect implements Runtime by asking the daemon for the container's current
+// state. A "no such container" response from the daemon means the container was
+// removed out of band and maps to LivenessGone (not an error — that is an
+// ordinary observation the reaper acts on). Otherwise the daemon's live
+// State.Running flag decides between LivenessRunning and LivenessStopped, so
+// exited, dead, restarting, paused, removing, and created all collapse into
+// LivenessStopped uniformly. Any other error (e.g. daemon unreachable) is
+// wrapped and returned so the caller can treat it as inconclusive.
+func (d *DockerRuntime) Inspect(ctx context.Context, id string) (LivenessState, error) {
+	info, err := d.cli.ContainerInspect(ctx, id)
+	if err != nil {
+		if client.IsErrNotFound(err) {
+			return LivenessGone, nil
+		}
+		return LivenessRunning, fmt.Errorf("runtime: inspect container %s: %w", id, err)
+	}
+	if info.State != nil && info.State.Running {
+		return LivenessRunning, nil
+	}
+	return LivenessStopped, nil
+}
+
 // ListLeased implements Runtime. It queries the daemon for every container
 // (including stopped ones, via All) carrying the Wisp contract label, using a
 // server-side label filter so only leased containers are returned, and maps each

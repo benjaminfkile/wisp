@@ -351,6 +351,210 @@ func TestReaperSetNotify(t *testing.T) {
 	}
 }
 
+// TestReaperReapsDeadContainerBeforeTTL covers ACs 149/150: a container killed
+// out of band well before its TTL (docker kill / rm / OOM) is detected on the
+// reaper's next tick and drives its contract to a terminal state. The container
+// slot is freed too, so a follow-up create is not blocked by a "ready" contract
+// with no living backing.
+func TestReaperReapsDeadContainerBeforeTTL(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	c, cid := readyContract(t, store, fake, time.Hour)
+
+	// Simulate an out-of-band docker kill / rm: the container is gone but the
+	// contract is still ready with a well-in-the-future TTL. Wisp only learns via
+	// the liveness check on the next tick — well before the lead window.
+	fake.InspectOverrides = map[string]runtime.LivenessState{cid: runtime.LivenessGone}
+
+	var events []Event
+	rp := New(store, fake, Options{
+		Lead:   time.Minute,
+		Logger: discardLogger(),
+		// Nowhere near the TTL: only the liveness signal can trigger the reap.
+		Now:    func() time.Time { return c.ExpiresAt.Add(-30 * time.Minute) },
+		Notify: func(e Event) { events = append(events, e) },
+	})
+
+	rp.Tick(context.Background())
+
+	got, _ := store.Get(c.ID)
+	if !got.State.Terminal() {
+		t.Fatalf("state = %q, want terminal after out-of-band container death", got.State)
+	}
+	if got.State != contract.StateExpired {
+		t.Errorf("state = %q, want %q", got.State, contract.StateExpired)
+	}
+	if len(events) != 1 || events[0].To != contract.StateExpired {
+		t.Fatalf("events = %+v, want one ready→expired event", events)
+	}
+}
+
+// TestReaperReapsStoppedContainerBeforeTTL is the LivenessStopped sibling of the
+// gone case above: a container that exited (OOM, crash, docker stop) but still
+// exists is likewise reaped through the same terminal path.
+func TestReaperReapsStoppedContainerBeforeTTL(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	c, cid := readyContract(t, store, fake, time.Hour)
+
+	fake.InspectOverrides = map[string]runtime.LivenessState{cid: runtime.LivenessStopped}
+
+	rp := New(store, fake, Options{
+		Lead:   time.Minute,
+		Logger: discardLogger(),
+		Now:    func() time.Time { return c.ExpiresAt.Add(-30 * time.Minute) },
+	})
+	rp.Tick(context.Background())
+
+	if got, _ := store.Get(c.ID); got.State != contract.StateExpired {
+		t.Errorf("state = %q, want %q after out-of-band container stop", got.State, contract.StateExpired)
+	}
+}
+
+// TestReaperDeadContainerFreesCapacityExactlyOnce covers AC 151: ReleaseCapacity
+// fires EXACTLY ONCE for a contract whose container died out of band, even when
+// the reaper observes the dead container on multiple ticks. The
+// state-machine gate on the winning expired transition is what enforces this —
+// second and subsequent ticks see a terminal contract and skip early.
+func TestReaperDeadContainerFreesCapacityExactlyOnce(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	c, cid := readyContract(t, store, fake, time.Hour)
+
+	fake.InspectOverrides = map[string]runtime.LivenessState{cid: runtime.LivenessGone}
+
+	freed := 0
+	rp := New(store, fake, Options{
+		Lead:            time.Minute,
+		Logger:          discardLogger(),
+		Now:             func() time.Time { return c.ExpiresAt.Add(-30 * time.Minute) },
+		ReleaseCapacity: func(contract.Contract) { freed++ },
+	})
+
+	for i := 0; i < 5; i++ {
+		rp.Tick(context.Background())
+	}
+
+	if freed != 1 {
+		t.Fatalf("ReleaseCapacity fired %d times across 5 ticks; want exactly 1", freed)
+	}
+	if got, _ := store.Get(c.ID); got.State != contract.StateExpired {
+		t.Errorf("state = %q, want %q", got.State, contract.StateExpired)
+	}
+}
+
+// TestReaperDeadContainerFreesGPUs covers AC 152: a contract holding GPU devices
+// whose container dies out of band still has its GPUs freed through the same
+// path a TTL expiry would. Uses Adopt to attach GPU device IDs, then simulates
+// the container going away via InspectOverrides.
+func TestReaperDeadContainerFreesGPUs(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	ctx := context.Background()
+
+	cid, err := fake.Create(ctx, "wisp-base", runtime.CreateOptions{})
+	if err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+	if err := fake.Start(ctx, cid); err != nil {
+		t.Fatalf("fake.Start: %v", err)
+	}
+	future := time.Unix(2_000_000_000, 0)
+	if _, err := store.Adopt(contract.AdoptParams{
+		ID:           "gpu-contract",
+		ContainerID:  cid,
+		ExpiresAt:    future,
+		GPUDeviceIDs: []string{"GPU-0", "GPU-1"},
+	}); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	// Simulate the container being killed by docker kill / OOM.
+	fake.InspectOverrides = map[string]runtime.LivenessState{cid: runtime.LivenessGone}
+
+	var freed [][]string
+	rp := New(store, fake, Options{
+		Logger:      discardLogger(),
+		Now:         func() time.Time { return future.Add(-time.Hour) },
+		ReleaseGPUs: func(ids []string) { freed = append(freed, ids) },
+	})
+	rp.Tick(ctx)
+
+	if len(freed) != 1 {
+		t.Fatalf("ReleaseGPUs fired %d times, want 1", len(freed))
+	}
+	if want := []string{"GPU-0", "GPU-1"}; !equalStrings(freed[0], want) {
+		t.Errorf("freed = %v, want %v", freed[0], want)
+	}
+	if got, _ := store.Get("gpu-contract"); got.State != contract.StateExpired {
+		t.Errorf("state = %q, want %q", got.State, contract.StateExpired)
+	}
+}
+
+// TestReaperInspectTransportErrorDoesNotReap: a transient error from Inspect
+// (e.g. daemon unreachable) is inconclusive — the reaper leaves the contract
+// alone rather than reaping a live lease on a blip.
+func TestReaperInspectTransportErrorDoesNotReap(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	c, _ := readyContract(t, store, fake, time.Hour)
+
+	fake.InspectErr = errors.New("daemon unreachable")
+
+	rp := New(store, fake, Options{
+		Lead:   time.Minute,
+		Logger: discardLogger(),
+		Now:    func() time.Time { return c.ExpiresAt.Add(-30 * time.Minute) },
+		Notify: func(Event) {
+			t.Error("no transition should fire on a transient Inspect error")
+		},
+	})
+	rp.Tick(context.Background())
+
+	if got, _ := store.Get(c.ID); got.State != contract.StateReady {
+		t.Errorf("state = %q, want still ready after transient Inspect error", got.State)
+	}
+}
+
+// TestReaperInspectSkipsProvisioning: a container mid-provision (created but not
+// yet Started) reports LivenessStopped from the runtime, but the reaper must
+// leave a provisioning contract alone — it is expected to not be running yet.
+// Only ready and expiring contracts are candidates for the liveness reap.
+func TestReaperInspectSkipsProvisioning(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	ctx := context.Background()
+
+	c, err := store.Create(contract.CreateParams{TTL: time.Hour})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := store.UpdateState(c.ID, contract.StateProvisioning); err != nil {
+		t.Fatalf("UpdateState provisioning: %v", err)
+	}
+	cid, err := fake.Create(ctx, "wisp-base", runtime.CreateOptions{})
+	if err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+	if _, err := store.SetContainerID(c.ID, cid); err != nil {
+		t.Fatalf("SetContainerID: %v", err)
+	}
+	// Deliberately do NOT Start the container — mirror the mid-provision moment
+	// between Create and Start when Inspect would report LivenessStopped.
+
+	rp := New(store, fake, Options{
+		Lead:   time.Minute,
+		Logger: discardLogger(),
+		Now:    func() time.Time { return c.CreatedAt.Add(time.Minute) },
+	})
+	rp.Tick(ctx)
+
+	got, _ := store.Get(c.ID)
+	if got.State != contract.StateProvisioning {
+		t.Errorf("state = %q, want still provisioning", got.State)
+	}
+}
+
 // TestReaperDefaults: New fills in sane defaults for a zero Options.
 func TestReaperDefaults(t *testing.T) {
 	rp := New(contract.NewStore(), runtime.NewFake(), Options{})

@@ -263,6 +263,53 @@ func TestFakeUnknownContainer(t *testing.T) {
 	}
 }
 
+// TestFakeInspect verifies Inspect reports LivenessRunning for a started
+// container, LivenessStopped for a created-but-not-started one and for a killed
+// one, and LivenessGone for an unknown id. InspectOverrides forces a specific
+// state regardless of the tracked flags — the seam that stands in for a
+// container that died out of band without the Fake having to model daemon-side
+// death. InspectErr, when set, surfaces the transport-error path.
+func TestFakeInspect(t *testing.T) {
+	ctx := context.Background()
+	f := NewFake()
+
+	if got, err := f.Inspect(ctx, "nope"); err != nil || got != LivenessGone {
+		t.Errorf("Inspect unknown = (%v, %v), want (LivenessGone, nil)", got, err)
+	}
+
+	id, _ := f.Create(ctx, "img", CreateOptions{})
+	if got, err := f.Inspect(ctx, id); err != nil || got != LivenessStopped {
+		t.Errorf("Inspect created-not-started = (%v, %v), want (LivenessStopped, nil)", got, err)
+	}
+	if err := f.Start(ctx, id); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got, err := f.Inspect(ctx, id); err != nil || got != LivenessRunning {
+		t.Errorf("Inspect started = (%v, %v), want (LivenessRunning, nil)", got, err)
+	}
+
+	// InspectOverrides wins over the tracked liveness.
+	f.InspectOverrides = map[string]LivenessState{id: LivenessGone}
+	if got, err := f.Inspect(ctx, id); err != nil || got != LivenessGone {
+		t.Errorf("Inspect with override = (%v, %v), want (LivenessGone, nil)", got, err)
+	}
+	f.InspectOverrides = nil
+
+	// Killing the container removes it, so Inspect reports Gone (not Stopped).
+	if err := f.Kill(ctx, id); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	if got, err := f.Inspect(ctx, id); err != nil || got != LivenessGone {
+		t.Errorf("Inspect after Kill = (%v, %v), want (LivenessGone, nil)", got, err)
+	}
+
+	// InspectErr takes precedence and surfaces the transport-level failure path.
+	f.InspectErr = errors.New("daemon unreachable")
+	if _, err := f.Inspect(ctx, "anything"); !errors.Is(err, f.InspectErr) {
+		t.Errorf("Inspect with InspectErr err = %v, want daemon unreachable", err)
+	}
+}
+
 func TestFakeExecAfterKill(t *testing.T) {
 	ctx := context.Background()
 	f := NewFake()

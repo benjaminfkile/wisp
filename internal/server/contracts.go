@@ -49,6 +49,17 @@ const gpusLabel = runtime.GPUsLabel
 const cpusLabel = runtime.CPUsLabel
 const memoryMBLabel = runtime.MemoryMBLabel
 
+// externalIDLabel is the container label carrying a caller-supplied opaque
+// identifier (e.g. an upstream lease id) accepted at create time, written next
+// to contractLabel so a wispd restart's reconcile can restore the mapping from
+// the container's labels alone. Defined in the runtime package for the same
+// reason as contractLabel.
+const externalIDLabel = runtime.ExternalIDLabel
+
+// maxExternalIDLen bounds the opaque external_id a create call may attach so an
+// arbitrarily long identifier cannot be smuggled into a container label.
+const maxExternalIDLen = 128
+
 // noNewPrivilegesOpt is the Docker security option applied to every leased
 // container so a process inside it cannot gain privileges via setuid binaries
 // (e.g. sudo/su). It is safe, workload-agnostic hardening: it neither drops
@@ -258,6 +269,11 @@ func (b *broker) routes(mux *http.ServeMux) {
 	// is registered without the app-token gate (see docs/DESIGN.md §7, §8).
 	mux.HandleFunc("GET /images", b.images)
 	mux.HandleFunc("POST /contracts", b.requireAppToken(b.create))
+	// The list endpoint is app-token gated (like create): it enumerates every
+	// live contract with its current bearer token so the local wisp-agent can
+	// rebuild its lease map after a restart, so it must never be reachable to
+	// an unauthenticated caller (see docs/DESIGN.md §8).
+	mux.HandleFunc("GET /contracts", b.requireAppToken(b.list))
 	mux.HandleFunc("GET /contracts/{id}", b.get)
 	mux.HandleFunc("DELETE /contracts/{id}", b.release)
 	mux.HandleFunc("POST /contracts/{id}/exec", b.exec)
@@ -280,6 +296,27 @@ func (b *broker) requireAppToken(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// authorizedForContract reports whether r may act on a per-contract endpoint
+// (today: GET /contracts/{id} and DELETE /contracts/{id}) — the app token OR
+// the contract's own bearer token authorizes it, letting the local agent drive
+// any lease it created while a satellite that only holds a contract token can
+// still read/release its own. When the configured app token is empty the app
+// gate is disabled (localhost-friendly default, see docs/DESIGN.md §8) and any
+// request passes; otherwise a mismatched Authorization header is rejected with
+// 401. Both comparisons are constant-time (see bearerMatches).
+func (b *broker) authorizedForContract(r *http.Request, c contract.Contract) bool {
+	if b.appToken == "" {
+		return true
+	}
+	if bearerMatches(r, b.appToken) {
+		return true
+	}
+	if c.Token != "" && bearerMatches(r, c.Token) {
+		return true
+	}
+	return false
 }
 
 // resourcesRequest is the optional per-request resource shaping. Each value is
@@ -323,6 +360,14 @@ type createRequest struct {
 	// contents; it just carries them into Config.Env so every exec/shell
 	// inherits them. It is WRITE-ONLY: never echoed on GET status, never logged.
 	Env map[string]string `json:"env"`
+
+	// ExternalID is an optional, opaque caller-supplied identifier (e.g. an
+	// upstream lease id) that wisp persists on the container as the
+	// wisp.external_id label and echoes back on list/status reads so an upstream
+	// agent can re-associate leases it owns after a wispd restart. It is capped
+	// at maxExternalIDLen so a malicious caller cannot smuggle an unbounded
+	// identifier into a container label.
+	ExternalID string `json:"external_id"`
 }
 
 // Env injection limits. These cap the blast radius of the opaque env map so a
@@ -354,6 +399,63 @@ type statusResponse struct {
 	Gpus []string `json:"gpus,omitempty"`
 
 	Meta map[string]any `json:"meta,omitempty"`
+
+	// ExternalID is the opaque caller-supplied identifier attached at create
+	// time (see createRequest.ExternalID); an empty string when the caller
+	// supplied none. Always present so a consumer sees the same field name it
+	// gets from GET /contracts.
+	ExternalID string `json:"external_id"`
+}
+
+// contractInfo is one entry in the GET /contracts list response. Its field
+// names and shape are a cross-repo wire contract (see docs/DESIGN.md §7 and the
+// wisp-agent counterpart), so keep them exactly in lockstep with that
+// specification. Only non-terminal contracts appear here (see listContracts).
+type contractInfo struct {
+	// ID is the contract id.
+	ID string `json:"id"`
+
+	// ExternalID is the opaque caller-supplied identifier (empty string when
+	// the caller supplied none).
+	ExternalID string `json:"external_id"`
+
+	// Token is the contract's CURRENT bearer token, valid for /exec and /shell.
+	// The endpoint is app-token-gated and local-only, so returning tokens to the
+	// authenticated local agent is acceptable for v1 (see docs/DESIGN.md §8).
+	Token string `json:"token"`
+
+	// Status is the current lifecycle state (one of provisioning|ready|expiring —
+	// terminal contracts are excluded from the list, requested is the transient
+	// pre-provision state).
+	Status string `json:"status"`
+
+	// ExpiresAt is the contract's absolute expiry as Unix seconds.
+	ExpiresAt int64 `json:"expires_at"`
+
+	// TTLSecondsRemaining is time.Until(ExpiresAt) rounded down to whole seconds,
+	// clamped at zero.
+	TTLSecondsRemaining int `json:"ttl_seconds_remaining"`
+
+	// ReservedCPUs is the POST-CLAMP CPU reservation held by the lease (see
+	// Contract.ReservedCPUs).
+	ReservedCPUs float64 `json:"reserved_cpus"`
+
+	// ReservedMemoryMB is the POST-CLAMP memory reservation held by the lease
+	// (see Contract.ReservedMemoryMB).
+	ReservedMemoryMB int `json:"reserved_memory_mb"`
+
+	// Gpus is the whole GPU devices this contract was exclusively assigned; a
+	// non-null array (empty for a GPU-less lease) so a consumer can iterate
+	// unconditionally.
+	Gpus []string `json:"gpus"`
+}
+
+// contractsListResponse is the GET /contracts response body — a single
+// "contracts" array of contractInfo entries. The array is always present
+// (empty when no non-terminal contracts exist) so a consumer can decode
+// unconditionally.
+type contractsListResponse struct {
+	Contracts []contractInfo `json:"contracts"`
 }
 
 // launchSpec is the launch configuration resolved from a create request against
@@ -448,6 +550,13 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cap the opaque external_id so a caller cannot smuggle an unbounded
+	// identifier into a container label. Empty is fine — the caller may omit it.
+	if len(req.ExternalID) > maxExternalIDLen {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("external_id too long (max %d bytes)", maxExternalIDLen))
+		return
+	}
+
 	// The policy caps the contract: the requested TTL and resources are clamped
 	// down to any configured maximum (see docs/DESIGN.md §7). Clamping happens
 	// BEFORE the capacity reservation so the reserved amounts are the POST-CLAMP
@@ -506,6 +615,7 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		ReservedCPUs:     spec.cpus,
 		ReservedMemoryMB: spec.memoryMB,
 		Meta:             req.Meta,
+		ExternalID:       req.ExternalID,
 	})
 	if err != nil {
 		// The only error Create returns for a positive TTL is ErrInvalidTTL,
@@ -915,7 +1025,9 @@ func (b *broker) mapOSMismatch(err error) error {
 }
 
 // get handles GET /contracts/:id: it reports the current status and the
-// seconds remaining until the TTL elapses.
+// seconds remaining until the TTL elapses. It requires either the app token or
+// the contract's own bearer token so a local process without either credential
+// cannot enumerate lease state (see authorizedForContract).
 func (b *broker) get(w http.ResponseWriter, r *http.Request) {
 	c, err := b.store.Get(r.PathValue("id"))
 	if errors.Is(err, contract.ErrNotFound) {
@@ -926,12 +1038,57 @@ func (b *broker) get(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not read contract")
 		return
 	}
+	if !b.authorizedForContract(r, c) {
+		writeError(w, http.StatusUnauthorized, "missing or invalid app or contract token")
+		return
+	}
 	writeJSON(w, http.StatusOK, b.statusOf(c))
+}
+
+// list handles GET /contracts: it returns every non-terminal contract with its
+// current bearer token so a restarted local agent can rebuild its lease map
+// (see docs/DESIGN.md §7). The endpoint is app-token-gated (see routes) and
+// local-only, so surfacing tokens to the authenticated caller is acceptable
+// for v1. Terminal contracts are excluded so a lease already reaped or released
+// never appears in the list.
+func (b *broker) list(w http.ResponseWriter, r *http.Request) {
+	all := b.store.List()
+	now := b.now()
+	out := contractsListResponse{Contracts: make([]contractInfo, 0, len(all))}
+	for _, c := range all {
+		if c.State.Terminal() {
+			continue
+		}
+		remaining := 0
+		if d := c.ExpiresAt.Sub(now); d > 0 {
+			remaining = int(d / time.Second)
+		}
+		gpus := c.GPUDeviceIDs
+		if gpus == nil {
+			// Emit an empty array (never null) so the consumer can iterate
+			// unconditionally.
+			gpus = []string{}
+		}
+		out.Contracts = append(out.Contracts, contractInfo{
+			ID:                  c.ID,
+			ExternalID:          c.ExternalID,
+			Token:               c.Token,
+			Status:              string(c.State),
+			ExpiresAt:           c.ExpiresAt.Unix(),
+			TTLSecondsRemaining: remaining,
+			ReservedCPUs:        c.ReservedCPUs,
+			ReservedMemoryMB:    c.ReservedMemoryMB,
+			Gpus:                gpus,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // release handles DELETE /contracts/:id: it kills the container and marks the
 // contract released. Releasing an already-terminal contract is a no-op that
-// echoes the current status, so DELETE is safe to retry.
+// echoes the current status, so DELETE is safe to retry. It requires either
+// the app token or the contract's own bearer token so a local process without
+// either credential cannot destroy a lease (see authorizedForContract).
 func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 	c, err := b.store.Get(r.PathValue("id"))
 	if errors.Is(err, contract.ErrNotFound) {
@@ -940,6 +1097,10 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not read contract")
+		return
+	}
+	if !b.authorizedForContract(r, c) {
+		writeError(w, http.StatusUnauthorized, "missing or invalid app or contract token")
 		return
 	}
 
@@ -1159,6 +1320,7 @@ func (b *broker) statusOf(c contract.Contract) statusResponse {
 		TTLSecondsRemaining: remaining,
 		Gpus:                c.GPUDeviceIDs,
 		Meta:                c.Meta,
+		ExternalID:          c.ExternalID,
 	}
 }
 
@@ -1256,6 +1418,13 @@ func createOptions(spec launchSpec, c contract.Contract, os runtime.ContainerOS)
 	// what create took.
 	labels[cpusLabel] = strconv.FormatFloat(c.ReservedCPUs, 'f', -1, 64)
 	labels[memoryMBLabel] = strconv.Itoa(c.ReservedMemoryMB)
+	// Record the caller-supplied opaque identifier so a wispd restart's reconcile
+	// can restore the mapping from surviving containers' labels alone. Omitted
+	// when the create carried no external_id, so the container carries no such
+	// label unless the caller explicitly asked for one.
+	if c.ExternalID != "" {
+		labels[externalIDLabel] = c.ExternalID
+	}
 	opts := runtime.CreateOptions{
 		Labels: labels,
 		// Run the keep-alive as the container's main process so it stays up for

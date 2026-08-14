@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/contract"
 	"github.com/benjaminfkile/wisp/internal/policy"
+	"github.com/benjaminfkile/wisp/internal/reaper"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
@@ -1657,5 +1659,406 @@ func TestDeleteNotFound(t *testing.T) {
 	rec := do(t, h, http.MethodDelete, "/contracts/nope", "")
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+// GET /contracts returns every non-terminal contract with the documented JSON
+// shape, including the current token and any caller-supplied external_id.
+// Covers acceptance criterion 158.
+func TestListContractsReturnsNonTerminalShape(t *testing.T) {
+	h, store, _ := testServer(t)
+
+	// One contract with a caller-supplied external id...
+	first := createContract(t, h, `{"ttl_seconds":3600,"external_id":"lease-abc","resources":{"cpus":0,"memory_mb":0}}`)
+	// ...and one without.
+	second := createContract(t, h, `{"ttl_seconds":1800}`)
+
+	// A terminal contract must never appear.
+	terminal := createContract(t, h, `{"ttl_seconds":3600}`)
+	if _, err := store.UpdateState(terminal.ContractID, contract.StateReleased); err != nil {
+		t.Fatalf("UpdateState released: %v", err)
+	}
+
+	rec := do(t, h, http.MethodGet, "/contracts", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got contractsListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v (body: %s)", err, rec.Body.String())
+	}
+
+	if len(got.Contracts) != 2 {
+		t.Fatalf("contracts len = %d, want 2 (terminal excluded)", len(got.Contracts))
+	}
+
+	byID := map[string]contractInfo{}
+	for _, c := range got.Contracts {
+		byID[c.ID] = c
+	}
+	firstInfo, ok := byID[first.ContractID]
+	if !ok {
+		t.Fatalf("first contract missing from list")
+	}
+	if firstInfo.ExternalID != "lease-abc" {
+		t.Errorf("first external_id = %q, want lease-abc", firstInfo.ExternalID)
+	}
+	if firstInfo.Token != first.Token {
+		t.Errorf("first token = %q, want %q (current create token)", firstInfo.Token, first.Token)
+	}
+	if firstInfo.Status != string(contract.StateReady) {
+		t.Errorf("first status = %q, want ready", firstInfo.Status)
+	}
+	if firstInfo.ExpiresAt <= 0 {
+		t.Errorf("first expires_at = %d, want > 0", firstInfo.ExpiresAt)
+	}
+	if firstInfo.TTLSecondsRemaining <= 0 || firstInfo.TTLSecondsRemaining > 3600 {
+		t.Errorf("first ttl_seconds_remaining = %d, want (0,3600]", firstInfo.TTLSecondsRemaining)
+	}
+	if firstInfo.Gpus == nil {
+		t.Errorf("first gpus = null, want empty array (always present in the wire contract)")
+	}
+
+	secondInfo, ok := byID[second.ContractID]
+	if !ok {
+		t.Fatalf("second contract missing from list")
+	}
+	if secondInfo.ExternalID != "" {
+		t.Errorf("second external_id = %q, want empty for a caller that supplied none", secondInfo.ExternalID)
+	}
+	if secondInfo.Token != second.Token {
+		t.Errorf("second token = %q, want %q", secondInfo.Token, second.Token)
+	}
+}
+
+// GET /contracts's raw JSON matches the cross-repo wire contract exactly —
+// wisp-agent scrapes these snake_case names — and the "contracts" array is
+// always present (empty when no non-terminal contracts exist).
+func TestListContractsRawJSONShape(t *testing.T) {
+	h, _, _ := testServer(t)
+
+	// Empty case: still an array, never null.
+	rec := do(t, h, http.MethodGet, "/contracts", "")
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode empty: %v", err)
+	}
+	if _, ok := raw["contracts"]; !ok {
+		t.Fatal("response has no top-level \"contracts\" field")
+	}
+	if string(raw["contracts"]) != "[]" {
+		t.Errorf("empty contracts = %s, want []", raw["contracts"])
+	}
+
+	// Populated case: each entry carries every wire-contract field.
+	createContract(t, h, `{"ttl_seconds":60,"external_id":"lease-1"}`)
+	rec = do(t, h, http.MethodGet, "/contracts", "")
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode populated: %v", err)
+	}
+	var list []map[string]json.RawMessage
+	if err := json.Unmarshal(raw["contracts"], &list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("list len = %d, want 1", len(list))
+	}
+	for _, field := range []string{"id", "external_id", "token", "status", "expires_at", "ttl_seconds_remaining", "reserved_cpus", "reserved_memory_mb", "gpus"} {
+		if _, ok := list[0][field]; !ok {
+			t.Errorf("contract entry missing wire-contract field %q (entry: %v)", field, list[0])
+		}
+	}
+	if string(list[0]["gpus"]) != "[]" {
+		t.Errorf("gpus raw = %s, want [] (never null)", list[0]["gpus"])
+	}
+}
+
+// GET /contracts without the app token returns 401; with the token it succeeds.
+// Covers acceptance criterion 159 (list-side).
+func TestListContractsRequiresAppToken(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, policy.Default(), bus.New(nil), "app-secret")
+
+	// No token: 401.
+	if rec := do(t, h, http.MethodGet, "/contracts", ""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("no-token GET /contracts status = %d, want 401 (body: %s)", rec.Code, rec.Body.String())
+	}
+	// Wrong token: 401.
+	if rec := doAuth(t, h, http.MethodGet, "/contracts", "wrong", ""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("bad-token GET /contracts status = %d, want 401", rec.Code)
+	}
+	// Correct token: 200.
+	if rec := doAuth(t, h, http.MethodGet, "/contracts", "app-secret", ""); rec.Code != http.StatusOK {
+		t.Errorf("good-token GET /contracts status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+// GET/DELETE /contracts/{id} require either the app token OR the per-contract
+// token — a random local process without either credential cannot read or
+// destroy the lease. Covers acceptance criterion 159 (per-contract side).
+func TestContractByIDRequiresAppOrContractToken(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, policy.Default(), bus.New(nil), "app-secret")
+
+	rec := doAuth(t, h, http.MethodPost, "/contracts", "app-secret", `{"ttl_seconds":3600}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var created createResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	url := "/contracts/" + created.ContractID
+
+	// GET without any token: 401.
+	if r := do(t, h, http.MethodGet, url, ""); r.Code != http.StatusUnauthorized {
+		t.Errorf("GET no-token status = %d, want 401", r.Code)
+	}
+	// GET with the app token: 200.
+	if r := doAuth(t, h, http.MethodGet, url, "app-secret", ""); r.Code != http.StatusOK {
+		t.Errorf("GET app-token status = %d, want 200 (body: %s)", r.Code, r.Body.String())
+	}
+	// GET with the contract token: 200.
+	if r := doAuth(t, h, http.MethodGet, url, created.Token, ""); r.Code != http.StatusOK {
+		t.Errorf("GET contract-token status = %d, want 200 (body: %s)", r.Code, r.Body.String())
+	}
+	// GET with a random token: 401.
+	if r := doAuth(t, h, http.MethodGet, url, "bogus", ""); r.Code != http.StatusUnauthorized {
+		t.Errorf("GET bogus-token status = %d, want 401", r.Code)
+	}
+
+	// DELETE with the contract token succeeds (and simultaneously releases).
+	if r := doAuth(t, h, http.MethodDelete, url, created.Token, ""); r.Code != http.StatusOK {
+		t.Errorf("DELETE contract-token status = %d, want 200 (body: %s)", r.Code, r.Body.String())
+	}
+
+	// A fresh contract for the DELETE-without-token / app-token cases.
+	rec = doAuth(t, h, http.MethodPost, "/contracts", "app-secret", `{"ttl_seconds":3600}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("second create status = %d, want 201", rec.Code)
+	}
+	var second createResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &second)
+	url = "/contracts/" + second.ContractID
+
+	// DELETE without any token: 401.
+	if r := do(t, h, http.MethodDelete, url, ""); r.Code != http.StatusUnauthorized {
+		t.Errorf("DELETE no-token status = %d, want 401", r.Code)
+	}
+	// DELETE with a random token: 401.
+	if r := doAuth(t, h, http.MethodDelete, url, "bogus", ""); r.Code != http.StatusUnauthorized {
+		t.Errorf("DELETE bogus-token status = %d, want 401", r.Code)
+	}
+	// DELETE with the app token: 200.
+	if r := doAuth(t, h, http.MethodDelete, url, "app-secret", ""); r.Code != http.StatusOK {
+		t.Errorf("DELETE app-token status = %d, want 200 (body: %s)", r.Code, r.Body.String())
+	}
+}
+
+// A create carrying external_id persists it as a container label, echoes it on
+// GET /contracts/{id}, and surfaces it in GET /contracts. The bookkeeping is
+// the same round-trip a wispd restart's reconcile relies on.
+// Covers acceptance criterion 160 (create side).
+func TestCreateExternalIDRoundTrip(t *testing.T) {
+	h, store, fake := testServer(t)
+	created := createContract(t, h, `{"ttl_seconds":3600,"external_id":"lease-xyz-42"}`)
+
+	c, err := store.Get(created.ContractID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if c.ExternalID != "lease-xyz-42" {
+		t.Errorf("stored ExternalID = %q, want lease-xyz-42", c.ExternalID)
+	}
+
+	// The container label carries the exact value so a wispd restart can recover it.
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	if got := fc.Opts.Labels[externalIDLabel]; got != "lease-xyz-42" {
+		t.Errorf("container label %s = %q, want lease-xyz-42", externalIDLabel, got)
+	}
+
+	// GET /contracts/{id} echoes it back.
+	rec := doAuth(t, h, http.MethodGet, "/contracts/"+created.ContractID, created.Token, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var status statusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if status.ExternalID != "lease-xyz-42" {
+		t.Errorf("status external_id = %q, want lease-xyz-42", status.ExternalID)
+	}
+}
+
+// A create without external_id writes no wisp.external_id label — the presence
+// of that label distinguishes a caller-supplied identifier from an absent one.
+func TestCreateWithoutExternalIDWritesNoLabel(t *testing.T) {
+	h, store, fake := testServer(t)
+	created := createContract(t, h, `{"ttl_seconds":60}`)
+
+	c, _ := store.Get(created.ContractID)
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatal("container not tracked")
+	}
+	if _, present := fc.Opts.Labels[externalIDLabel]; present {
+		t.Errorf("container carries %s label without a caller-supplied external_id: %v",
+			externalIDLabel, fc.Opts.Labels)
+	}
+}
+
+// A create with an external_id longer than the cap is rejected up front — no
+// contract is recorded, no container is booted.
+func TestCreateExternalIDTooLongRejected(t *testing.T) {
+	h, store, _ := testServer(t)
+	tooLong := strings.Repeat("x", maxExternalIDLen+1)
+	body := `{"ttl_seconds":60,"external_id":"` + tooLong + `"}`
+
+	rec := do(t, h, http.MethodPost, "/contracts", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if n := len(store.List()); n != 0 {
+		t.Errorf("stored contracts = %d, want 0 after rejected external_id", n)
+	}
+}
+
+// After a wispd restart's reconcile, an adopted contract's external_id is
+// recovered from the container label and appears on both GET /contracts and
+// GET /contracts/{id} — the mapping the local wisp-agent needs to re-associate
+// its leases. Covers acceptance criterion 160 (reconcile side).
+func TestReconcileRestoresExternalIDFromLabel(t *testing.T) {
+	ctx := context.Background()
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+
+	expiry := strconv.FormatInt(time.Unix(2_000_000_000, 0).Unix(), 10)
+	cid, err := fake.Create(ctx, "wisp-base", runtime.CreateOptions{
+		Labels: map[string]string{
+			contractLabel:   "kept-contract",
+			expiresAtLabel:  expiry,
+			externalIDLabel: "lease-carried-across",
+		},
+	})
+	if err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+	if err := fake.Start(ctx, cid); err != nil {
+		t.Fatalf("fake.Start: %v", err)
+	}
+
+	Reconcile(ctx, store, fake, nil, nil, discardLogger())
+
+	c, err := store.Get("kept-contract")
+	if err != nil {
+		t.Fatalf("adopted contract missing: %v", err)
+	}
+	if c.ExternalID != "lease-carried-across" {
+		t.Errorf("recovered ExternalID = %q, want lease-carried-across", c.ExternalID)
+	}
+}
+
+// Adopt generates a fresh bearer token so an exec against a reconciled
+// contract succeeds with the token returned by GET /contracts.
+// Covers acceptance criterion 161.
+func TestReconciledContractGetsFreshWorkingToken(t *testing.T) {
+	ctx := context.Background()
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+
+	expiry := strconv.FormatInt(time.Unix(2_000_000_000, 0).Unix(), 10)
+	cid, err := fake.Create(ctx, "wisp-base", runtime.CreateOptions{
+		Labels: map[string]string{contractLabel: "adopted", expiresAtLabel: expiry},
+	})
+	if err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+	if err := fake.Start(ctx, cid); err != nil {
+		t.Fatalf("fake.Start: %v", err)
+	}
+
+	// Now build the HTTP surface over the same store/fake so an app-token-gated
+	// GET /contracts + exec via the returned token exercises the fresh credential.
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, policy.Default(), bus.New(nil), "app-secret")
+	Reconcile(ctx, store, fake, nil, nil, discardLogger())
+
+	c, err := store.Get("adopted")
+	if err != nil {
+		t.Fatalf("adopted contract missing: %v", err)
+	}
+	if c.Token == "" {
+		t.Fatal("adopted contract has empty token; want a fresh one")
+	}
+
+	// The token surfaced by GET /contracts matches the stored one.
+	rec := doAuth(t, h, http.MethodGet, "/contracts", "app-secret", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /contracts status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var list contractsListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(list.Contracts) != 1 {
+		t.Fatalf("list len = %d, want 1", len(list.Contracts))
+	}
+	if list.Contracts[0].Token != c.Token {
+		t.Errorf("list token = %q, want %q (matches stored)", list.Contracts[0].Token, c.Token)
+	}
+
+	// Exec against the adopted contract with the fresh token succeeds — the whole
+	// point of re-issuing on Adopt.
+	rec = doAuth(t, h, http.MethodPost, "/contracts/adopted/exec", list.Contracts[0].Token, `{"command":"echo hi"}`)
+	if rec.Code != http.StatusOK {
+		t.Errorf("exec status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+// Terminal contracts never appear in GET /contracts, and the reaper's cleanup
+// sweep removes them from the store on the tick after they become terminal so
+// storage does not grow unboundedly. Covers acceptance criterion 162.
+func TestListExcludesTerminalAndReaperSweepDeletes(t *testing.T) {
+	h, store, _ := testServer(t)
+	live := createContract(t, h, `{"ttl_seconds":3600}`)
+	terminal := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	// Drive the second one to a terminal state directly. GET /contracts must
+	// filter it out even though it is still in the store.
+	if _, err := store.UpdateState(terminal.ContractID, contract.StateReleased); err != nil {
+		t.Fatalf("UpdateState released: %v", err)
+	}
+
+	rec := do(t, h, http.MethodGet, "/contracts", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /contracts status = %d, want 200", rec.Code)
+	}
+	var list contractsListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(list.Contracts) != 1 || list.Contracts[0].ID != live.ContractID {
+		t.Fatalf("list = %+v, want only the live contract", list.Contracts)
+	}
+
+	// One reaper tick is enough to remove a contract that was terminal at start of
+	// tick — it drops from the store, so a subsequent Get returns not-found.
+	rp := reaper.New(store, runtime.NewFake(), reaper.Options{
+		Logger: discardLogger(),
+		Now:    func() time.Time { return time.Unix(1_000_000_000, 0) },
+	})
+	rp.Tick(context.Background())
+
+	if _, err := store.Get(terminal.ContractID); !errors.Is(err, contract.ErrNotFound) {
+		t.Errorf("terminal contract still in store after cleanup tick: err=%v", err)
+	}
+	// The live contract is untouched by the cleanup sweep.
+	if _, err := store.Get(live.ContractID); err != nil {
+		t.Errorf("live contract missing after cleanup tick: %v", err)
 	}
 }

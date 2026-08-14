@@ -44,6 +44,12 @@ type CreateParams struct {
 	// Meta is arbitrary client-supplied metadata echoed back on status reads.
 	// Opaque to the store.
 	Meta map[string]any
+
+	// ExternalID is an opaque caller-supplied identifier the create endpoint
+	// accepted (see Contract.ExternalID). The store records it so status/list reads
+	// can surface it and so the reconcile can round-trip it through the container's
+	// wisp.external_id label. Opaque to the store; empty when the caller supplied none.
+	ExternalID string
 }
 
 // ErrInvalidTTL is returned by Create when the requested TTL is not positive.
@@ -105,6 +111,7 @@ func (s *Store) Create(p CreateParams) (Contract, error) {
 		ReservedCPUs:     p.ReservedCPUs,
 		ReservedMemoryMB: p.ReservedMemoryMB,
 		Meta:             p.Meta,
+		ExternalID:       p.ExternalID,
 		State:            StateRequested,
 		CreatedAt:        created,
 		ExpiresAt:        created.Add(p.TTL),
@@ -144,16 +151,25 @@ type AdoptParams struct {
 	// or malformed (see the reconcile), which still counts one contract slot.
 	ReservedCPUs     float64
 	ReservedMemoryMB int
+
+	// ExternalID is the caller-supplied opaque identifier recovered from the
+	// container's wisp.external_id label so the reconciled contract surfaces the
+	// same identifier on list/status reads as the original create call did. Empty
+	// when the container carried no such label.
+	ExternalID string
 }
 
 // Adopt records a tracking entry for a pre-existing container discovered during
 // startup reconciliation. The contract is rebuilt in StateReady so the reaper
 // treats it like any live lease: still-valid ones keep being tracked, and ones
 // already past ExpiresAt are reaped (their container killed) on the reaper's
-// first sweep. It has no bearer token — a reconciled lease cannot be driven via
-// exec/shell, only tracked to expiry — and no client Meta, which did not survive
-// the restart. A no-op if the id is already tracked, so re-running the reconcile
-// never clobbers a live contract. Returns a copy of the tracked contract.
+// first sweep. It generates a FRESH bearer token so the reconciled contract can
+// be driven via exec/shell — the original token died with the prior wispd's
+// memory, and re-issuing one here lets an authenticated local agent recovering
+// its lease map re-associate the container with a working credential (client
+// Meta did not survive the restart, so it is left nil). A no-op if the id is
+// already tracked, so re-running the reconcile never clobbers a live contract or
+// its previously issued token. Returns a copy of the tracked contract.
 func (s *Store) Adopt(p AdoptParams) (Contract, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -169,7 +185,9 @@ func (s *Store) Adopt(p AdoptParams) (Contract, error) {
 		GPUDeviceIDs:     cloneIDs(p.GPUDeviceIDs),
 		ReservedCPUs:     p.ReservedCPUs,
 		ReservedMemoryMB: p.ReservedMemoryMB,
+		ExternalID:       p.ExternalID,
 		CreatedAt:        s.now(),
+		Token:            s.newToken(),
 	}
 	s.contracts[p.ID] = c
 	return *c, nil

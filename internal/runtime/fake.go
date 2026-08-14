@@ -313,7 +313,7 @@ func (f *Fake) ListLeased(ctx context.Context) ([]LeasedContainer, error) {
 	out := make([]LeasedContainer, 0, len(f.containers))
 	for _, c := range f.containers {
 		if _, ok := c.Opts.Labels[ContractLabel]; ok {
-			out = append(out, LeasedContainer{ID: c.ID, Labels: c.Opts.Labels})
+			out = append(out, LeasedContainer{ID: c.ID, Labels: c.Opts.Labels, Running: c.Started && !c.Killed})
 		}
 	}
 	return out, nil

@@ -392,7 +392,11 @@ func (d *DockerRuntime) ListLeased(ctx context.Context) ([]LeasedContainer, erro
 	}
 	out := make([]LeasedContainer, 0, len(list))
 	for _, c := range list {
-		out = append(out, LeasedContainer{ID: c.ID, Labels: c.Labels})
+		// c.State is the daemon's coarse container state ("running", "exited",
+		// "created", "dead", "restarting", "paused", "removing"); only "running"
+		// represents a live lease. Non-running values collapse to Running=false
+		// so the reconcile can drop stopped orphans without adopting them.
+		out = append(out, LeasedContainer{ID: c.ID, Labels: c.Labels, Running: c.State == "running"})
 	}
 	return out, nil
 }

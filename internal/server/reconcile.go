@@ -19,18 +19,29 @@ import (
 // consumer's secrets in their environment and no daemon to enforce their TTL.
 //
 // It queries the runtime for every container carrying the wisp.contract label
-// and, for each, recovers the contract id (wisp.contract) and absolute expiry
-// (wisp.expires_at, Unix seconds) and re-adopts a tracking entry in StateReady.
-// The reaper then treats them like any live lease on its next sweep: containers
-// already past their expiry are killed and marked expired, and still-valid ones
-// resume being tracked to their TTL. Callers MUST run this before the reaper
-// starts so no orphan is missed on the first sweep.
+// (running or stopped, so orphans from a host reboot are visible too) and, for
+// each RUNNING container with well-formed labels, recovers the contract id
+// (wisp.contract) and absolute expiry (wisp.expires_at, Unix seconds) and
+// re-adopts a tracking entry in StateReady. The reaper then treats them like
+// any live lease on its next sweep: containers already past their expiry are
+// killed and marked expired, and still-valid ones resume being tracked to their
+// TTL. Callers MUST run this before the reaper starts so no orphan is missed on
+// the first sweep.
 //
-// Reconcile is tolerant of a container whose labels are missing or malformed: it
-// logs and skips that container rather than failing the whole reconcile, so one
-// bad label never blocks recovery of the rest. A failure to even list containers
-// is logged and returns without adopting anything — a best-effort recovery must
-// never keep the daemon from starting.
+// A non-running container carrying the contract label is a dead lease from a
+// prior wispd — its process is no longer running and no capacity is truly held
+// by it. Reconcile does NOT adopt it (which would reserve full capacity for a
+// container that isn't consuming any and could report the host at_capacity while
+// idle) and instead force-removes it (rt.Kill), so a `docker ps -a` after
+// startup no longer shows stale wisp containers.
+//
+// A container whose labels are missing or malformed cannot be tracked (there is
+// no trustworthy id or expiry to enforce a TTL against) but carries wisp.contract
+// so it is unambiguously ours; leaving it running would be worse than removing it,
+// so Reconcile force-removes it with a clear warn log rather than skipping it and
+// letting an unaccounted-for container linger forever. A failure to even list
+// containers is logged and returns without adopting anything — a best-effort
+// recovery must never keep the daemon from starting.
 //
 // alloc, when non-nil, is the exclusive GPU device allocator: for each adopted
 // lease carrying GPU devices (the wisp.gpus label), Reconcile reserves those
@@ -57,20 +68,45 @@ func Reconcile(ctx context.Context, store *contract.Store, rt runtime.Runtime, a
 
 	adopted := 0
 	for _, lc := range containers {
+		// A non-running container is a dead lease from a prior wispd (a host
+		// reboot left it Exited, or the daemon killed it out of band). It holds
+		// no live process, and adopting it would falsely reserve its full
+		// capacity for a container that isn't consuming any. Force-remove it so
+		// `docker ps -a` no longer shows the stale artifact, and never reserve
+		// capacity for it.
+		if !lc.Running {
+			if err := rt.Kill(ctx, lc.ID); err != nil {
+				logger.Warn("reconcile: remove non-running leased container failed",
+					"container_id", lc.ID, "contract_id", lc.Labels[contractLabel], "error", err)
+			} else {
+				logger.Info("reconcile: removed non-running leased container (not adopted, no capacity reserved)",
+					"container_id", lc.ID, "contract_id", lc.Labels[contractLabel])
+			}
+			continue
+		}
 		id := lc.Labels[contractLabel]
 		if id == "" {
 			// The runtime filtered on the label's presence, so an empty value here
-			// means a malformed label; skip it rather than track an id-less lease.
-			logger.Warn("reconcile: container has missing contract label; skipping", "container_id", lc.ID)
+			// means a malformed label. The container is unambiguously ours but has
+			// no trustworthy id to track it by; leaving it running unaccounted-for
+			// is worse than removing it, so force-remove it.
+			logger.Warn("reconcile: container has missing contract label; removing", "container_id", lc.ID)
+			if err := rt.Kill(ctx, lc.ID); err != nil {
+				logger.Warn("reconcile: remove malformed-label container failed", "container_id", lc.ID, "error", err)
+			}
 			continue
 		}
 		expiresAt, ok := parseExpiresAt(lc.Labels[expiresAtLabel])
 		if !ok {
-			// Without a trustworthy expiry the reaper cannot enforce a TTL, so skip
-			// the container rather than adopt a lease that would never (or wrongly)
-			// expire. This is logged so an operator can see the orphan was left.
-			logger.Warn("reconcile: contract has missing or malformed expiry label; skipping",
+			// Without a trustworthy expiry the reaper cannot enforce a TTL, and
+			// leaving the container running unaccounted-for would let a lease
+			// outlive its intended TTL forever. Force-remove it instead.
+			logger.Warn("reconcile: contract has missing or malformed expiry label; removing",
 				"contract_id", id, "container_id", lc.ID, "expires_at", lc.Labels[expiresAtLabel])
+			if err := rt.Kill(ctx, lc.ID); err != nil {
+				logger.Warn("reconcile: remove malformed-label container failed",
+					"contract_id", id, "container_id", lc.ID, "error", err)
+			}
 			continue
 		}
 		gpuIDs := parseGPUsLabel(lc.Labels[gpusLabel])

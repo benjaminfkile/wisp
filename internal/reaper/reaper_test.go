@@ -288,8 +288,13 @@ func TestReaperSkipsTerminalAndUntimely(t *testing.T) {
 	rp.Tick(context.Background())
 	rp.Tick(context.Background()) // idempotent
 
-	if got, _ := store.Get(released.ID); got.State != contract.StateReleased {
-		t.Errorf("released contract State = %q, want released", got.State)
+	// The released contract is a terminal-at-start-of-tick lease that the reaper's
+	// cleanup sweep removes so the store does not grow unboundedly. What matters
+	// for "skips terminal" is that no unexpected transition fired (asserted via
+	// the Notify hook above) and that the container was not touched — the removal
+	// itself is expected.
+	if _, err := store.Get(released.ID); !errors.Is(err, contract.ErrNotFound) {
+		t.Errorf("released contract lookup err = %v, want ErrNotFound after cleanup sweep", err)
 	}
 	if got, _ := store.Get(fresh.ID); got.State != contract.StateReady {
 		t.Errorf("fresh contract State = %q, want ready", got.State)
@@ -438,8 +443,12 @@ func TestReaperDeadContainerFreesCapacityExactlyOnce(t *testing.T) {
 	if freed != 1 {
 		t.Fatalf("ReleaseCapacity fired %d times across 5 ticks; want exactly 1", freed)
 	}
-	if got, _ := store.Get(c.ID); got.State != contract.StateExpired {
-		t.Errorf("state = %q, want %q", got.State, contract.StateExpired)
+	// After the first tick the contract is expired; a subsequent tick's cleanup
+	// sweep removes it (it was terminal at start of tick), so five ticks in it is
+	// gone from the store. What matters here is exactly-once capacity release
+	// across those ticks, which is asserted above.
+	if _, err := store.Get(c.ID); !errors.Is(err, contract.ErrNotFound) {
+		t.Errorf("Get after 5 ticks err = %v, want ErrNotFound (terminal contract cleaned up)", err)
 	}
 }
 

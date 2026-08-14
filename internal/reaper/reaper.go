@@ -163,12 +163,32 @@ func (r *Reaper) Run(ctx context.Context) {
 	}
 }
 
-// Tick performs a single sweep of the store, applying every due transition. It
-// is exported so tests drive the reaper deterministically (set the clock, call
-// Tick) and so callers can force a reconcile on demand.
+// Tick performs a single sweep of the store, applying every due transition,
+// and drops from the store any contract that was ALREADY terminal when the
+// sweep began, so the store (and this tick's List() walk) do not grow
+// unboundedly across restarts and long-running hosts. A contract this tick
+// itself transitioned to terminal is left in place for one full tick so a
+// polling caller can still observe the terminal state once before it is
+// removed. It is exported so tests drive the reaper deterministically (set
+// the clock, call Tick) and so callers can force a reconcile on demand.
 func (r *Reaper) Tick(ctx context.Context) {
-	for _, c := range r.store.List() {
+	contracts := r.store.List()
+	// Snapshot which contracts were already terminal before reap runs, so a lease
+	// this tick moves to terminal does not get deleted in the same tick — polling
+	// callers can still observe the transition once.
+	terminalBefore := make([]string, 0)
+	for _, c := range contracts {
+		if c.State.Terminal() {
+			terminalBefore = append(terminalBefore, c.ID)
+		}
+	}
+	for _, c := range contracts {
 		r.reap(ctx, c)
+	}
+	for _, id := range terminalBefore {
+		if err := r.store.Delete(id); err != nil && !errors.Is(err, contract.ErrNotFound) {
+			r.logger.Debug("reaper: delete terminal contract", "contract_id", id, "error", err)
+		}
 	}
 }
 

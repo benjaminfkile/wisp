@@ -125,6 +125,13 @@ type Contract struct {
 	// Opaque to Wisp.
 	Meta map[string]any
 
+	// ExternalID is an opaque caller-supplied identifier (e.g. an upstream lease
+	// id) that the create endpoint accepted. It is persisted on the container's
+	// wisp.external_id label so it survives a wispd restart's reconcile, and is
+	// surfaced on list/status reads so an upstream agent can re-associate leases
+	// it owns after wispd restarts. Empty when the caller supplied none.
+	ExternalID string
+
 	// State is the current lifecycle state.
 	State State
 

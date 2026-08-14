@@ -230,27 +230,23 @@ func TestReaperReapsDeadContainerFreesCapacityAndImagesReflects(t *testing.T) {
 	rp.Tick(nil)
 	rp.Tick(nil)
 
-	if got, _ := store.Get(created.ContractID); got.State != contract.StateExpired {
-		t.Fatalf("state = %q, want %q after dead-container reap", got.State, contract.StateExpired)
+	// After three ticks the contract has been expired (first tick) and then
+	// cleaned up (a terminal-at-start tick removes it), so a subsequent Get
+	// reports it missing. What matters here is exactly-once capacity release —
+	// asserted below via the aggregate usage — not that a terminal record lingers.
+	if _, err := store.Get(created.ContractID); !errors.Is(err, contract.ErrNotFound) {
+		t.Fatalf("store.Get after 3 ticks err = %v, want ErrNotFound (terminal contract cleaned up)", err)
 	}
 	if b.cap.ActiveContracts() != 0 || b.cap.UsedCPUs() != 0 || b.cap.UsedMemoryMB() != 0 {
 		t.Fatalf("post-reap usage = {%d, %v, %d}, want all zero (exactly-once free)",
 			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
 	}
 
-	// GET /contracts/{id} reports the terminal state, not "ready".
+	// GET /contracts/{id} for a cleaned-up contract is a 404 — the reaper's
+	// cleanup sweep removed it after it went terminal.
 	rec := doAuth(t, h, http.MethodGet, "/contracts/"+created.ContractID, created.Token, "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /contracts status = %d (body: %s)", rec.Code, rec.Body.String())
-	}
-	var got struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("decode status: %v (body: %s)", err, rec.Body.String())
-	}
-	if got.Status != string(contract.StateExpired) {
-		t.Errorf("GET /contracts status = %q, want %q", got.Status, contract.StateExpired)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET /contracts status = %d, want 404 after cleanup (body: %s)", rec.Code, rec.Body.String())
 	}
 
 	// GET /images capacity block reflects the freed usage.

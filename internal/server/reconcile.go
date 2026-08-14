@@ -121,7 +121,8 @@ func Reconcile(ctx context.Context, store *contract.Store, rt runtime.Runtime, a
 				"contract_id", id, "container_id", lc.ID,
 				"cpus", lc.Labels[cpusLabel], "memory_mb", lc.Labels[memoryMBLabel])
 		}
-		if _, err := store.Adopt(contract.AdoptParams{ID: id, ContainerID: lc.ID, ExpiresAt: expiresAt, GPUDeviceIDs: gpuIDs, ReservedCPUs: cpus, ReservedMemoryMB: memoryMB}); err != nil {
+		externalID := lc.Labels[externalIDLabel]
+		if _, err := store.Adopt(contract.AdoptParams{ID: id, ContainerID: lc.ID, ExpiresAt: expiresAt, GPUDeviceIDs: gpuIDs, ReservedCPUs: cpus, ReservedMemoryMB: memoryMB, ExternalID: externalID}); err != nil {
 			logger.Error("reconcile: adopt contract", "contract_id", id, "container_id", lc.ID, "error", err)
 			continue
 		}

@@ -69,6 +69,14 @@ const (
 	MemoryMBLabel = "wisp.memory_mb"
 )
 
+// ExternalIDLabel is the Docker label carrying a caller-supplied opaque
+// identifier the create endpoint accepted (e.g. an upstream lease id). It is
+// written at create time alongside ContractLabel so a wispd restart can restore
+// the mapping from surviving containers' labels alone (see the startup reconcile),
+// which lets an upstream agent re-associate leases it owns after a wispd restart.
+// It is omitted when the create call carried no external_id.
+const ExternalIDLabel = "wisp.external_id"
+
 // ErrNotFound is returned when an operation references a container id that the
 // runtime does not know about (never created, or already destroyed).
 var ErrNotFound = errors.New("runtime: container not found")

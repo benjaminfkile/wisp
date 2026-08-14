@@ -430,7 +430,8 @@ Single Go binary (daemon). Suggested pieces:
 ## 10. API surface (v0 sketch)
 
 ```
-POST   /contracts                     create + boot + run userdata
+POST   /contracts                     create + boot + run userdata (optional external_id)
+GET    /contracts                     list every non-terminal contract (id, external_id, current token, status, expiry, reserved cpus/mem, gpus)
 GET    /contracts/:id                 status, time remaining
 DELETE /contracts/:id                 release now (destroy container)
 POST   /contracts/:id/exec            run a command (sync)         { command }
@@ -442,8 +443,11 @@ WS     /events                        subscribe (with filter)
 GET    /images                        os + allow-list + default + limits + effective isolation + gpu + capacity (unauthenticated, §7)
 GET    /healthz                       liveness
 
-Auth: Authorization: Bearer <contract token> on contract-scoped calls;
-      per-satellite app token to create contracts / use the bus.
+Auth: Authorization: Bearer <contract token> on /exec and /shell;
+      GET /contracts and POST /contracts require the app token;
+      GET /contracts/:id and DELETE /contracts/:id accept EITHER the app token
+      or the per-contract token;
+      per-satellite app token to use the bus.
 ```
 
 ## 11. End-to-end walkthrough — a "task runner" satellite

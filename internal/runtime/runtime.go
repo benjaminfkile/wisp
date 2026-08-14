@@ -83,6 +83,15 @@ type LeasedContainer struct {
 
 	// Labels is the container's complete label map as reported by the runtime.
 	Labels map[string]string
+
+	// Running reports whether the container was in the running state when
+	// ListLeased observed it. ListLeased returns containers regardless of state
+	// (so the startup reconcile can also see stopped orphans and clean them up),
+	// but only running ones represent live leases whose capacity must be
+	// re-reserved and whose TTL is still being enforced. A stopped container
+	// carrying the contract label is an artifact of a prior wispd's exit (or a
+	// host reboot) and must not be adopted as if it were live.
+	Running bool
 }
 
 // ErrNotRunning is returned when an exec is attempted against a container that

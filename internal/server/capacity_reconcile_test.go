@@ -13,9 +13,11 @@ import (
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
-// leasedCap builds a LeasedContainer carrying the contract, expiry, and (when
-// non-empty) the capacity labels, so a reconcile test can drive the parse path
-// directly without provisioning a real container.
+// leasedCap builds a running LeasedContainer carrying the contract, expiry, and
+// (when non-empty) the capacity labels, so a reconcile test can drive the parse
+// path directly without provisioning a real container. Running=true because
+// only running containers are adopted (a stopped one is removed and its
+// capacity is never reserved — see Reconcile).
 func leasedCap(containerID, contractID, expiresAt, cpus, memoryMB string) runtime.LeasedContainer {
 	labels := map[string]string{contractLabel: contractID}
 	if expiresAt != "" {
@@ -27,7 +29,7 @@ func leasedCap(containerID, contractID, expiresAt, cpus, memoryMB string) runtim
 	if memoryMB != "" {
 		labels[memoryMBLabel] = memoryMB
 	}
-	return runtime.LeasedContainer{ID: containerID, Labels: labels}
+	return runtime.LeasedContainer{ID: containerID, Labels: labels, Running: true}
 }
 
 // A create writes the POST-CLAMP reserved cpus/memory on the container labels, and

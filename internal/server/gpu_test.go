@@ -315,7 +315,7 @@ func TestGPUsLabelRoundTripThroughReconcile(t *testing.T) {
 	store := contract.NewStore()
 	alloc := gpu.NewAllocator([]string{"GPU-0", "GPU-1", "GPU-2"})
 	fake := runtime.NewFake()
-	fake.LeasedContainers = []runtime.LeasedContainer{{ID: "cont-1", Labels: opts.Labels}}
+	fake.LeasedContainers = []runtime.LeasedContainer{{ID: "cont-1", Labels: opts.Labels, Running: true}}
 
 	Reconcile(ctx, store, fake, alloc, nil, discardLogger())
 
@@ -350,10 +350,10 @@ func TestReconcileRebuildsOccupancyAcrossRestart(t *testing.T) {
 
 	expiry := strconv.FormatInt(time.Unix(1_900_000_000, 0).Unix(), 10)
 	fake.LeasedContainers = []runtime.LeasedContainer{
-		{ID: "cont-a", Labels: map[string]string{contractLabel: "contract-a", expiresAtLabel: expiry, gpusLabel: "GPU-0,GPU-1"}},
+		{ID: "cont-a", Labels: map[string]string{contractLabel: "contract-a", expiresAtLabel: expiry, gpusLabel: "GPU-0,GPU-1"}, Running: true},
 		// contract-b references GPU-2 (still present) and GPU-gone (removed since
 		// launch): the reconcile reserves GPU-2 and logs/skips GPU-gone.
-		{ID: "cont-b", Labels: map[string]string{contractLabel: "contract-b", expiresAtLabel: expiry, gpusLabel: "GPU-2,GPU-gone"}},
+		{ID: "cont-b", Labels: map[string]string{contractLabel: "contract-b", expiresAtLabel: expiry, gpusLabel: "GPU-2,GPU-gone"}, Running: true},
 	}
 
 	Reconcile(ctx, store, fake, alloc, nil, discardLogger())

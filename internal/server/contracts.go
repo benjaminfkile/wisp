@@ -424,9 +424,11 @@ type contractInfo struct {
 	// authenticated local agent is acceptable for v1 (see docs/DESIGN.md §8).
 	Token string `json:"token"`
 
-	// Status is the current lifecycle state (one of provisioning|ready|expiring —
-	// terminal contracts are excluded from the list, requested is the transient
-	// pre-provision state).
+	// Status is the current lifecycle state, exactly one of
+	// provisioning|ready|expiring. Terminal contracts (released|expired) are
+	// excluded from the list, and the transient pre-provision state (requested)
+	// is also excluded so the wire never leaks a status outside this enum (see
+	// the list handler); consumers may treat those three as an exhaustive set.
 	Status string `json:"status"`
 
 	// ExpiresAt is the contract's absolute expiry as Unix seconds.
@@ -1050,13 +1052,24 @@ func (b *broker) get(w http.ResponseWriter, r *http.Request) {
 // (see docs/DESIGN.md §7). The endpoint is app-token-gated (see routes) and
 // local-only, so surfacing tokens to the authenticated caller is acceptable
 // for v1. Terminal contracts are excluded so a lease already reaped or released
-// never appears in the list.
+// never appears in the list. StateRequested contracts are ALSO excluded: it is
+// the transient pre-provision state a create call passes through between
+// store.Create and the provision path's UpdateState(StateProvisioning), so an
+// observer catching a contract mid-flight would otherwise see a status outside
+// the documented list enum (provisioning|ready|expiring) that consumers were
+// built against. A requested contract has no container id yet either, so it is
+// useless to a resyncing agent — skipping it costs nothing.
 func (b *broker) list(w http.ResponseWriter, r *http.Request) {
 	all := b.store.List()
 	now := b.now()
 	out := contractsListResponse{Contracts: make([]contractInfo, 0, len(all))}
 	for _, c := range all {
 		if c.State.Terminal() {
+			continue
+		}
+		// Skip the transient pre-provision state so the list never emits a
+		// "requested" status the wire contract does not document.
+		if c.State == contract.StateRequested {
 			continue
 		}
 		remaining := 0

@@ -1,15 +1,22 @@
 package reaper
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/benjaminfkile/wisp/internal/contract"
 	"github.com/benjaminfkile/wisp/internal/runtime"
+	dockertypes "github.com/docker/docker/api/types"
+	dockercontainer "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/system"
+	dockerclient "github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 )
 
 // discardLogger keeps test output quiet.
@@ -561,6 +568,80 @@ func TestReaperInspectSkipsProvisioning(t *testing.T) {
 	got, _ := store.Get(c.ID)
 	if got.State != contract.StateProvisioning {
 		t.Errorf("state = %q, want still provisioning", got.State)
+	}
+}
+
+// dockerNotFoundStubClient embeds the full Docker APIClient (left nil) and
+// overrides Info (for construction) plus ContainerInspect and ContainerRemove
+// so the reaper can drive a DockerRuntime whose backing daemon reports both the
+// inspect and the remove as docker-style not-found — the exact shape produced
+// by a live daemon after a container is removed out of band (docker rm, an
+// auto-remove after exit, etc.). Anything else would panic, which is fine: the
+// reaper's expire path only calls Inspect and Kill on the runtime.
+type dockerNotFoundStubClient struct {
+	dockerclient.APIClient
+}
+
+func (dockerNotFoundStubClient) Info(context.Context) (system.Info, error) {
+	return system.Info{OSType: "linux"}, nil
+}
+
+func (dockerNotFoundStubClient) ContainerInspect(context.Context, string) (dockertypes.ContainerJSON, error) {
+	return dockertypes.ContainerJSON{}, errdefs.NotFound(errors.New("No such container"))
+}
+
+func (dockerNotFoundStubClient) ContainerRemove(context.Context, string, dockercontainer.RemoveOptions) error {
+	return errdefs.NotFound(errors.New("No such container"))
+}
+
+// TestReaperNoErrorLogOnDockerNotFoundKill covers AC 215: a container the
+// daemon reports as gone (docker rm out of band, auto-remove after exit) is
+// reaped through the LivenessGone path without an ERROR log. The regression it
+// pins is a Kill implementation that wrapped the docker not-found error and
+// never returned runtime.ErrNotFound, so reaper.expire logged
+// "reaper: kill container" on every out-of-band removal — the exact scenario
+// the container-death detection was built for. The test uses a real
+// DockerRuntime backed by a stub client returning docker-style not-found (NOT
+// the fake runtime, whose Kill already returns the pre-mapped ErrNotFound and
+// therefore masks the bug).
+func TestReaperNoErrorLogOnDockerNotFoundKill(t *testing.T) {
+	store := contract.NewStore()
+	rt := runtime.NewDockerRuntimeWithClient(dockerNotFoundStubClient{})
+
+	// A ready contract with a container id the daemon does not know about — the
+	// LivenessGone shape. Adopt sets the fields directly so we do not need to
+	// drive a Fake through create/start.
+	future := time.Unix(2_000_000_000, 0)
+	adopted, err := store.Adopt(contract.AdoptParams{
+		ID:          "gone-contract",
+		ContainerID: "vanished-cid",
+		ExpiresAt:   future,
+	})
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	rp := New(store, rt, Options{
+		Lead:   time.Minute,
+		Logger: logger,
+		// Well before the TTL: only the LivenessGone signal (via Inspect) can
+		// trigger the reap.
+		Now: func() time.Time { return future.Add(-time.Hour) },
+	})
+
+	rp.Tick(context.Background())
+
+	if got, _ := store.Get(adopted.ID); got.State != contract.StateExpired {
+		t.Fatalf("state = %q, want expired after out-of-band container removal", got.State)
+	}
+	out := logs.String()
+	if strings.Contains(out, "level=ERROR") {
+		t.Errorf("reaper logged an ERROR on the LivenessGone reap path; the docker not-found from Kill must map to runtime.ErrNotFound and be suppressed. logs:\n%s", out)
+	}
+	if strings.Contains(out, "reaper: kill container") {
+		t.Errorf("reaper logged a kill-container error message; want silent suppression on LivenessGone. logs:\n%s", out)
 	}
 }
 

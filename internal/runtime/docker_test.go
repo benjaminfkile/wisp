@@ -11,6 +11,7 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -359,6 +360,64 @@ func TestDockerRuntimeCreateGPUDeviceRequests(t *testing.T) {
 		}
 		if _, err := d.Create(ctx, "img", opts); !errors.Is(err, ErrGPUAttachUnsupported) {
 			t.Fatalf("Create error = %v, want ErrGPUAttachUnsupported", err)
+		}
+	})
+}
+
+// killStubClient embeds the Docker APIClient (left nil) and overrides only
+// Info (for construction) and ContainerRemove (what Kill calls). A test sets
+// removeErr to the error the daemon should return.
+type killStubClient struct {
+	client.APIClient
+	removeErr error
+}
+
+func (c *killStubClient) Info(context.Context) (system.Info, error) {
+	return system.Info{OSType: "linux"}, nil
+}
+
+func (c *killStubClient) ContainerRemove(context.Context, string, container.RemoveOptions) error {
+	return c.removeErr
+}
+
+// TestDockerRuntimeKillMapsNotFound verifies DockerRuntime.Kill maps the docker
+// client's not-found error to runtime.ErrNotFound, the same way Inspect does —
+// so reaper.expire's errors.Is(err, ErrNotFound) suppression correctly covers
+// containers removed out of band (the LivenessGone case the container-death
+// detection was built for) rather than logging a spurious ERROR every time.
+// Other errors are wrapped through unchanged.
+func TestDockerRuntimeKillMapsNotFound(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("docker not-found maps to ErrNotFound", func(t *testing.T) {
+		stub := &killStubClient{removeErr: errdefs.NotFound(errors.New("No such container: abc"))}
+		d := NewDockerRuntimeWithClient(stub)
+		if err := d.Kill(ctx, "abc"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Kill error = %v, want to match ErrNotFound", err)
+		}
+	})
+
+	t.Run("other errors are wrapped", func(t *testing.T) {
+		boom := errors.New("daemon unreachable")
+		stub := &killStubClient{removeErr: boom}
+		d := NewDockerRuntimeWithClient(stub)
+		err := d.Kill(ctx, "abc")
+		if err == nil {
+			t.Fatal("Kill returned nil, want an error")
+		}
+		if errors.Is(err, ErrNotFound) {
+			t.Fatalf("Kill error = %v, must not match ErrNotFound for a non-not-found failure", err)
+		}
+		if !errors.Is(err, boom) {
+			t.Fatalf("Kill error = %v, want to wrap %v", err, boom)
+		}
+	})
+
+	t.Run("no error passes through", func(t *testing.T) {
+		stub := &killStubClient{}
+		d := NewDockerRuntimeWithClient(stub)
+		if err := d.Kill(ctx, "abc"); err != nil {
+			t.Fatalf("Kill = %v, want nil on a successful remove", err)
 		}
 	})
 }

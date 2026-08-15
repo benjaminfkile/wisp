@@ -348,9 +348,16 @@ func (d *DockerRuntime) Start(ctx context.Context, id string) error {
 }
 
 // Kill implements Runtime. It force-removes the container (stopping it first),
-// so the id is no longer valid afterwards.
+// so the id is no longer valid afterwards. A "no such container" response from
+// the daemon maps to ErrNotFound so the reaper's expire path (which suppresses
+// only that sentinel via errors.Is) does not log a spurious ERROR every time it
+// reaps a container that was removed out of band — the exact LivenessGone case
+// the container-death detection was built for. Any other error is wrapped.
 func (d *DockerRuntime) Kill(ctx context.Context, id string) error {
 	if err := d.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}); err != nil {
+		if client.IsErrNotFound(err) {
+			return ErrNotFound
+		}
 		return fmt.Errorf("runtime: kill container %s: %w", id, err)
 	}
 	return nil
@@ -360,10 +367,14 @@ func (d *DockerRuntime) Kill(ctx context.Context, id string) error {
 // state. A "no such container" response from the daemon means the container was
 // removed out of band and maps to LivenessGone (not an error — that is an
 // ordinary observation the reaper acts on). Otherwise the daemon's live
-// State.Running flag decides between LivenessRunning and LivenessStopped, so
-// exited, dead, restarting, paused, removing, and created all collapse into
-// LivenessStopped uniformly. Any other error (e.g. daemon unreachable) is
-// wrapped and returned so the caller can treat it as inconclusive.
+// State.Running flag decides between LivenessRunning and LivenessStopped: a
+// paused or restarting container keeps State.Running=true on the daemon side
+// (see the docker daemon's SetRestarting / pause.go), so both map to
+// LivenessRunning — the SAFE mapping (no false-positive reap of a container
+// that is only paused or bouncing), which is what the reaper wants; only
+// created, exited, dead, and removing (all State.Running=false) collapse into
+// LivenessStopped. Any other error (e.g. daemon unreachable) is wrapped and
+// returned so the caller can treat it as inconclusive.
 func (d *DockerRuntime) Inspect(ctx context.Context, id string) (LivenessState, error) {
 	info, err := d.cli.ContainerInspect(ctx, id)
 	if err != nil {

@@ -1773,6 +1773,96 @@ func TestListContractsRawJSONShape(t *testing.T) {
 	}
 }
 
+// TestListContractsExcludesRequested covers AC 216: a contract observed in the
+// transient pre-provision state (store.Create returns StateRequested, provision
+// then flips it to StateProvisioning) MUST NOT appear in GET /contracts, so the
+// wire never emits a "status":"requested" outside the documented enum
+// (provisioning|ready|expiring) that consumers were built against. The window is
+// sub-millisecond in production; a store.Adopt with no state advance is used to
+// pin a contract in StateRequested deterministically, and every non-Requested
+// state is also walked through to prove the list surfaces those. A requested
+// contract carries no container id yet either, so a resyncing agent loses
+// nothing.
+func TestListContractsExcludesRequested(t *testing.T) {
+	h, store, _ := testServer(t)
+
+	// A ready contract that MUST appear.
+	ready := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	// A contract pinned in StateRequested. store.Create leaves a contract in
+	// exactly that state (the provision path is what flips it to
+	// StateProvisioning), so calling it directly recreates the sub-millisecond
+	// window a caller might observe between store.Create and
+	// UpdateState(StateProvisioning) inside broker.provision.
+	pending, err := store.Create(contract.CreateParams{TTL: time.Hour})
+	if err != nil {
+		t.Fatalf("store.Create: %v", err)
+	}
+	if pending.State != contract.StateRequested {
+		t.Fatalf("pending state = %q, want %q (test premise)", pending.State, contract.StateRequested)
+	}
+
+	rec := do(t, h, http.MethodGet, "/contracts", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got contractsListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// The list contains only the ready contract; the requested one is skipped.
+	if len(got.Contracts) != 1 {
+		t.Fatalf("contracts len = %d, want 1 (requested contract must be excluded)", len(got.Contracts))
+	}
+	if got.Contracts[0].ID != ready.ContractID {
+		t.Errorf("contracts[0].ID = %q, want %q", got.Contracts[0].ID, ready.ContractID)
+	}
+	// Every surfaced status must fall inside the documented enum.
+	allowed := map[string]bool{
+		string(contract.StateProvisioning): true,
+		string(contract.StateReady):        true,
+		string(contract.StateExpiring):     true,
+	}
+	for _, c := range got.Contracts {
+		if !allowed[c.Status] {
+			t.Errorf("status = %q, want one of provisioning|ready|expiring", c.Status)
+		}
+	}
+
+	// Advance the pinned contract through the remaining non-terminal states and
+	// confirm each surfaces cleanly (the enum is exhaustive from the wire's
+	// perspective).
+	for _, next := range []contract.State{contract.StateProvisioning, contract.StateReady, contract.StateExpiring} {
+		if _, err := store.UpdateState(pending.ID, next); err != nil {
+			t.Fatalf("UpdateState %q: %v", next, err)
+		}
+		rec := do(t, h, http.MethodGet, "/contracts", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status after %q = %d, want 200", next, rec.Code)
+		}
+		var listed contractsListResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+			t.Fatalf("decode after %q: %v", next, err)
+		}
+		found := false
+		for _, c := range listed.Contracts {
+			if c.ID == pending.ID {
+				found = true
+				if c.Status != string(next) {
+					t.Errorf("status for %q = %q, want %q", pending.ID, c.Status, next)
+				}
+			}
+			if !allowed[c.Status] {
+				t.Errorf("status %q outside documented enum after %q", c.Status, next)
+			}
+		}
+		if !found {
+			t.Errorf("pending contract missing from list after %q transition", next)
+		}
+	}
+}
+
 // GET /contracts without the app token returns 401; with the token it succeeds.
 // Covers acceptance criterion 159 (list-side).
 func TestListContractsRequiresAppToken(t *testing.T) {

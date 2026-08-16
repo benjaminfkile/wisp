@@ -683,6 +683,183 @@ func TestDeleteIdempotent(t *testing.T) {
 	}
 }
 
+// A DELETE against an ALREADY-expired contract is an idempotent success (never a
+// 500), and it must NOT double-free the lease's reserved host capacity: the
+// terminal transition that expired it already freed capacity, so the release
+// handler's no-op path skips the free. Live-repro'd during the 2026-08-16
+// failure drill (the manager retried release after the reaper had already
+// expired the contract).
+func TestDeleteExpiredContractIsIdempotentNoop(t *testing.T) {
+	b, h, store, _ := capBroker(t, budgetPolicy(0, 4, 512))
+
+	created := createContract(t, h, `{"ttl_seconds":600,"resources":{"cpus":2,"memory_mb":256}}`)
+	if b.cap.ActiveContracts() != 1 || b.cap.UsedCPUs() != 2 || b.cap.UsedMemoryMB() != 256 {
+		t.Fatalf("usage after create = {%d, %v, %d}, want {1, 2, 256}",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+
+	// Simulate the reaper having already expired the contract: force the
+	// terminal transition through the store and free the capacity exactly as
+	// the reaper's expire path does (gated on the winning transition).
+	c, _ := store.Get(created.ContractID)
+	if _, err := store.UpdateState(c.ID, contract.StateExpired); err != nil {
+		t.Fatalf("simulate reaper expire: %v", err)
+	}
+	b.cap.Free(c.ReservedCPUs, c.ReservedMemoryMB)
+	if b.cap.ActiveContracts() != 0 || b.cap.UsedCPUs() != 0 || b.cap.UsedMemoryMB() != 0 {
+		t.Fatalf("usage after simulated expiry = {%d, %v, %d}, want all zero",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+
+	// DELETE of the already-expired contract must succeed with a normal status
+	// response — never 500.
+	rec := do(t, h, http.MethodDelete, "/contracts/"+created.ContractID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got statusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Status != string(contract.StateExpired) {
+		t.Errorf("status = %q, want expired (idempotent path echoes current state)", got.Status)
+	}
+
+	// Capacity must NOT be double-freed by the idempotent no-op path.
+	if b.cap.ActiveContracts() != 0 || b.cap.UsedCPUs() != 0 || b.cap.UsedMemoryMB() != 0 {
+		t.Errorf("usage after idempotent DELETE = {%d, %v, %d}, want all zero (no double free)",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+}
+
+// A DELETE against an ALREADY-released contract is also an idempotent success
+// with no capacity double-free — the released-then-released case, distinct from
+// the expired-then-released case above.
+func TestDeleteReleasedContractIsIdempotentNoop(t *testing.T) {
+	b, h, _, _ := capBroker(t, budgetPolicy(0, 4, 512))
+
+	created := createContract(t, h, `{"ttl_seconds":600,"resources":{"cpus":2,"memory_mb":256}}`)
+
+	// First DELETE: authoritative release, frees capacity exactly once.
+	if rec := do(t, h, http.MethodDelete, "/contracts/"+created.ContractID, ""); rec.Code != http.StatusOK {
+		t.Fatalf("first DELETE status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if b.cap.ActiveContracts() != 0 || b.cap.UsedCPUs() != 0 || b.cap.UsedMemoryMB() != 0 {
+		t.Fatalf("usage after first release = {%d, %v, %d}, want all zero",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+
+	// Second DELETE: idempotent no-op, must not double-free.
+	rec := do(t, h, http.MethodDelete, "/contracts/"+created.ContractID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second DELETE status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got statusResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if got.Status != string(contract.StateReleased) {
+		t.Errorf("status = %q, want released", got.Status)
+	}
+	if b.cap.ActiveContracts() != 0 || b.cap.UsedCPUs() != 0 || b.cap.UsedMemoryMB() != 0 {
+		t.Errorf("usage after second DELETE = {%d, %v, %d}, want all zero (no double free)",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+}
+
+// The reaper-race scenario: the reaper wins the terminal transition BETWEEN the
+// release handler's Kill and its UpdateState — the tiny window
+// live-repro'd in the 2026-08-16 failure drill. Modeled by wrapping the fake
+// runtime with a hook that expires the contract (and frees its capacity, as the
+// reaper's expire path does gated on the winning transition) during the Kill
+// call. The DELETE must return success rather than 500, and capacity must not
+// be double-freed.
+func TestDeleteRaceWithReaperExpirySucceeds(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	rt := &killHookRuntime{Runtime: fake}
+	b := newBroker(store, rt, budgetPolicy(0, 4, 512), bus.New(nil), discardLogger(), "")
+	mux := http.NewServeMux()
+	b.routes(mux)
+
+	created := createContract(t, mux, `{"ttl_seconds":600,"resources":{"cpus":2,"memory_mb":256}}`)
+	if b.cap.ActiveContracts() != 1 || b.cap.UsedCPUs() != 2 || b.cap.UsedMemoryMB() != 256 {
+		t.Fatalf("usage after create = {%d, %v, %d}, want {1, 2, 256}",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+
+	// During Kill, force the reaper's expire to win: transition the contract to
+	// expired and free its capacity (exactly as reaper.expire does gated on the
+	// winning transition). Only fire once so a second, unrelated Kill call
+	// (e.g. from a subsequent test action) does not re-run the hook.
+	var raced bool
+	rt.onKill = func(id string) {
+		if raced {
+			return
+		}
+		raced = true
+		c, err := store.Get(created.ContractID)
+		if err != nil {
+			t.Errorf("simulated reaper: get contract: %v", err)
+			return
+		}
+		if _, err := store.UpdateState(c.ID, contract.StateExpired); err != nil {
+			t.Errorf("simulated reaper: update state to expired: %v", err)
+			return
+		}
+		b.cap.Free(c.ReservedCPUs, c.ReservedMemoryMB)
+	}
+
+	rec := do(t, mux, http.MethodDelete, "/contracts/"+created.ContractID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE status = %d, want 200 (reaper race must resolve as idempotent success) (body: %s)",
+			rec.Code, rec.Body.String())
+	}
+	if !raced {
+		t.Fatal("Kill hook did not fire; the race scenario was not exercised")
+	}
+	var got statusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Status != string(contract.StateExpired) {
+		t.Errorf("status = %q, want expired (release path echoes the reaper's winning state)", got.Status)
+	}
+	if b.cap.ActiveContracts() != 0 || b.cap.UsedCPUs() != 0 || b.cap.UsedMemoryMB() != 0 {
+		t.Errorf("usage after raced DELETE = {%d, %v, %d}, want all zero (no double free by loser)",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+	final, _ := store.Get(created.ContractID)
+	if final.State != contract.StateExpired {
+		t.Errorf("stored state = %q, want expired (reaper won the transition)", final.State)
+	}
+}
+
+// DELETE against a contract id no wispd process ever knew still returns 404 —
+// the idempotent no-op only covers ids that ARE tracked.
+func TestDeleteUnknownContractStillReturns404(t *testing.T) {
+	h, _, _ := testServer(t)
+
+	rec := do(t, h, http.MethodDelete, "/contracts/does-not-exist", "")
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 for unknown id (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+// killHookRuntime wraps a runtime.Runtime and fires onKill just before delegating
+// to the wrapped runtime's Kill, letting a test inject a state transition
+// between the release handler's Kill and its UpdateState — the reaper-race seam
+// (see TestDeleteRaceWithReaperExpirySucceeds).
+type killHookRuntime struct {
+	runtime.Runtime
+	onKill func(id string)
+}
+
+func (r *killHookRuntime) Kill(ctx context.Context, id string) error {
+	if r.onKill != nil {
+		r.onKill(id)
+	}
+	return r.Runtime.Kill(ctx, id)
+}
+
 func TestCreateInvalidTTL(t *testing.T) {
 	h, _, _ := testServer(t)
 	for _, body := range []string{`{"ttl_seconds":0}`, `{"ttl_seconds":-5}`, `{"image":"wisp-base"}`} {

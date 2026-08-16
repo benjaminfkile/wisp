@@ -1098,10 +1098,14 @@ func (b *broker) list(w http.ResponseWriter, r *http.Request) {
 }
 
 // release handles DELETE /contracts/:id: it kills the container and marks the
-// contract released. Releasing an already-terminal contract is a no-op that
-// echoes the current status, so DELETE is safe to retry. It requires either
-// the app token or the contract's own bearer token so a local process without
-// either credential cannot destroy a lease (see authorizedForContract).
+// contract released. Releasing an already-terminal contract is an IDEMPOTENT
+// success — the contract IS released in every sense the caller cares about — so
+// a DELETE against an already expired or released lease returns the normal
+// success response, and a reaper that wins the terminal transition between our
+// Get and our UpdateState (the tiny race window live-repro'd on 2026-08-15)
+// resolves the same way rather than 500'ing. It requires either the app token
+// or the contract's own bearer token so a local process without either
+// credential cannot destroy a lease (see authorizedForContract).
 func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 	c, err := b.store.Get(r.PathValue("id"))
 	if errors.Is(err, contract.ErrNotFound) {
@@ -1117,6 +1121,11 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A DELETE against an already-terminal contract is an idempotent no-op: the
+	// contract IS released in every sense the caller cares about, and the terminal
+	// transition that took it here already freed capacity and GPUs (the reaper and
+	// the release path both gate their frees on winning the state-machine transition),
+	// so this path must NOT free again.
 	if c.State.Terminal() {
 		writeJSON(w, http.StatusOK, b.statusOf(c))
 		return
@@ -1127,16 +1136,32 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 			b.logger.Error("kill container on release", "contract_id", c.ID, "error", err)
 		}
 	}
-	// Return any exclusively-held GPU devices to the allocator. Free is idempotent,
-	// so a lease the reaper later also sweeps never double-frees a device.
-	b.alloc.Free(c.GPUDeviceIDs)
 
-	c, err = b.store.UpdateState(c.ID, contract.StateReleased)
+	updated, err := b.store.UpdateState(c.ID, contract.StateReleased)
 	if err != nil {
+		// The reaper raced us to a terminal transition between our Get above and
+		// this UpdateState (the tiny window observed in the 2026-08-15 failure
+		// drill). Treat it as an idempotent success — the contract IS released as
+		// far as the caller is concerned — and DO NOT double-free capacity or
+		// GPUs: the reaper's winning transition already freed both (its expire
+		// path gates ReleaseCapacity on the winning transition and Free-releases
+		// GPUs idempotently). Mirror the response back from the store so the
+		// caller sees the authoritative terminal state, not our stale copy.
+		var illegal *contract.IllegalTransitionError
+		if errors.As(err, &illegal) {
+			if cur, gerr := b.store.Get(c.ID); gerr == nil && cur.State.Terminal() {
+				writeJSON(w, http.StatusOK, b.statusOf(cur))
+				return
+			}
+		}
 		b.logger.Error("mark contract released", "contract_id", c.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "could not release contract")
 		return
 	}
+	// Return any exclusively-held GPU devices to the allocator. Gated on the winning
+	// state-machine transition above so a released-then-reaped lease never
+	// double-frees; Free is also idempotent as a belt-and-braces safety net.
+	b.alloc.Free(c.GPUDeviceIDs)
 	// Return the lease's reserved host capacity now that the release is
 	// authoritative. The state-machine transition above serializes against a
 	// concurrent reaper expiry — only one side wins — so capacity frees exactly once
@@ -1144,8 +1169,8 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 	b.cap.Free(c.ReservedCPUs, c.ReservedMemoryMB)
 	// contract.released announces the client-initiated teardown (see
 	// docs/DESIGN.md §6). The reaper announces contract.expiring / contract.expired.
-	b.publishLifecycle(eventContractReleased, c)
-	writeJSON(w, http.StatusOK, b.statusOf(c))
+	b.publishLifecycle(eventContractReleased, updated)
+	writeJSON(w, http.StatusOK, b.statusOf(updated))
 }
 
 // execRequest is the POST /contracts/:id/exec body (see docs/DESIGN.md §5). The

@@ -227,12 +227,20 @@ func (f *Fake) Create(ctx context.Context, image string, opts CreateOptions) (st
 	// Resolve the launch mechanism the same way the real runtime does so tests
 	// can assert the isolation level→Runtime/Isolation mapping. The OS mirrors
 	// ContainerOS's default (an empty OS is treated as linux); read directly here
-	// because we already hold the lock.
+	// because we already hold the lock. The Kata runtime name is picked from the
+	// Fake's Runtimes (mirroring what the real DockerRuntime caches from
+	// Info.Runtimes at construction), so a test that models a daemon registering
+	// Kata only as the short alias "kata" sees the vm launch name "kata"
+	// verbatim, matching the exact behavior the real DockerRuntime now has.
 	os := f.OS
 	if os == "" {
 		os = OSLinux
 	}
-	rt, iso := launchMechanism(opts.Isolation, os)
+	runtimes := f.Runtimes
+	if runtimes == nil {
+		runtimes = defaultFakeRuntimes
+	}
+	rt, iso := launchMechanism(opts.Isolation, os, pickKataRuntimeName(runtimes))
 	f.containers[id] = &FakeContainer{ID: id, Image: image, Opts: opts, Runtime: rt, Isolation: iso}
 	return id, nil
 }

@@ -220,19 +220,30 @@ func TestDockerRuntimeContainerOSFallback(t *testing.T) {
 }
 
 // createStubClient embeds the Docker APIClient (left nil) and overrides only the
-// two methods DockerRuntime.Create needs without a daemon: Info drives OS
-// detection at construction, and ContainerCreate captures the HostConfig so a
-// test can assert how the isolation level maps onto it. Any other method call
-// would panic, which is fine: Create only touches these.
+// two methods DockerRuntime.Create needs without a daemon: Info drives OS AND
+// Kata-runtime-name detection at construction (see detectDaemon), and
+// ContainerCreate captures the HostConfig so a test can assert how the isolation
+// level maps onto it. Any other method call would panic, which is fine: Create
+// only touches these. runtimes lets a test model which OCI runtimes the daemon
+// registered (used to seed detectDaemon's cached kata runtime name); nil means
+// the daemon reported no named runtimes.
 type createStubClient struct {
 	client.APIClient
 	osType    string
+	runtimes  []string
 	gotHost   *container.HostConfig
 	gotConfig *container.Config
 }
 
 func (c *createStubClient) Info(context.Context) (system.Info, error) {
-	return system.Info{OSType: c.osType}, nil
+	var rmap map[string]system.RuntimeWithStatus
+	if len(c.runtimes) > 0 {
+		rmap = make(map[string]system.RuntimeWithStatus, len(c.runtimes))
+		for _, name := range c.runtimes {
+			rmap[name] = system.RuntimeWithStatus{}
+		}
+	}
+	return system.Info{OSType: c.osType, Runtimes: rmap}, nil
 }
 
 func (c *createStubClient) ContainerCreate(_ context.Context, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
@@ -245,7 +256,11 @@ func (c *createStubClient) ContainerCreate(_ context.Context, config *container.
 // requested isolation level onto the container's HostConfig the same way for the
 // real backend: shared (and the empty default) leave Runtime and Isolation unset
 // (default runc); sandboxed selects the gVisor runtime "runsc"; vm on a linux
-// daemon selects the Kata runtime "kata-runtime"; vm on a windows daemon selects
+// daemon selects the Kata runtime NAME THE DAEMON ACTUALLY REGISTERED, either
+// the canonical "kata-runtime" when registered, or the short alias "kata" when
+// the daemon registered only that (policy.SupportedIsolations accepts either, so
+// launch must too; otherwise a daemon that registered only "kata" would
+// advertise vm and then fail every vm create); vm on a windows daemon selects
 // Hyper-V isolation "hyperv". Runtime and Isolation are never both set, and no
 // other HostConfig field (SecurityOpt, Resources, NetworkMode) is disturbed.
 func TestDockerRuntimeCreateIsolation(t *testing.T) {
@@ -253,21 +268,31 @@ func TestDockerRuntimeCreateIsolation(t *testing.T) {
 	tests := []struct {
 		name          string
 		osType        string
+		runtimes      []string
 		isolation     string
 		wantRuntime   string
 		wantIsolation container.Isolation
 	}{
-		{"shared linux", "linux", IsolationShared, "", ""},
-		{"empty defaults to shared", "linux", "", "", ""},
-		{"shared windows", "windows", IsolationShared, "", ""},
-		{"sandboxed linux", "linux", IsolationSandboxed, "runsc", ""},
-		{"sandboxed windows", "windows", IsolationSandboxed, "runsc", ""},
-		{"vm linux", "linux", IsolationVM, "kata-runtime", ""},
-		{"vm windows", "windows", IsolationVM, "", container.Isolation("hyperv")},
+		{"shared linux", "linux", []string{"runc"}, IsolationShared, "", ""},
+		{"empty defaults to shared", "linux", []string{"runc"}, "", "", ""},
+		{"shared windows", "windows", nil, IsolationShared, "", ""},
+		{"sandboxed linux", "linux", []string{"runc", "runsc"}, IsolationSandboxed, "runsc", ""},
+		{"sandboxed windows", "windows", nil, IsolationSandboxed, "runsc", ""},
+		{"vm linux canonical kata-runtime", "linux", []string{"runc", "kata-runtime"}, IsolationVM, "kata-runtime", ""},
+		// Regression for the runtime-alias mismatch: a daemon that registered
+		// Kata under only the short alias "kata" must launch vm as "kata", not
+		// as "kata-runtime" (the latter is unknown to such a daemon and every
+		// vm create would fail; see policy.SupportedIsolations, which accepts
+		// either alias).
+		{"vm linux short kata alias", "linux", []string{"runc", "kata"}, IsolationVM, "kata", ""},
+		// When both aliases are registered the canonical name wins so launch
+		// stays predictable.
+		{"vm linux both aliases prefers kata-runtime", "linux", []string{"runc", "kata", "kata-runtime"}, IsolationVM, "kata-runtime", ""},
+		{"vm windows", "windows", nil, IsolationVM, "", container.Isolation("hyperv")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			stub := &createStubClient{osType: tt.osType}
+			stub := &createStubClient{osType: tt.osType, runtimes: tt.runtimes}
 			d := NewDockerRuntimeWithClient(stub)
 
 			// Pass unrelated HostConfig-bearing options to confirm they survive

@@ -186,24 +186,31 @@ const (
 
 // The Docker launch-mechanism names an isolation level maps to. These are the
 // standard defaults for each backend and are not configurable: gVisor registers
-// its OCI runtime as "runsc", Kata Containers as "kata-runtime", and Hyper-V
-// isolation is selected via the container's Isolation value "hyperv" rather than
-// a named runtime.
+// its OCI runtime as "runsc", Kata Containers as "kata-runtime" (with the short
+// alias "kata" also seen in the wild), and Hyper-V isolation is selected via the
+// container's Isolation value "hyperv" rather than a named runtime.
 const (
 	gVisorRuntimeName = "runsc"
 	kataRuntimeName   = "kata-runtime"
+	kataRuntimeAlt    = "kata"
 	hyperVIsolation   = "hyperv"
 )
 
 // launchMechanism maps a requested isolation level and the daemon's container OS
 // to the Docker launch mechanism: the HostConfig.Runtime name and the
-// HostConfig.Isolation value. At most one is non-empty — they are NEVER both
+// HostConfig.Isolation value. At most one is non-empty; they are NEVER both
 // set. "" and "shared" yield neither (the default OCI runtime, runc, unchanged);
-// "sandboxed" yields the gVisor runtime; "vm" yields the Kata runtime on a Linux
-// daemon or Hyper-V isolation on a Windows daemon. Both DockerRuntime.Create and
-// the Fake use it so their behavior matches and tests can assert the mapping
-// against the Fake.
-func launchMechanism(isolation string, os ContainerOS) (runtimeName, isolationMode string) {
+// "sandboxed" yields the gVisor runtime; "vm" yields the detected Kata runtime
+// name on a Linux daemon (kataRuntime, or the "kata-runtime" default when the
+// caller supplies an empty string) or Hyper-V isolation on a Windows daemon.
+// Passing the DETECTED Kata runtime name in, rather than always naming
+// "kata-runtime", keeps launch aligned with what the daemon actually registered,
+// so a daemon that registered Kata only under the short alias "kata" (which
+// policy.SupportedIsolations also accepts) still launches vm leases successfully
+// instead of failing every create with an unknown-runtime error. Both
+// DockerRuntime.Create and the Fake use this so their behavior matches and tests
+// can assert the mapping against the Fake.
+func launchMechanism(isolation string, os ContainerOS, kataRuntime string) (runtimeName, isolationMode string) {
 	switch isolation {
 	case IsolationSandboxed:
 		return gVisorRuntimeName, ""
@@ -211,10 +218,39 @@ func launchMechanism(isolation string, os ContainerOS) (runtimeName, isolationMo
 		if os == OSWindows {
 			return "", hyperVIsolation
 		}
-		return kataRuntimeName, ""
+		if kataRuntime == "" {
+			kataRuntime = kataRuntimeName
+		}
+		return kataRuntime, ""
 	default:
 		return "", ""
 	}
+}
+
+// pickKataRuntimeName returns the Kata runtime name to LAUNCH with, chosen from
+// the daemon's registered runtimes. Docker daemons register Kata as
+// "kata-runtime" (the canonical name) or, in some packagings, as the short alias
+// "kata"; policy.SupportedIsolations advertises vm for either, so launch must
+// name whichever one the daemon actually registered. Otherwise a daemon that
+// registered only "kata" would advertise vm and then fail every vm create with
+// an unknown-runtime error. When both are present the canonical "kata-runtime"
+// wins; when neither is present the empty string is returned and callers fall
+// back to the default (see launchMechanism), a state that never reaches launch
+// because policy would not have advertised vm at all.
+func pickKataRuntimeName(runtimes []string) string {
+	hasAlt := false
+	for _, r := range runtimes {
+		if r == kataRuntimeName {
+			return kataRuntimeName
+		}
+		if r == kataRuntimeAlt {
+			hasAlt = true
+		}
+	}
+	if hasAlt {
+		return kataRuntimeAlt
+	}
+	return ""
 }
 
 // Resources caps a container's resource usage. A zero field means "no limit"

@@ -4,7 +4,7 @@
 implemented on branch `secure-lease-isolation`. This document records what has been tested, how,
 the bugs that testing found, and what remains to test.
 
-Last updated: 2026-08-28 (model description refreshed against the code; test matrix unchanged since 2026-08-07).
+Last updated: 2026-08-28 (Kata alias launch fix: launch names whichever Kata runtime the daemon actually registered, matching detection; test matrix unchanged since 2026-08-07).
 
 ## The model under test
 
@@ -24,11 +24,12 @@ Last updated: 2026-08-28 (model description refreshed against the code; test mat
   `shared`. `POST /contracts` on that degraded host is refused with `409 no runnable isolation
   tier`, whether the request names an isolation or omits it, because omitting `isolation` would
   otherwise default to the empty string and silently downgrade to `runc` at launch.
-- **Level → launch mechanism** (`internal/runtime/docker.go` `launchMechanism`):
-  `shared`→ default runc; `sandboxed`→ `HostConfig.Runtime="runsc"`; `vm`→ `HostConfig.Runtime="kata-runtime"`
-  on Linux or `HostConfig.Isolation="hyperv"` on Windows. Never both `Runtime` and `Isolation`.
-  (Detection accepts the short `kata` alias but launch always names `kata-runtime`, so a daemon that
-  registered Kata only as `kata` will advertise `vm` and then fail the launch; register `kata-runtime`.)
+- **Level → launch mechanism** (`internal/runtime/runtime.go` `launchMechanism`):
+  `shared`→ default runc; `sandboxed`→ `HostConfig.Runtime="runsc"`; `vm`→ `HostConfig.Runtime` set to
+  the Kata runtime name the daemon actually registered (canonical `kata-runtime`, or the short alias
+  `kata` when the daemon registered only that; the DockerRuntime caches whichever it detected via
+  `Info.Runtimes` at construction and passes it through, so launch matches detection) on Linux, or
+  `HostConfig.Isolation="hyperv"` on Windows. Never both `Runtime` and `Isolation`.
 - **Per-OS hardening:** `no-new-privileges` (SecurityOpt) and `PidsLimit` are Linux-only; a Windows
   daemon rejects them, so they are applied only on a Linux daemon. `NanoCPUs`/`Memory` are cross-platform.
 - End to end, `isolation` rides the tunnel `LeaseCreate` frame (JSON key `isolation`) from wisper-api
@@ -124,7 +125,9 @@ Validated:
 
 - **`vm` / Kata on Linux.** The only untested launch path. Requires hardware virtualization (KVM),
   which normal EC2 instances do not expose, needs a bare-metal (`*.metal`) instance or another
-  KVM-capable Linux host. Would validate `HostConfig.Runtime="kata-runtime"` → a real microVM.
+  KVM-capable Linux host. Would validate `HostConfig.Runtime` set to the daemon's detected Kata
+  runtime name (canonical `kata-runtime`, or the short alias `kata` when that is what the daemon
+  registered) → a real microVM.
 - **`sandboxed` through the full marketplace tunnel.** `sandboxed` is proven directly against wisp on
   Linux+gVisor, and the tunnel is proven on Windows; not yet combined (drive a `sandboxed` lease
   through wisper-api → agent → a Linux+gVisor wisp).

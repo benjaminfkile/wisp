@@ -8,8 +8,8 @@
 //   - Fake — an in-memory implementation for tests. It requires no daemon and
 //     lets tests drive deterministic container/exec behaviour.
 //
-// Nothing here is wired into the HTTP surface yet; later tasks (contract model,
-// exec endpoint, shell) consume this interface.
+// The broker, exec endpoint, shell endpoint, reaper, and startup reconcile all
+// speak to the backend through this interface.
 package runtime
 
 import (

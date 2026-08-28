@@ -8,7 +8,9 @@
 // clock and calls Tick directly. In production Run scans the store on a ticker.
 //
 // A lifecycle hook (Notify) fires on every transition the reaper makes; the
-// event bus (a later task, see docs/DESIGN.md §6) wires into it.
+// event bus wires into it in cmd/wispd so contract.expiring / contract.expired
+// are republished onto the same bus the HTTP surface reads and writes to (see
+// docs/DESIGN.md §6).
 package reaper
 
 import (
@@ -137,8 +139,8 @@ func New(store *contract.Store, rt runtime.Runtime, opts Options) *Reaper {
 }
 
 // SetNotify installs or replaces the lifecycle hook after construction. The
-// event bus (a later task) subscribes this way once it is built. Passing nil
-// disables notifications.
+// event bus subscribes this way in cmd/wispd via server.LifecycleNotify.
+// Passing nil disables notifications.
 func (r *Reaper) SetNotify(fn func(Event)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

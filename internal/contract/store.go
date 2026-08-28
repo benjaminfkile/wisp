@@ -23,8 +23,9 @@ type CreateParams struct {
 	Image string
 
 	// Isolation is the resolved isolation level for the lease (see
-	// policy.Isolation), recorded so a later task can select the runtime that
-	// satisfies it. Opaque to the store.
+	// policy.Isolation), recorded so the runtime layer can select the launch
+	// mechanism that satisfies it (see runtime.launchMechanism). Opaque to the
+	// store.
 	Isolation string
 
 	// GPUDeviceIDs are the whole GPU devices the allocator exclusively assigned to

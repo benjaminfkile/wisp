@@ -281,8 +281,11 @@ startup warning, and rejects a create requesting an unavailable level. It **fail
 downgrading**: when the configured default is not runnable the effective default falls back to
 `shared` only if the operator allow-listed `shared`, otherwise to the first runnable configured
 level; and when *none* of the configured levels are runnable (and `shared` was excluded) the host
-logs an error and advertises an **empty** `supported` list rather than quietly serving the weakest
-tier the operator did not authorise. If the daemon info query itself fails, detection falls back to
+logs an error, advertises an **empty** `supported` list, and **rejects every `POST /contracts` with
+`409 no runnable isolation tier`**, whether or not the request names an isolation, rather than
+quietly serving the weakest tier the operator did not authorise. Omitting `isolation` on a degraded
+host is refused for the same reason an explicit request is: defaulting to the empty string would
+silently downgrade to `runc`. If the daemon info query itself fails, detection falls back to
 the OS-derived set (`shared`, plus `vm` on a Windows daemon) with a warning. A
 Docker daemon is fixed in one mode by the operator, Wisp only detects it and never switches it, so an image whose OS does not match is rejected. Wisp cannot know an arbitrary image's OS up front,
 so it attempts the create and maps the daemon's OS/platform rejection to a clear

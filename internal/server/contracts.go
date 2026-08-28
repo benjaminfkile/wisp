@@ -349,10 +349,14 @@ type createRequest struct {
 	Meta       map[string]any   `json:"meta"`
 
 	// Isolation is the optional, ordered isolation level for the lease (see
-	// policy.Isolation): "shared" (the default and today's runc behavior),
-	// "sandboxed", or "vm". Omitted/empty resolves to the policy default. It is
-	// validated and recorded here; a later task maps the level to a container
-	// runtime, so today every accepted level still launches under runc.
+	// policy.Isolation): "shared" (runc, the safe baseline), "sandboxed" (gVisor),
+	// or "vm" (Kata on a Linux daemon, Hyper-V on a Windows daemon). Omitted/empty
+	// resolves to the host's effective default. It is validated against the host's
+	// effective posture, recorded on the contract, and threaded through the
+	// runtime to select the launch mechanism (see runtime.launchMechanism). A host
+	// whose effective isolation set is empty (all configured tiers unrunnable and
+	// shared excluded) rejects every create with a 409, whether or not this field
+	// is set, rather than silently downgrading to runc.
 	Isolation string `json:"isolation"`
 
 	// Env is an optional, opaque KEY->VALUE map injected as the container's
@@ -470,8 +474,10 @@ type launchSpec struct {
 	pids     int
 	network  string
 	// isolation is the resolved, validated isolation level for the lease (see
-	// policy.Isolation). It is recorded on the contract for a later task to map to
-	// a container runtime; it does not affect container launch yet.
+	// policy.Isolation). It is recorded on the contract and threaded into the
+	// runtime through CreateOptions.Isolation, which the runtime maps to the
+	// launch mechanism (see runtime.launchMechanism): shared/empty → runc,
+	// sandboxed → gVisor, vm → Kata on Linux or Hyper-V on Windows.
 	isolation policy.Isolation
 	// env is the validated, KEY=VALUE-form environment injected into the
 	// container's Config.Env; nil when the create carried no env.
@@ -491,6 +497,20 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.TTLSeconds <= 0 {
 		writeError(w, http.StatusBadRequest, "ttl_seconds must be positive")
+		return
+	}
+
+	// Fail loud on a host with no runnable isolation tier BEFORE any other
+	// per-request work. detectIsolation deliberately advertises an empty effective
+	// set when every configured tier is unrunnable and shared was excluded from
+	// the allow-list (see the host-degraded branch there); admitting any create in
+	// that state, even one that omits isolation (defaulting to the empty string
+	// would silently downgrade to runc via launchMechanism("")), would undo the
+	// whole point of the fail-loud posture. Refuse the create with a 409 conflict
+	// that names the missing capability, matching the discovery document's
+	// Isolation.Supported=[] advertisement.
+	if len(b.iso.Levels()) == 0 {
+		writeError(w, http.StatusConflict, "no runnable isolation tier: host advertises no isolation")
 		return
 	}
 
@@ -524,7 +544,8 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 	// operator allow-list intersected with the levels this daemon can actually run
 	// (see detectIsolation) — else a client error (400), mirroring the
 	// image/network validation shape. The host never accepts a level it cannot
-	// launch, even if the operator allow-listed it.
+	// launch, even if the operator allow-listed it. The empty-set (host-degraded)
+	// case is already rejected above with a 409 before we reach this point.
 	isolation := b.iso.Default()
 	if req.Isolation != "" {
 		level, err := policy.ParseIsolation(req.Isolation)

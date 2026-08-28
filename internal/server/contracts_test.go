@@ -1143,8 +1143,8 @@ func TestCreateIsolationNotAllowedRejected(t *testing.T) {
 
 func TestCreateAllowedIsolationRecorded(t *testing.T) {
 	// A policy widening the allowed set lets a lease request a stronger level; it
-	// is recorded on the contract (a later task maps it to a runtime — launch
-	// behavior is unchanged for now, so the container still boots normally).
+	// is recorded on the contract and mapped by the runtime layer to the launch
+	// mechanism the level requires (see runtime.launchMechanism).
 	pol := &policy.Config{
 		Allow:        []string{"wisp-base"},
 		DefaultImage: "wisp-base",
@@ -1232,6 +1232,90 @@ func TestCreateIsolationUnavailableDroppedAndRejected(t *testing.T) {
 	// shared (the effective level) is still accepted.
 	if rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"isolation":"shared"}`); rec.Code != http.StatusCreated {
 		t.Errorf("shared create status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateEmptyEffectiveIsolationRejectsAll verifies the fail-loud posture on
+// a host whose effective isolation set is EMPTY: the operator excluded shared
+// and the only configured tier (vm) is unrunnable on this daemon, so
+// detectIsolation advertises no isolation at all. Every create must be refused
+// with a 409 naming the missing capability, whether the request explicitly
+// picked an isolation level or omitted it. Omitting isolation is the case the
+// task calls out: defaulting to the empty string used to silently downgrade to
+// runc via launchMechanism(""), the exact "silent downgrade" the fail-loud work
+// was meant to eliminate.
+func TestCreateEmptyEffectiveIsolationRejectsAll(t *testing.T) {
+	pol := &policy.Config{
+		Allow:        []string{"wisp-base"},
+		DefaultImage: "wisp-base",
+		Limits: policy.Limits{
+			Networks: []string{"none", "open"},
+			// Operator wants vm-only isolation; shared is explicitly excluded.
+			Isolations:       []string{"vm"},
+			DefaultIsolation: "vm",
+		},
+	}
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	// A Linux daemon with no Kata runtime cannot provide vm, so the intersection
+	// with the operator allow-list is empty.
+	fake.Runtimes = []string{"runc"}
+
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, pol, bus.New(nil), "")
+
+	// The discovery document advertises no isolation on a degraded host, matching
+	// the empty effective set the create path rejects against.
+	rec := do(t, h, http.MethodGet, "/images", "")
+	var got imagesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode /images: %v", err)
+	}
+	if len(got.Isolation.Supported) != 0 {
+		t.Errorf("advertised isolation.supported = %v, want empty (host degraded)", got.Isolation.Supported)
+	}
+	if got.Isolation.Default != "" {
+		t.Errorf("advertised isolation.default = %q, want empty (no runnable default)", got.Isolation.Default)
+	}
+
+	// A create that OMITS isolation must be rejected with a 409; before the fix
+	// it silently launched under runc via launchMechanism("").
+	rec = do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("omitted-isolation status = %d, want 409 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "no runnable isolation tier") {
+		t.Errorf("omitted-isolation body = %q, want it to mention 'no runnable isolation tier'", rec.Body.String())
+	}
+	if n := len(store.List()); n != 0 {
+		t.Errorf("stored contracts after omitted-isolation reject = %d, want 0", n)
+	}
+	if n := fake.Count(); n != 0 {
+		t.Errorf("launched containers after omitted-isolation reject = %d, want 0", n)
+	}
+
+	// A create that explicitly picks the operator's own configured level must
+	// also be rejected: the tier is not runnable on this host.
+	rec = do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"isolation":"vm"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("explicit-isolation status = %d, want 409 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "no runnable isolation tier") {
+		t.Errorf("explicit-isolation body = %q, want it to mention 'no runnable isolation tier'", rec.Body.String())
+	}
+
+	// A create that asks for shared (which the operator excluded) must ALSO be
+	// rejected with the same host-degraded 409, rather than the per-level 400:
+	// the empty-set check runs first and is the true reason nothing may be
+	// created here.
+	rec = do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60,"isolation":"shared"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("shared-isolation status = %d, want 409 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if n := len(store.List()); n != 0 {
+		t.Errorf("stored contracts after every rejected create = %d, want 0", n)
+	}
+	if n := fake.Count(); n != 0 {
+		t.Errorf("launched containers after every rejected create = %d, want 0", n)
 	}
 }
 

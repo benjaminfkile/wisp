@@ -21,7 +21,9 @@ Last updated: 2026-08-28 (model description refreshed against the code; test mat
   effective default is `shared` only when the operator allow-listed it, else the first runnable
   configured level; and if *none* of the configured levels are runnable (and `shared` was excluded)
   wisp logs an error and advertises an **empty** `supported` list instead of falling back to
-  `shared`. Every explicit isolation request is then a 400 "not allowed".
+  `shared`. `POST /contracts` on that degraded host is refused with `409 no runnable isolation
+  tier`, whether the request names an isolation or omits it, because omitting `isolation` would
+  otherwise default to the empty string and silently downgrade to `runc` at launch.
 - **Level → launch mechanism** (`internal/runtime/docker.go` `launchMechanism`):
   `shared`→ default runc; `sandboxed`→ `HostConfig.Runtime="runsc"`; `vm`→ `HostConfig.Runtime="kata-runtime"`
   on Linux or `HostConfig.Isolation="hyperv"` on Windows. Never both `Runtime` and `Isolation`.

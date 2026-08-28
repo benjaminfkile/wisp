@@ -1,9 +1,10 @@
 // Command wispd is the Wisp broker daemon entrypoint.
 //
 // Wisp leases ephemeral, root-access, throwaway containers for a bounded time
-// (see docs/DESIGN.md). This scaffold stands up the HTTP server, structured
-// logging, and environment-driven config; the broker surface is filled in by
-// later tasks.
+// (see docs/DESIGN.md). This process wires together structured logging,
+// environment-driven config, the policy engine, the Docker-backed runtime, the
+// contract store, the event bus, the TTL reaper, and the HTTP broker surface,
+// then serves it until a signal triggers a graceful shutdown.
 package main
 
 import (

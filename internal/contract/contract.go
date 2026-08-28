@@ -3,8 +3,9 @@
 // container, tracked through a small lifecycle state machine and held in a
 // thread-safe in-memory store.
 //
-// Nothing here is wired into the HTTP surface yet; the contract lifecycle API
-// (a later task) consumes this package.
+// The HTTP broker (see internal/server) is the sole consumer: create records a
+// new contract here, provisioning/release drive its state machine transitions,
+// and the reaper expires contracts through the same store.
 package contract
 
 import (
@@ -116,9 +117,10 @@ type Contract struct {
 	Image string
 
 	// Isolation is the resolved isolation level for the lease (see
-	// policy.Isolation), recorded so a later task can select the container
-	// runtime that satisfies it. Opaque to this package; empty on contracts
-	// reconciled from Docker labels, where it did not survive the restart.
+	// policy.Isolation), recorded so the runtime can select the container
+	// runtime that satisfies it (see runtime.launchMechanism). Opaque to this
+	// package; empty on contracts reconciled from Docker labels, where it did
+	// not survive the restart.
 	Isolation string
 
 	// Meta is arbitrary client-supplied metadata echoed back on status reads.

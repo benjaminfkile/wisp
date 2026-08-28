@@ -95,9 +95,9 @@ requested → provisioning → ready → (in use) → expiring → released | ex
 - **ready**: the client may exec / open shells freely.
 - **expiring**: a warning state (and bus event) a configurable lead time before the TTL
   (`WISP_EXPIRING_LEAD_SECONDS`, default 60), so the client can exfiltrate work (push a branch,
-  POST results out) before the hard kill. Note that as built, exec and shell require `ready`, so
-  they are `409` once the contract is `expiring`; a client must finish exfiltrating before the lead
-  window opens (see §14).
+  POST results out) before the hard kill. Exec and shell stay usable through the lead window
+  (accepted in both `ready` and `expiring`) so a client can actually use the grace period; only
+  once the contract reaches a terminal state do they return `409`.
 - **released**: client called `DELETE /contracts/:id`. A `DELETE` against a contract that is
   already `released` or `expired` is an idempotent success (200 echoing the terminal status) and
   never frees capacity or GPUs a second time.
@@ -129,10 +129,12 @@ opens as many as it wants.
 
 Both exec modes take `{ "command": "..." }`, run it through the container OS's shell (`/bin/sh -c`
 on Linux, `cmd /c` on a Windows daemon) as a fresh process, and require the contract to be `ready`
-(`409` otherwise). Sync exec returns `{stdout, stderr, exit_code}`; a non-zero exit code is still a
-`200`. Streaming exec commits `200` with `Content-Type: text/event-stream` and then emits `chunk`
-events (`{"stream":"stdout"|"stderr","data":"..."}`, JSON-escaped so newlines survive SSE framing),
-a final `exit` event (`{"exit_code": n}`), or an `error` event if the exec fails mid-stream.
+or `expiring` (`409` otherwise). The interactive shell handshake follows the same rule: both
+`ready` and `expiring` are accepted so a client can exfiltrate work during the lead window. Sync
+exec returns `{stdout, stderr, exit_code}`; a non-zero exit code is still a `200`. Streaming exec
+commits `200` with `Content-Type: text/event-stream` and then emits `chunk` events
+(`{"stream":"stdout"|"stderr","data":"..."}`, JSON-escaped so newlines survive SSE framing), a
+final `exit` event (`{"exit_code": n}`), or an `error` event if the exec fails mid-stream.
 
 **How the shell works (the only non-trivial bit):** Docker's Engine API already gives an
 interactive PTY over a *hijacked* connection (`exec create` with `Tty:true` + `exec start`). Wisp
@@ -163,7 +165,11 @@ A separate, dumb pub/sub layer for **coordination between satellites**. Wisp is 
   accepts `?token=`.
 - Wisp emits its own **contract lifecycle** events: `contract.created`, `contract.ready`,
   `contract.expiring`, `contract.released`, `contract.expired`, each carrying
-  `{"contract_id":"...","status":"..."}`.
+  `{"contract_id":"...","status":"..."}`. `contract.expired` additionally carries a `reason`
+  field so a subscriber can distinguish a provisioning failure (`provisioning_failed`, published
+  by the create path when image pull, container create/start, or userdata fails) from a natural
+  TTL expiry (`ttl_expired`) or an out-of-band container death (`container_died`, detected by the
+  reaper's liveness sweep). The other lifecycle events omit the field.
 - Payloads are opaque to Wisp. It does not interpret event `type` strings or bodies.
 - Delivery is fire-and-forget, in-process fan-out: each subscriber has a 64-event buffer and a
   subscriber that falls behind has events dropped (and logged) rather than stalling publishers.
@@ -569,7 +575,7 @@ switches it**, it only serves whichever mode the host is in.
   (`cd X && …`) or Wisp pins a per-contract working dir.
 - **Bare ≠ empty**, the base must include a shell + package manager (e.g. `debian-slim`/`alpine`)
   or "install it yourself" is impossible; and the requested network must allow egress for installs.
-- **Provisioning race**, reject/queue execs until `ready`; surface userdata failures.
+- **Provisioning race**, reject execs until `ready` (they stay usable through `expiring`); surface userdata failures.
 - **TTL is a hard kill**, emit `contract.expiring` with enough lead time; clients must exfiltrate
   before then.
 - **Output backpressure**, the shell/stream bridge must handle large/fast output without blowing
@@ -598,8 +604,6 @@ switches it**, it only serves whichever mode the host is in.
 - Image allow-list + limits config: static file (`WISP_CONFIG`, today) vs a management API?
 - Pooling: keep a warm base container ready to cut cold-start, or always cold?
 - Multi-host later (one Wisp fanning across several Docker hosts), or strictly single-host?
-- Should exec / shell stay usable during `expiring`? Today both require `ready`, which makes the
-  lead window a warning only rather than a grace period for exfiltration.
 
 ---
 

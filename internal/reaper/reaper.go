@@ -34,6 +34,21 @@ const (
 	defaultLead = time.Minute
 )
 
+// Reason categorises WHY the reaper drove a contract into a particular state,
+// so downstream consumers (the bus) can distinguish otherwise-identical
+// terminal transitions. Only expired transitions carry a reason today; the
+// warning-only expiring transition leaves it empty.
+const (
+	// ReasonTTLExpired is set on an expired transition triggered by the TTL
+	// having elapsed (the ordinary lifecycle end).
+	ReasonTTLExpired = "ttl_expired"
+
+	// ReasonContainerDied is set on an expired transition triggered by the
+	// backing container going away before the TTL (docker kill / docker rm /
+	// OOM), detected by the reaper's liveness sweep.
+	ReasonContainerDied = "container_died"
+)
+
 // Event describes a lifecycle transition the reaper performed. It is passed to
 // the Notify hook so downstream consumers (the event bus) can react.
 type Event struct {
@@ -48,6 +63,12 @@ type Event struct {
 
 	// At is the reaper clock time at which the transition happened.
 	At time.Time
+
+	// Reason categorises the transition (see the Reason* constants). Empty
+	// unless To is StateExpired; the two current values distinguish a TTL
+	// expiry from an out-of-band container death so subscribers can tell them
+	// apart on the bus.
+	Reason string
 }
 
 // Options configures a Reaper. Every field is optional; New fills in defaults.
@@ -199,7 +220,8 @@ func (r *Reaper) Tick(ctx context.Context) {
 // inside the lead window is warned by moving it to expiring; a contract whose
 // backing container has died out of band (docker kill / rm / OOM) is expired
 // on the same path, so its capacity and GPUs return to the allocators within a
-// few ticks rather than at TTL expiry.
+// few ticks rather than at TTL expiry. The two expire paths tag their
+// transition with distinct Reason values so the bus can tell them apart.
 func (r *Reaper) reap(ctx context.Context, c contract.Contract) {
 	if c.State.Terminal() {
 		return
@@ -207,7 +229,7 @@ func (r *Reaper) reap(ctx context.Context, c contract.Contract) {
 	now := r.now()
 	switch {
 	case !now.Before(c.ExpiresAt):
-		r.expire(ctx, c, now)
+		r.expire(ctx, c, now, ReasonTTLExpired)
 	case r.containerDied(ctx, c):
 		// The container is gone or stopped before its TTL: route through the same
 		// expire path so capacity, GPUs, and the contract slot free exactly once
@@ -215,9 +237,9 @@ func (r *Reaper) reap(ctx context.Context, c contract.Contract) {
 		// opposed to a TTL expiry) visible to operators.
 		r.logger.Info("reaper: container died before TTL; expiring contract",
 			"contract_id", c.ID, "container_id", c.ContainerID, "state", c.State)
-		r.expire(ctx, c, now)
+		r.expire(ctx, c, now, ReasonContainerDied)
 	case c.State == contract.StateReady && !now.Before(c.ExpiresAt.Add(-r.lead)):
-		r.transition(c, contract.StateExpiring, now)
+		r.transition(c, contract.StateExpiring, now, "")
 	}
 }
 
@@ -245,8 +267,10 @@ func (r *Reaper) containerDied(ctx context.Context, c contract.Contract) bool {
 
 // expire kills the contract's container (if one was provisioned) and marks the
 // contract expired. A container the runtime no longer knows about is treated as
-// already gone.
-func (r *Reaper) expire(ctx context.Context, c contract.Contract, now time.Time) {
+// already gone. reason categorises WHY the reaper is expiring the contract (TTL
+// vs container death) and rides through to the fired Event so the bus can
+// republish it on contract.expired.
+func (r *Reaper) expire(ctx context.Context, c contract.Contract, now time.Time, reason string) {
 	if c.ContainerID != "" {
 		if err := r.rt.Kill(ctx, c.ContainerID); err != nil && !errors.Is(err, runtime.ErrNotFound) {
 			r.logger.Error("reaper: kill container", "contract_id", c.ID, "error", err)
@@ -263,7 +287,7 @@ func (r *Reaper) expire(ctx context.Context, c contract.Contract, now time.Time)
 	// subtracts plain amounts and is not self-idempotent, so gating on the winning
 	// transition is what guarantees a lease released and reaped in a race frees its
 	// capacity exactly once (the store admits a single terminal transition).
-	if r.transition(c, contract.StateExpired, now) && r.releaseCapacity != nil {
+	if r.transition(c, contract.StateExpired, now, reason) && r.releaseCapacity != nil {
 		r.releaseCapacity(c)
 	}
 }
@@ -273,8 +297,9 @@ func (r *Reaper) expire(ctx context.Context, c contract.Contract, now time.Time)
 // once-per-contract side effect on winning the transition. A rejected transition
 // (the contract raced to a terminal state via DELETE, or was deleted outright) is
 // logged at debug and ignored, returning false: the store's state machine is the
-// source of truth.
-func (r *Reaper) transition(c contract.Contract, next contract.State, now time.Time) bool {
+// source of truth. reason is propagated onto the fired Event so subscribers can
+// distinguish otherwise-identical terminal transitions (see Event.Reason).
+func (r *Reaper) transition(c contract.Contract, next contract.State, now time.Time, reason string) bool {
 	if _, err := r.store.UpdateState(c.ID, next); err != nil {
 		if errors.Is(err, contract.ErrIllegalTransition) || errors.Is(err, contract.ErrNotFound) {
 			r.logger.Debug("reaper: skip transition", "contract_id", c.ID, "to", next, "error", err)
@@ -283,7 +308,7 @@ func (r *Reaper) transition(c contract.Contract, next contract.State, now time.T
 		r.logger.Error("reaper: transition", "contract_id", c.ID, "to", next, "error", err)
 		return false
 	}
-	r.fire(Event{ContractID: c.ID, From: c.State, To: next, At: now})
+	r.fire(Event{ContractID: c.ID, From: c.State, To: next, At: now, Reason: reason})
 	return true
 }
 

@@ -35,25 +35,58 @@ var eventsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(*http.Request) bool { return true },
 }
 
+// Reasons carried on a contract.expired payload's `reason` field, so a
+// subscriber can distinguish a provisioning failure from a TTL expiry or an
+// out-of-band container death. Only contract.expired currently carries a
+// reason; the other lifecycle events omit the field.
+const (
+	// ExpiredReasonProvisioningFailed is set when the create path's fail()
+	// destroys the container after a failed image pull, container create/start,
+	// or userdata run. Distinguishes an authentic provisioning failure from a
+	// lease that ran successfully and then expired.
+	ExpiredReasonProvisioningFailed = "provisioning_failed"
+
+	// ExpiredReasonTTLExpired is set when the reaper expires a lease whose TTL
+	// has elapsed (the ordinary lifecycle end).
+	ExpiredReasonTTLExpired = "ttl_expired"
+
+	// ExpiredReasonContainerDied is set when the reaper expires a lease whose
+	// backing container has stopped or been removed out of band (docker kill /
+	// docker rm / OOM), detected by the liveness sweep before the TTL.
+	ExpiredReasonContainerDied = "container_died"
+)
+
 // lifecyclePayload is the opaque body Wisp attaches to a contract lifecycle
-// event. The bus does not interpret it; subscribers do.
+// event. The bus does not interpret it; subscribers do. Reason is set only on
+// contract.expired so subscribers can tell a provisioning failure apart from a
+// TTL expiry or an out-of-band container death; other lifecycle events omit it.
 type lifecyclePayload struct {
 	ContractID string `json:"contract_id"`
 	Status     string `json:"status"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 // publishLifecycle emits a contract lifecycle event for c onto the bus. A
 // marshal failure is logged and the event is dropped rather than propagated:
 // lifecycle emission is best-effort and must never break the request path.
 func (b *broker) publishLifecycle(eventType string, c contract.Contract) {
-	publishLifecycle(b.bus, b.logger, eventType, c.ID, c.State)
+	publishLifecycle(b.bus, b.logger, eventType, c.ID, c.State, "")
+}
+
+// publishExpired is the contract.expired counterpart of publishLifecycle that
+// carries the reason the lease reached the expired state so subscribers can
+// distinguish provisioning failure from TTL/container death.
+func (b *broker) publishExpired(contractID, reason string) {
+	publishLifecycle(b.bus, b.logger, eventContractExpired, contractID, contract.StateExpired, reason)
 }
 
 // publishLifecycle marshals a lifecycle payload and publishes it under
 // eventType. It is a package function (not just a broker method) so the reaper
-// wiring (LifecycleNotify) can share it without a broker.
-func publishLifecycle(b *bus.Bus, logger *slog.Logger, eventType, contractID string, state contract.State) {
-	data, err := json.Marshal(lifecyclePayload{ContractID: contractID, Status: string(state)})
+// wiring (LifecycleNotify) can share it without a broker. reason is included on
+// the payload only when non-empty (contract.expired carries it; the other
+// lifecycle events do not).
+func publishLifecycle(b *bus.Bus, logger *slog.Logger, eventType, contractID string, state contract.State, reason string) {
+	data, err := json.Marshal(lifecyclePayload{ContractID: contractID, Status: string(state), Reason: reason})
 	if err != nil {
 		logger.Error("marshal lifecycle event", "type", eventType, "contract_id", contractID, "error", err)
 		return
@@ -65,7 +98,11 @@ func publishLifecycle(b *bus.Bus, logger *slog.Logger, eventType, contractID str
 // time-based transitions as contract lifecycle events on the bus:
 // expiring → contract.expiring, expired → contract.expired. Transitions with no
 // corresponding lifecycle event are ignored. main wires this into the reaper so
-// the bus announces the full lifecycle (see docs/DESIGN.md §6).
+// the bus announces the full lifecycle (see docs/DESIGN.md §6). A
+// contract.expired carries the reaper Event's Reason (ttl_expired or
+// container_died) so subscribers can tell a natural TTL expiry from an
+// out-of-band container death, matching the provisioning-failure reason the
+// broker publishes on the same event type.
 func LifecycleNotify(b *bus.Bus, logger *slog.Logger) func(reaper.Event) {
 	if logger == nil {
 		logger = slog.Default()
@@ -75,7 +112,7 @@ func LifecycleNotify(b *bus.Bus, logger *slog.Logger) func(reaper.Event) {
 		if eventType == "" {
 			return
 		}
-		publishLifecycle(b, logger, eventType, e.ContractID, e.To)
+		publishLifecycle(b, logger, eventType, e.ContractID, e.To, e.Reason)
 	}
 }
 

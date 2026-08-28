@@ -978,7 +978,10 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, spec launch
 
 // fail destroys the container (if one was created) and marks the contract
 // expired. Errors from the cleanup are logged, not returned: the caller already
-// has the originating failure to report.
+// has the originating failure to report. On the winning terminal transition it
+// also announces contract.expired on the bus with reason=provisioning_failed so
+// subscribers learn about the failure through the same channel a TTL/container
+// death expiry would surface it (see docs/DESIGN.md §6).
 func (b *broker) fail(ctx context.Context, id, containerID string) {
 	if containerID != "" {
 		if err := b.rt.Kill(ctx, containerID); err != nil && !errors.Is(err, runtime.ErrNotFound) {
@@ -1003,6 +1006,12 @@ func (b *broker) fail(ctx context.Context, id, containerID string) {
 	if cerr == nil {
 		b.cap.Free(c.ReservedCPUs, c.ReservedMemoryMB)
 	}
+	// Announce the terminal transition on the bus so subscribers learn about a
+	// provisioning failure through the same lifecycle channel a TTL / container
+	// death expiry uses. Emitted only after the winning UpdateState above so a
+	// race with the reaper does not double-emit; the reason field lets a
+	// subscriber tell this apart from a natural TTL expiry (see events.go).
+	b.publishExpired(id, ExpiredReasonProvisioningFailed)
 }
 
 // userdataError reports a userdata script that exited non-zero.
@@ -1239,9 +1248,12 @@ type execStreamExit struct {
 // state to persist across steps send a single compound command.
 //
 // The call requires the contract's bearer token (Authorization: Bearer <token>)
-// and rejects execs against a contract that is not ready (409), unknown (404),
-// or presented without a valid token (401). These checks are identical in both
-// modes: the stream flag only changes how a successful exec's output is framed.
+// and rejects execs against a contract that is not usable (409), unknown (404),
+// or presented without a valid token (401). A contract in the expiring lead
+// window is still usable: the whole point of that window is to give the client
+// time to exfiltrate work, so execs are accepted through it. These checks are
+// identical in both modes: the stream flag only changes how a successful
+// exec's output is framed.
 func (b *broker) exec(w http.ResponseWriter, r *http.Request) {
 	c, err := b.store.Get(r.PathValue("id"))
 	if errors.Is(err, contract.ErrNotFound) {
@@ -1258,7 +1270,7 @@ func (b *broker) exec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if c.State != contract.StateReady {
+	if c.State != contract.StateReady && c.State != contract.StateExpiring {
 		writeError(w, http.StatusConflict, "contract not ready")
 		return
 	}

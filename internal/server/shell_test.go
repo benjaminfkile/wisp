@@ -13,6 +13,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/benjaminfkile/wisp/internal/contract"
 	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
@@ -253,6 +254,40 @@ func TestShellHandshakeRequiresToken(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown-contract status = %d, want 404", rec.Code)
 	}
+}
+
+// TestShellAllowedDuringExpiring: the shell handshake succeeds while a contract
+// is in the expiring lead window (not just ready). The whole point of the lead
+// time is to let the client exfiltrate work before the hard kill, so returning
+// 409 during expiring would defeat it.
+func TestShellAllowedDuringExpiring(t *testing.T) {
+	h, store, fake := testServer(t)
+
+	containerEnd, testEnd := net.Pipe()
+	defer testEnd.Close()
+	fake.ShellHandler = func(id string, cmd []string) (io.ReadWriteCloser, error) {
+		return containerEnd, nil
+	}
+
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+	if _, err := store.UpdateState(created.ContractID, contract.StateExpiring); err != nil {
+		t.Fatalf("UpdateState expiring: %v", err)
+	}
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	wsBase := "ws" + strings.TrimPrefix(srv.URL, "http")
+	shellURL := wsBase + "/contracts/" + created.ContractID + "/shell?token=" + created.Token
+
+	conn, resp, err := websocket.DefaultDialer.Dial(shellURL, nil)
+	if err != nil {
+		got := 0
+		if resp != nil {
+			got = resp.StatusCode
+		}
+		t.Fatalf("expiring shell handshake failed: err=%v status=%d, want a successful upgrade", err, got)
+	}
+	conn.Close()
 }
 
 // TestShellEndToEnd drives a real WebSocket handshake through the server and the

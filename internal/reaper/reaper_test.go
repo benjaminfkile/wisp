@@ -203,16 +203,21 @@ func TestReaperExpiringThenExpired(t *testing.T) {
 }
 
 // TestReaperExpiresReadyPastTTL: a ready contract already past its TTL (the lead
-// window was missed) goes straight to expired and is killed.
+// window was missed) goes straight to expired and is killed. The fired Event
+// carries Reason=ReasonTTLExpired so the bus can tell a natural TTL expiry
+// apart from an out-of-band container death expiry (both drive the same
+// terminal transition otherwise).
 func TestReaperExpiresReadyPastTTL(t *testing.T) {
 	store := contract.NewStore()
 	fake := runtime.NewFake()
 	c, cid := readyContract(t, store, fake, time.Hour)
 
+	var events []Event
 	rp := New(store, fake, Options{
 		Lead:   time.Minute,
 		Logger: discardLogger(),
 		Now:    func() time.Time { return c.ExpiresAt.Add(time.Second) },
+		Notify: func(e Event) { events = append(events, e) },
 	})
 
 	rp.Tick(context.Background())
@@ -223,6 +228,9 @@ func TestReaperExpiresReadyPastTTL(t *testing.T) {
 	}
 	if _, ok := fake.Container(cid); ok {
 		t.Error("container survived; want killed")
+	}
+	if len(events) != 1 || events[0].Reason != ReasonTTLExpired {
+		t.Fatalf("events = %+v, want one expired event with Reason=%q", events, ReasonTTLExpired)
 	}
 }
 
@@ -398,6 +406,11 @@ func TestReaperReapsDeadContainerBeforeTTL(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].To != contract.StateExpired {
 		t.Fatalf("events = %+v, want one ready→expired event", events)
+	}
+	// The container-death path tags its Reason so the bus can distinguish it
+	// from a natural TTL expiry (see LifecycleNotify).
+	if events[0].Reason != ReasonContainerDied {
+		t.Errorf("events[0].Reason = %q, want %q", events[0].Reason, ReasonContainerDied)
 	}
 }
 

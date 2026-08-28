@@ -82,7 +82,9 @@ func parseShellControl(data []byte) (shellControl, bool) {
 // rides the URL or the subprotocol rather than an Authorization header). All
 // pre-upgrade rejections use plain HTTP status codes so a client that fails the
 // handshake sees a normal response: unknown contract (404), missing/invalid
-// token (401), or a contract that is not ready (409).
+// token (401), or a contract that is not usable (409). A contract in the
+// expiring lead window is still usable: the whole point of that window is to
+// give the client time to exfiltrate work, so shells are accepted through it.
 func (b *broker) shell(w http.ResponseWriter, r *http.Request) {
 	c, err := b.store.Get(r.PathValue("id"))
 	if errors.Is(err, contract.ErrNotFound) {
@@ -99,7 +101,7 @@ func (b *broker) shell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if c.State != contract.StateReady {
+	if c.State != contract.StateReady && c.State != contract.StateExpiring {
 		writeError(w, http.StatusConflict, "contract not ready")
 		return
 	}

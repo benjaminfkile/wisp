@@ -2,6 +2,9 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,7 +15,9 @@ import (
 
 	"github.com/benjaminfkile/wisp/internal/bus"
 	"github.com/benjaminfkile/wisp/internal/contract"
+	"github.com/benjaminfkile/wisp/internal/policy"
 	"github.com/benjaminfkile/wisp/internal/reaper"
+	"github.com/benjaminfkile/wisp/internal/runtime"
 )
 
 // wsEvent is the shape a subscriber reads off WS /events: a bus event framed as
@@ -209,7 +214,8 @@ func TestLifecycleEventsEmitted(t *testing.T) {
 
 // TestLifecycleNotify: the reaper hook maps time-based transitions to the right
 // lifecycle events on the bus, covering the expiring/expired criterion without
-// driving a real clock.
+// driving a real clock. The two expired paths (TTL and container death) each
+// carry the matching reason on the payload so a subscriber can tell them apart.
 func TestLifecycleNotify(t *testing.T) {
 	b := bus.New(nil)
 	sub := b.Subscribe()
@@ -218,26 +224,34 @@ func TestLifecycleNotify(t *testing.T) {
 	notify := LifecycleNotify(b, nil)
 
 	notify(reaper.Event{ContractID: "c1", From: contract.StateReady, To: contract.StateExpiring})
-	notify(reaper.Event{ContractID: "c1", From: contract.StateExpiring, To: contract.StateExpired})
+	notify(reaper.Event{ContractID: "c1", From: contract.StateExpiring, To: contract.StateExpired, Reason: reaper.ReasonTTLExpired})
+	notify(reaper.Event{ContractID: "c2", From: contract.StateReady, To: contract.StateExpired, Reason: reaper.ReasonContainerDied})
 	// A transition with no lifecycle event (e.g. into provisioning) is ignored.
 	notify(reaper.Event{ContractID: "c1", From: contract.StateRequested, To: contract.StateProvisioning})
 
-	want := []string{eventContractExpiring, eventContractExpired}
-	for i, wantType := range want {
+	want := []struct {
+		eventType string
+		reason    string
+	}{
+		{eventContractExpiring, ""},
+		{eventContractExpired, ExpiredReasonTTLExpired},
+		{eventContractExpired, ExpiredReasonContainerDied},
+	}
+	for i, w := range want {
 		select {
 		case e := <-sub.Events():
-			if e.Type != wantType {
-				t.Errorf("event %d = %q, want %q", i, e.Type, wantType)
+			if e.Type != w.eventType {
+				t.Errorf("event %d = %q, want %q", i, e.Type, w.eventType)
 			}
 			var p lifecyclePayload
 			if err := json.Unmarshal(e.Data, &p); err != nil {
 				t.Fatalf("decode payload: %v", err)
 			}
-			if p.ContractID != "c1" {
-				t.Errorf("event %d contract_id = %q, want c1", i, p.ContractID)
+			if p.Reason != w.reason {
+				t.Errorf("event %d reason = %q, want %q", i, p.Reason, w.reason)
 			}
 		case <-time.After(time.Second):
-			t.Fatalf("timed out waiting for event %d (%s)", i, wantType)
+			t.Fatalf("timed out waiting for event %d (%s)", i, w.eventType)
 		}
 	}
 
@@ -246,5 +260,122 @@ func TestLifecycleNotify(t *testing.T) {
 	case e := <-sub.Events():
 		t.Fatalf("unexpected event %q", e.Type)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestLifecycleEventOmitsReasonForNonExpired: contract.created / .ready /
+// .released / .expiring payloads never carry a reason field so their wire shape
+// is byte-for-byte unchanged for existing subscribers.
+func TestLifecycleEventOmitsReasonForNonExpired(t *testing.T) {
+	h, _, _ := testServer(t)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	conn := dialEvents(t, srv, "")
+	defer conn.Close()
+
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	// The first two events are contract.created and contract.ready.
+	for i := 0; i < 2; i++ {
+		e := readEvent(t, conn)
+		if strings.Contains(string(e.Data), `"reason"`) {
+			t.Errorf("event %d (%s) carries reason: %s", i, e.Type, e.Data)
+		}
+	}
+
+	// Release emits contract.released, also without a reason.
+	rec := doAuth(t, h, http.MethodDelete, "/contracts/"+created.ContractID, created.Token, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("release status = %d, want 200", rec.Code)
+	}
+	rel := readEvent(t, conn)
+	if strings.Contains(string(rel.Data), `"reason"`) {
+		t.Errorf("released event carries reason: %s", rel.Data)
+	}
+}
+
+// TestProvisioningFailurePublishesExpired: a create whose provisioning fails
+// (e.g. userdata exiting non-zero) publishes contract.expired on the bus with
+// reason=provisioning_failed, so a subscriber learns about the failure through
+// the same lifecycle channel a TTL / container death expiry uses.
+func TestProvisioningFailurePublishesExpired(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	// userdata exits non-zero: provisioning fails, the container is destroyed,
+	// and the contract is marked expired.
+	fake.ExecHandler = func(id string, cmd []string) (runtime.ExecResult, error) {
+		return runtime.ExecResult{ExitCode: 1, Stderr: "boom"}, nil
+	}
+	eventBus := bus.New(nil)
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, policy.Default(), eventBus, "")
+
+	// Subscribe BEFORE the create so no event races the reader.
+	sub := eventBus.Subscribe(eventContractExpired)
+	defer sub.Close()
+
+	rec := do(t, h, http.MethodPost, "/contracts",
+		`{"ttl_seconds":60,"userdata":"exit 1"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("create status = %d, want 500 on failed userdata (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	select {
+	case e := <-sub.Events():
+		if e.Type != eventContractExpired {
+			t.Fatalf("event type = %q, want %q", e.Type, eventContractExpired)
+		}
+		var p lifecyclePayload
+		if err := json.Unmarshal(e.Data, &p); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if p.Status != string(contract.StateExpired) {
+			t.Errorf("status = %q, want %q", p.Status, contract.StateExpired)
+		}
+		if p.Reason != ExpiredReasonProvisioningFailed {
+			t.Errorf("reason = %q, want %q", p.Reason, ExpiredReasonProvisioningFailed)
+		}
+		// The contract id in the payload matches the one that failed.
+		all := store.List()
+		if len(all) != 1 {
+			t.Fatalf("stored contracts = %d, want 1", len(all))
+		}
+		if p.ContractID != all[0].ID {
+			t.Errorf("payload contract_id = %q, want %q", p.ContractID, all[0].ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for contract.expired after provisioning failure")
+	}
+}
+
+// TestProvisioningFailurePublishesExpiredOnImagePull: the same expired event
+// with reason=provisioning_failed fires when the image pull itself fails,
+// covering the other broker.fail() entry points besides userdata.
+func TestProvisioningFailurePublishesExpiredOnImagePull(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	fake.EnsureImageErr = errors.New("pull failed")
+	eventBus := bus.New(nil)
+	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, policy.Default(), eventBus, "")
+
+	sub := eventBus.Subscribe(eventContractExpired)
+	defer sub.Close()
+
+	rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":60}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("create status = %d, want 500 on failed image pull (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	select {
+	case e := <-sub.Events():
+		var p lifecyclePayload
+		if err := json.Unmarshal(e.Data, &p); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if p.Reason != ExpiredReasonProvisioningFailed {
+			t.Errorf("reason = %q, want %q", p.Reason, ExpiredReasonProvisioningFailed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for contract.expired after failed image pull")
 	}
 }

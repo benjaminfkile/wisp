@@ -281,15 +281,17 @@ WS     /events                        subscribe, optional ?type=a,b filter      
 - `POST /contracts/:id/exec` runs the command through `/bin/sh -c` (or `cmd /c`
   on a Windows daemon) as a fresh process and returns
   `{stdout, stderr, exit_code}` (a non-zero exit is still `200`). It is `409`
-  unless the contract is `ready`, `400` on an empty command. With `?stream=1`
-  the response is `text/event-stream`: `chunk` events carrying
-  `{"stream":"stdout"|"stderr","data":"..."}`, then one `exit` event with
-  `{"exit_code":n}` (or an `error` event if the exec fails mid-stream).
+  unless the contract is `ready` or `expiring` (execs stay usable through the
+  lead window so the client can exfiltrate work before the hard kill), `400` on
+  an empty command. With `?stream=1` the response is `text/event-stream`:
+  `chunk` events carrying `{"stream":"stdout"|"stderr","data":"..."}`, then one
+  `exit` event with `{"exit_code":n}` (or an `error` event if the exec fails
+  mid-stream).
 - `WS /contracts/:id/shell` bridges a TTY exec of `/bin/sh` (`cmd.exe` on
   Windows). Raw bytes ride binary messages both ways; a text message
   `{"type":"resize","rows":n,"cols":n}` resizes the TTY and any other text is
   written to stdin verbatim. Pre-upgrade rejections are `404` / `401` / `409`
-  (not ready).
+  (not `ready` or `expiring`; shells stay usable through the lead window too).
 
 Every response body other than the SSE stream is JSON; errors are
 `{"error":"..."}`.
@@ -338,6 +340,12 @@ There is no persistence or replay.
 Wisp publishes its own contract lifecycle events on the same bus:
 `contract.created`, `contract.ready`, `contract.expiring`, `contract.released`,
 `contract.expired`. Each carries `{"contract_id":"...","status":"..."}`.
+`contract.expired` additionally carries a `reason` field so a subscriber can
+distinguish a provisioning failure (`provisioning_failed`, published by the
+create path when image pull, container create/start, or userdata fails) from a
+natural TTL expiry (`ttl_expired`) or an out-of-band container death
+(`container_died`, detected by the reaper's liveness sweep). The other
+lifecycle events omit the field.
 
 ```sh
 # subscribe (blocks, prints events as JSON)

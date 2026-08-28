@@ -427,6 +427,60 @@ func TestExecEmptyCommand(t *testing.T) {
 	}
 }
 
+// TestExecAllowedDuringExpiring: exec is accepted while a contract is in the
+// expiring lead window (not just ready). The whole point of the lead time is
+// to let the client exfiltrate work before the hard kill, so returning 409
+// during expiring would defeat it.
+func TestExecAllowedDuringExpiring(t *testing.T) {
+	h, store, fake := testServer(t)
+	fake.ExecHandler = func(id string, cmd []string) (runtime.ExecResult, error) {
+		return runtime.ExecResult{Stdout: "bye\n", ExitCode: 0}, nil
+	}
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	// Move the contract to expiring: same lead-window state the reaper installs.
+	if _, err := store.UpdateState(created.ContractID, contract.StateExpiring); err != nil {
+		t.Fatalf("UpdateState expiring: %v", err)
+	}
+
+	rec := doAuth(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec",
+		created.Token, `{"command":"git push"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expiring exec status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var resp execResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Stdout != "bye\n" {
+		t.Errorf("stdout = %q, want %q", resp.Stdout, "bye\n")
+	}
+}
+
+// TestExecStreamAllowedDuringExpiring: the streaming exec path likewise accepts
+// requests during the expiring lead window, matching the sync path.
+func TestExecStreamAllowedDuringExpiring(t *testing.T) {
+	h, store, fake := testServer(t)
+	fake.StreamHandler = func(id string, cmd []string, emit func(runtime.ExecChunk) error) (int, error) {
+		_ = emit(runtime.ExecChunk{Stream: "stdout", Data: []byte("done")})
+		return 0, nil
+	}
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	if _, err := store.UpdateState(created.ContractID, contract.StateExpiring); err != nil {
+		t.Fatalf("UpdateState expiring: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/contracts/"+created.ContractID+"/exec?stream=1",
+		strings.NewReader(`{"command":"upload"}`))
+	req.Header.Set("Authorization", "Bearer "+created.Token)
+	rec := newFlushRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.status != http.StatusOK {
+		t.Fatalf("expiring stream exec status = %d, want 200", rec.status)
+	}
+}
+
 func TestCreateBootsAndReturns(t *testing.T) {
 	h, store, fake := testServer(t)
 

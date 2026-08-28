@@ -170,13 +170,17 @@ can actually run (`shared` always; `sandboxed` when the gVisor runtime `runsc`
 is registered; `vm` when a Kata runtime (`kata-runtime` or `kata`) is registered
 on a Linux daemon, or on any Windows daemon via Hyper-V), and `default` is the
 level applied when a create omits `isolation`. A consumer only ever sees, and
-can only request, levels this host can launch. Wisp **fails loud, never
-downgrades**: a policy-allowed level the host cannot run is dropped with a
-startup warning, and if *none* of the configured levels are runnable (and the
-operator excluded `shared`) the host logs an error, advertises an empty
-`supported` list, and **refuses every `POST /contracts` with `409 no runnable
-isolation tier`**, whether or not the request names an isolation, instead of
-silently falling back to `shared`.
+can only request, levels this host can launch. When a `vm` lease launches on a
+Linux daemon Wisp names the Kata runtime the daemon actually registered (the
+canonical `kata-runtime` when present, else the short alias `kata`), so a daemon
+that registered Kata under either name both advertises `vm` and launches it
+successfully (launch tracks detection). Wisp **fails loud, never downgrades**: a
+policy-allowed level the host cannot run is dropped with a startup warning, and
+if *none* of the configured levels are runnable (and the operator excluded
+`shared`) the host logs an error, advertises an empty `supported` list, and
+**refuses every `POST /contracts` with `409 no runnable isolation tier`**,
+whether or not the request names an isolation, instead of silently falling back
+to `shared`.
 
 The `capacity` block advertises the host's aggregate capacity posture: the
 operator budgets (`max_contracts`, `total_cpus`, `total_memory_mb`; `0` means

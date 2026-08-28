@@ -458,29 +458,43 @@ func TestFakeDaemonInfo(t *testing.T) {
 // would, recording the Runtime and Isolation values on the captured container so
 // tests can assert the full level→mechanism mapping without a daemon. The full
 // matrix: shared (and the empty default) → neither set; sandboxed → Runtime
-// "runsc"; vm on a linux daemon → Runtime "kata-runtime"; vm on a windows daemon
-// → Isolation "hyperv". Runtime and Isolation are never both set.
+// "runsc"; vm on a linux daemon → the Kata runtime name the daemon actually
+// registered ("kata-runtime" canonical, or the short alias "kata" when it is the
+// only one present); vm on a windows daemon → Isolation "hyperv". Runtime and
+// Isolation are never both set.
 func TestFakeCreateIsolationMechanism(t *testing.T) {
 	ctx := context.Background()
 	tests := []struct {
 		name          string
 		os            ContainerOS
+		runtimes      []string
 		isolation     string
 		wantRuntime   string
 		wantIsolation string
 	}{
-		{"shared linux", OSLinux, IsolationShared, "", ""},
-		{"empty defaults to shared", OSLinux, "", "", ""},
-		{"shared windows", OSWindows, IsolationShared, "", ""},
-		{"sandboxed linux", OSLinux, IsolationSandboxed, "runsc", ""},
-		{"sandboxed windows", OSWindows, IsolationSandboxed, "runsc", ""},
-		{"vm linux", OSLinux, IsolationVM, "kata-runtime", ""},
-		{"vm windows", OSWindows, IsolationVM, "", "hyperv"},
+		{"shared linux", OSLinux, nil, IsolationShared, "", ""},
+		{"empty defaults to shared", OSLinux, nil, "", "", ""},
+		{"shared windows", OSWindows, nil, IsolationShared, "", ""},
+		{"sandboxed linux", OSLinux, nil, IsolationSandboxed, "runsc", ""},
+		{"sandboxed windows", OSWindows, nil, IsolationSandboxed, "runsc", ""},
+		{"vm linux canonical kata-runtime", OSLinux, []string{"runc", "kata-runtime"}, IsolationVM, "kata-runtime", ""},
+		// Regression for the runtime-alias mismatch: a daemon that registered
+		// Kata only under the short alias "kata" must launch vm as "kata", not
+		// as "kata-runtime" (the latter would be unknown to such a daemon).
+		{"vm linux short kata alias", OSLinux, []string{"runc", "kata"}, IsolationVM, "kata", ""},
+		// When both aliases are registered the canonical name wins so launch
+		// stays predictable across daemons that register both.
+		{"vm linux both aliases prefers kata-runtime", OSLinux, []string{"runc", "kata", "kata-runtime"}, IsolationVM, "kata-runtime", ""},
+		// Default permissive runtimes (nil) include "kata-runtime", so the
+		// no-Runtimes case still resolves to the canonical name.
+		{"vm linux default runtimes", OSLinux, nil, IsolationVM, "kata-runtime", ""},
+		{"vm windows", OSWindows, nil, IsolationVM, "", "hyperv"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := NewFake()
 			f.OS = tt.os
+			f.Runtimes = tt.runtimes
 			id, err := f.Create(ctx, "img", CreateOptions{Isolation: tt.isolation})
 			if err != nil {
 				t.Fatalf("Create: %v", err)

@@ -26,6 +26,17 @@ type DockerRuntime struct {
 	// modes at runtime, so a cached value stays correct for the runtime's life.
 	containerOS ContainerOS
 
+	// kataRuntime is the Kata runtime name the daemon actually registered
+	// ("kata-runtime" or the short alias "kata"), detected once at construction
+	// and used verbatim when launching a vm lease on a Linux daemon (see Create /
+	// launchMechanism). Detection accepts either name so a daemon that only
+	// registered the short alias still advertises vm via
+	// policy.SupportedIsolations AND launches successfully. Without this cache,
+	// launch would always name "kata-runtime" and fail on such a daemon. Empty
+	// when no Kata runtime is registered; in that state vm is not advertised and
+	// no vm launch is ever attempted.
+	kataRuntime string
+
 	// gpuRunner runs nvidia-smi for GPU enumeration (see GPUs). It defaults to the
 	// real execRunner; keeping it a field lets the enumeration seam be swapped
 	// without touching the Docker client.
@@ -40,7 +51,7 @@ func NewDockerRuntime() (*DockerRuntime, error) {
 		return nil, fmt.Errorf("runtime: docker client: %w", err)
 	}
 	d := &DockerRuntime{cli: cli, gpuRunner: execRunner{}}
-	d.detectContainerOS(context.Background())
+	d.detectDaemon(context.Background())
 	return d, nil
 }
 
@@ -48,17 +59,25 @@ func NewDockerRuntime() (*DockerRuntime, error) {
 // callers (and tests that supply a stub client) can inject their own client.
 func NewDockerRuntimeWithClient(cli client.APIClient) *DockerRuntime {
 	d := &DockerRuntime{cli: cli, gpuRunner: execRunner{}}
-	d.detectContainerOS(context.Background())
+	d.detectDaemon(context.Background())
 	return d
 }
 
-// detectContainerOS queries the daemon for its container OS mode via Info and
-// caches it. Call it once at construction and again if the runtime reconnects
-// its client. Detection is best-effort: if Info fails or reports an unknown
-// OSType, the runtime falls back to OSLinux, the Docker default. It never
-// switches the daemon's mode — the operator owns that.
-func (d *DockerRuntime) detectContainerOS(ctx context.Context) {
+// detectDaemon queries the daemon for its container OS mode AND the Kata
+// runtime name it actually registered, caching both. Call it once at
+// construction and again if the runtime reconnects its client. Both are pinned
+// once at startup because the daemon does not switch OS modes or reload its OCI
+// runtime list at runtime, so cached values stay correct for the runtime's life.
+//
+// Detection is best-effort: if Info fails or reports an unknown OSType, the
+// runtime falls back to OSLinux (the Docker default), and the Kata runtime name
+// is left empty (launchMechanism then falls back to the canonical "kata-runtime"
+// on a vm launch, a state that is only ever reached on a daemon where policy
+// would not have advertised vm at all, so this fallback is defensive rather than
+// load-bearing). It never switches the daemon's mode; the operator owns that.
+func (d *DockerRuntime) detectDaemon(ctx context.Context) {
 	d.containerOS = OSLinux
+	d.kataRuntime = ""
 	info, err := d.cli.Info(ctx)
 	if err != nil {
 		return
@@ -66,6 +85,11 @@ func (d *DockerRuntime) detectContainerOS(ctx context.Context) {
 	if ContainerOS(info.OSType) == OSWindows {
 		d.containerOS = OSWindows
 	}
+	runtimes := make([]string, 0, len(info.Runtimes))
+	for name := range info.Runtimes {
+		runtimes = append(runtimes, name)
+	}
+	d.kataRuntime = pickKataRuntimeName(runtimes)
 }
 
 // ContainerOS implements Runtime, returning the daemon's detected container OS
@@ -314,10 +338,14 @@ func (d *DockerRuntime) Create(ctx context.Context, image string, opts CreateOpt
 	}
 	// Select the launch mechanism from the requested isolation level. The daemon
 	// OS is distinguished the same way exec-command wrapping already does it (the
-	// cached containerOS). launchMechanism returns at most one of the two — they
-	// are never both set — leaving every other HostConfig field (SecurityOpt,
-	// Resources, NetworkMode) untouched.
-	runtimeName, isolationMode := launchMechanism(opts.Isolation, d.containerOS)
+	// cached containerOS), and the DETECTED Kata runtime name (cached at
+	// construction from Info.Runtimes) is passed through so a Linux vm launch
+	// names whichever alias the daemon actually registered ("kata-runtime" or
+	// the short alias "kata"), instead of always naming "kata-runtime" and
+	// failing on a daemon that registered only the alias. launchMechanism returns
+	// at most one of the two (they are never both set), leaving every other
+	// HostConfig field (SecurityOpt, Resources, NetworkMode) untouched.
+	runtimeName, isolationMode := launchMechanism(opts.Isolation, d.containerOS, d.kataRuntime)
 	host.Runtime = runtimeName
 	host.Isolation = container.Isolation(isolationMode)
 	// Attach any exclusively-assigned GPU devices through the per-launch-mechanism

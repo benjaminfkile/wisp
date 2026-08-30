@@ -101,12 +101,15 @@ requested → provisioning → ready → (in use) → expiring → releasing →
   once the contract reaches `releasing` or a terminal state do they return `409`.
 - **releasing**: the transient, **non-terminal** fence a `DELETE /contracts/:id` installs BEFORE
   killing the container so the reaper's TTL / container-died sweeps cannot race the release. The
-  reaper skips `releasing` contracts for a short release grace (30 s), and inside that window the
-  DELETE handler is the sole owner of the container kill and the terminal transition. Past the
-  grace the release is presumed stuck (the handler crashed mid-release, or its `Kill` hung) and
-  the reaper expires the contract just like any other non-terminal one, so the lease's capacity
-  and GPUs return to the allocators instead of leaking until restart; `expired` is therefore also
-  a legal successor from `releasing`. Exec and shell are `409` against a `releasing` contract
+  reaper skips `releasing` contracts for a short release grace
+  (`WISP_RELEASE_GRACE_SECONDS`, default 30 s), and inside that window the DELETE handler is the
+  sole owner of the container kill and the terminal transition. Past the grace the release is
+  presumed stuck (the handler died mid-release, or its request was cancelled before it reached
+  the final mark-released transition) and the reaper expires the contract just like any other
+  non-terminal one, so the lease's capacity and GPUs return to the allocators instead of leaking
+  until restart; `expired` is therefore also a legal successor from `releasing`. A hung Docker
+  daemon on the reaper's own `Kill` is bounded separately (see §13, "Release grace bounds the
+  fence"), not by this grace. Exec and shell are `409` against a `releasing` contract
   (the container is being torn down). A `DELETE` against a contract already in `releasing` is an
   idempotent success (200 echoing the current `releasing` status) so a concurrent second DELETE
   does not double-kill or double-free. The state is internal to the release handler (it lives at
@@ -615,11 +618,17 @@ switches it**, it only serves whichever mode the host is in.
   containers still report running on the daemon side and are left alone; a transport error is
   inconclusive and retried next sweep.
 - **Release grace bounds the fence**, the reaper skips a `releasing` contract for a short grace
-  (30 s) after the DELETE handler installed the fence, so the handler owns the tear down without
-  the reaper racing it. Past the grace the release is presumed stuck (the handler crashed
-  mid-release, or its `Kill` hung) and the reaper expires the contract like any other
-  non-terminal one, returning its capacity and GPUs to the allocators so a stalled release never
-  leaks a lease's reservation until wispd restarts.
+  (`WISP_RELEASE_GRACE_SECONDS`, default 30 s) after the DELETE handler installed the fence, so
+  the handler owns the tear down without the reaper racing it. Past the grace the release is
+  presumed stuck (the handler died mid-release, or its request was cancelled before the final
+  mark-released transition) and the reaper expires the contract like any other non-terminal one,
+  returning its capacity and GPUs to the allocators so a stalled release never leaks a lease's
+  reservation until wispd restarts.
+- **Reaper Kill is bounded**, each reaper `Kill` runs under a 30 s timeout so a hung Docker
+  daemon (a wedged `ContainerRemove`) cannot stall the sweep. On timeout the contract is left
+  in place for the next tick to retry, and the sweep proceeds with the remaining contracts, so
+  one wedged container never freezes reaping for the whole store or keeps other capacity
+  reservations from returning to the allocators.
 
 ## 14. Open questions
 

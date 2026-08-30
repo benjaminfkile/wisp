@@ -897,10 +897,97 @@ func TestReaperDefaults(t *testing.T) {
 	if rp.releaseGrace != defaultReleaseGrace {
 		t.Errorf("releaseGrace = %v, want %v", rp.releaseGrace, defaultReleaseGrace)
 	}
+	if rp.killTimeout != defaultKillTimeout {
+		t.Errorf("killTimeout = %v, want %v", rp.killTimeout, defaultKillTimeout)
+	}
 	if rp.now == nil {
 		t.Error("now is nil; want default time.Now")
 	}
 	if rp.logger == nil {
 		t.Error("logger is nil; want default")
+	}
+}
+
+// hangingKillRuntime wraps a Fake so a targeted container id hangs Kill until
+// the caller's context is cancelled, standing in for a Docker daemon whose
+// ContainerRemove has wedged. Any other id delegates to the fake's normal Kill.
+// Embedding the concrete *runtime.Fake means Kill defined here shadows the
+// embedded Kill and the wrapper still satisfies runtime.Runtime.
+type hangingKillRuntime struct {
+	*runtime.Fake
+	hangID string
+}
+
+func (h *hangingKillRuntime) Kill(ctx context.Context, id string) error {
+	if id == h.hangID {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return h.Fake.Kill(ctx, id)
+}
+
+// TestReaperKillTimeoutContinuesTick pins the fix for the "one hung Kill stalls
+// the whole tick" scenario: with a bounded Kill, a runtime whose Kill blocks on
+// the first contract processed must NOT prevent the reaper from moving on and
+// expiring the remaining contracts. Without the bound the reaper loop would
+// block on the wedged Kill and the second contract's TTL expiry would sit
+// unenforced until the daemon responded, dropping capacity and GPUs on the
+// floor for the duration.
+func TestReaperKillTimeoutContinuesTick(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+
+	// Two ready contracts, both past their TTL. The store lists in CreatedAt
+	// order, so the first-created (hung) contract is processed first; without
+	// the Kill bound the sweep would block there and never reach live.
+	hung, hungCID := readyContract(t, store, fake, time.Hour)
+	live, liveCID := readyContract(t, store, fake, time.Hour)
+
+	rt := &hangingKillRuntime{Fake: fake, hangID: hungCID}
+
+	rp := New(store, rt, Options{
+		Lead:        time.Minute,
+		KillTimeout: 50 * time.Millisecond,
+		Logger:      discardLogger(),
+		// Past both TTLs so both contracts are due for expiry.
+		Now: func() time.Time { return hung.ExpiresAt.Add(time.Second) },
+	})
+
+	done := make(chan struct{})
+	go func() {
+		rp.Tick(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Tick stalled on a hung Kill; each reaper Kill must be bounded so the sweep can continue with the remaining contracts")
+	}
+
+	// The hung contract must be left in place so the next tick can retry the
+	// kill; a timed-out Kill is inconclusive and must not fake a terminal
+	// transition on the store side either.
+	got, err := store.Get(hung.ID)
+	if err != nil {
+		t.Fatalf("Get hung contract: %v", err)
+	}
+	if got.State == contract.StateExpired {
+		t.Errorf("hung contract state = %q; a Kill timeout must leave the contract for the next tick, not transition it to expired", got.State)
+	}
+	if _, ok := fake.Container(hungCID); !ok {
+		t.Error("hung container was removed despite the Kill timing out")
+	}
+
+	// The live contract must have been reaped despite the earlier hung Kill;
+	// this is the regression the timeout was added to prevent.
+	liveGot, err := store.Get(live.ID)
+	if err != nil {
+		t.Fatalf("Get live contract: %v", err)
+	}
+	if liveGot.State != contract.StateExpired {
+		t.Errorf("live contract state = %q; want expired (the reaper must reap the remaining contracts even when one Kill hangs)", liveGot.State)
+	}
+	if _, ok := fake.Container(liveCID); ok {
+		t.Error("live contract's container survived; it must be reaped even when another contract's Kill hangs")
 	}
 }

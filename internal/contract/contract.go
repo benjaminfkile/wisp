@@ -27,8 +27,9 @@ import (
 // The TTL reaper may expire an active contract from any state where a
 // container exists, and skips StateReleasing only for a short grace window
 // after the fence goes up so the release handler owns the tear down; past
-// the grace the release is presumed stuck (the handler crashed mid-release
-// or its Kill hung) and the reaper expires the contract like any other
+// the grace the release is presumed stuck (the handler died mid-release or
+// its request was cancelled before it reached the final mark-released
+// transition) and the reaper expires the contract like any other
 // non-terminal one so its capacity and GPUs return to the allocators.
 type State string
 
@@ -98,7 +99,8 @@ var legalTransitions = map[State]map[State]bool{
 		// The DELETE handler's final "mark released" is the normal successor,
 		// serializing the terminal side effects (freeing capacity and GPUs) to
 		// one caller. StateExpired is the reaper's stuck-release escape hatch:
-		// past the release grace the reaper expires a contract still in
+		// past the release grace (the release handler died mid-release or its
+		// request was cancelled) the reaper expires a contract still in
 		// StateReleasing so its capacity is not leaked. Whichever side wins the
 		// state-machine transition owns the terminal side effects.
 		StateReleased: true,

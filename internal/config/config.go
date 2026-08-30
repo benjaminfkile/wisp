@@ -13,10 +13,13 @@ import (
 const defaultAddr = "127.0.0.1:8080"
 
 // TTL-reaper defaults (see docs/DESIGN.md §4, §9). The reaper scans every
-// ReapInterval and warns contracts ExpiringLead before their TTL.
+// ReapInterval and warns contracts ExpiringLead before their TTL. ReleaseGrace
+// bounds how long a contract may sit in StateReleasing before the reaper stops
+// skipping it and expires the contract like any other non-terminal one.
 const (
 	defaultReapInterval = time.Second
 	defaultExpiringLead = time.Minute
+	defaultReleaseGrace = 30 * time.Second
 )
 
 // Config holds runtime configuration for the daemon.
@@ -30,6 +33,14 @@ type Config struct {
 	// ExpiringLead is how long before a contract's TTL it is moved to the
 	// expiring warning state, giving the client time to exfiltrate work.
 	ExpiringLead time.Duration
+
+	// ReleaseGrace is how long a contract may sit in StateReleasing before the
+	// reaper stops skipping it. Inside the window the DELETE handler owns the
+	// tear down; past it the release is presumed stuck (the handler died
+	// mid-release, or its request was cancelled before the final mark-released
+	// transition) and the reaper expires the contract like any other
+	// non-terminal one so its capacity and GPUs return to the allocators.
+	ReleaseGrace time.Duration
 
 	// ImageConfigFile is an optional path to a JSON policy config file defining
 	// the image allow-list, default image, and limits (see docs/DESIGN.md §7).
@@ -51,15 +62,19 @@ type Config struct {
 //
 //	WISP_ADDR                  full listen address (host:port). Takes precedence.
 //	WISP_PORT                  port only; combined with 127.0.0.1 when WISP_ADDR is unset.
-//	WISP_REAP_INTERVAL_SECONDS reaper scan interval in seconds (positive integer).
-//	WISP_EXPIRING_LEAD_SECONDS expiring-warning lead time in seconds (positive integer).
-//	WISP_CONFIG                path to a JSON image allow-list + limits config (optional).
-//	WISP_APP_TOKEN             app-level bearer token gating contract creation (optional).
+//	WISP_REAP_INTERVAL_SECONDS  reaper scan interval in seconds (positive integer).
+//	WISP_EXPIRING_LEAD_SECONDS  expiring-warning lead time in seconds (positive integer).
+//	WISP_RELEASE_GRACE_SECONDS  release-grace window in seconds (positive integer); how
+//	                            long a contract may sit in StateReleasing before the
+//	                            reaper expires it. Defaults to 30.
+//	WISP_CONFIG                 path to a JSON image allow-list + limits config (optional).
+//	WISP_APP_TOKEN              app-level bearer token gating contract creation (optional).
 func Load() (Config, error) {
 	cfg := Config{
 		Addr:            defaultAddr,
 		ReapInterval:    defaultReapInterval,
 		ExpiringLead:    defaultExpiringLead,
+		ReleaseGrace:    defaultReleaseGrace,
 		ImageConfigFile: os.Getenv("WISP_CONFIG"),
 		AppToken:        os.Getenv("WISP_APP_TOKEN"),
 	}
@@ -80,6 +95,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.ExpiringLead, err = positiveSecondsEnv("WISP_EXPIRING_LEAD_SECONDS", defaultExpiringLead); err != nil {
+		return Config{}, err
+	}
+	if cfg.ReleaseGrace, err = positiveSecondsEnv("WISP_RELEASE_GRACE_SECONDS", defaultReleaseGrace); err != nil {
 		return Config{}, err
 	}
 

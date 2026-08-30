@@ -98,6 +98,7 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, pol *policy
 	rp := reaper.New(store, rt, reaper.Options{
 		Lead:            cfg.ExpiringLead,
 		Interval:        cfg.ReapInterval,
+		ReleaseGrace:    cfg.ReleaseGrace,
 		Logger:          logger,
 		Notify:          server.LifecycleNotify(eventBus, logger),
 		ReleaseGPUs:     daemon.ReleaseGPUs,

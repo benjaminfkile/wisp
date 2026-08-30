@@ -240,7 +240,9 @@ func (s *Store) List() []Contract {
 // UpdateState transitions the contract to next, enforcing the lifecycle state
 // machine. It returns the updated contract copy, ErrNotFound if the id is
 // unknown, or an *IllegalTransitionError (wrapping ErrIllegalTransition) if the
-// move is not permitted.
+// move is not permitted. A winning transition into StateReleasing also stamps
+// ReleasingSince with the store's clock so the reaper's release-grace check has
+// an authoritative timestamp for the fence going up.
 func (s *Store) UpdateState(id string, next State) (Contract, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -253,6 +255,9 @@ func (s *Store) UpdateState(id string, next State) (Contract, error) {
 		return Contract{}, &IllegalTransitionError{From: c.State, To: next}
 	}
 	c.State = next
+	if next == StateReleasing {
+		c.ReleasingSince = s.now()
+	}
 	return *c, nil
 }
 

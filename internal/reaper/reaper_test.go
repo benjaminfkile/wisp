@@ -681,47 +681,46 @@ func TestReaperNoErrorLogOnDockerConflictKill(t *testing.T) {
 }
 
 // TestReaperSkipsReleasingContract pins the release-fence contract from the
-// reaper side: a contract in StateReleasing must never be reaped (no Kill,
-// no transition) because the DELETE handler owns that fence and is in the
-// middle of tearing the container down. Without this skip the reaper would
-// double-kill the container and then purge the contract from under the
-// DELETE handler, turning it into a 500 (the 2026-08-29 wisp-log failure).
+// reaper side: a contract in StateReleasing INSIDE the release grace must never
+// be reaped (no Kill, no transition) because the DELETE handler owns that fence
+// and is in the middle of tearing the container down. Without this skip the
+// reaper would double-kill the container and then purge the contract from under
+// the DELETE handler, turning it into a 500 (the 2026-08-29 wisp-log failure).
 func TestReaperSkipsReleasingContract(t *testing.T) {
 	store := contract.NewStore()
 	fake := runtime.NewFake()
 	ctx := context.Background()
 
-	// A live container behind a contract now in StateReleasing whose TTL has
-	// already elapsed. Both reap-triggering signals (TTL past + container
-	// stopped) are simulated below so the test can catch either path if the
-	// skip fails.
-	past := time.Unix(1_000_000_000, 0)
-	cid, err := fake.Create(ctx, "wisp-base", runtime.CreateOptions{})
-	if err != nil {
-		t.Fatalf("fake.Create: %v", err)
-	}
-	if err := fake.Start(ctx, cid); err != nil {
-		t.Fatalf("fake.Start: %v", err)
-	}
-	c, err := store.Adopt(contract.AdoptParams{
-		ID:          "releasing-contract",
-		ContainerID: cid,
-		ExpiresAt:   past,
-	})
-	if err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
+	// A live container behind a contract just moved into StateReleasing whose
+	// TTL has already elapsed. Both reap-triggering signals (TTL past +
+	// container stopped) are simulated below so the test can catch either path
+	// if the in-grace skip fails.
+	c, cid := readyContract(t, store, fake, time.Hour)
 	if _, err := store.UpdateState(c.ID, contract.StateReleasing); err != nil {
 		t.Fatalf("UpdateState releasing: %v", err)
 	}
+	// Reload the contract to read the ReleasingSince the store stamped on the
+	// transition, so the reaper's clock is anchored to a real timestamp and the
+	// grace check is exercised rather than accidentally satisfied.
+	c, err := store.Get(c.ID)
+	if err != nil {
+		t.Fatalf("Get after UpdateState: %v", err)
+	}
+	if c.ReleasingSince.IsZero() {
+		t.Fatal("UpdateState(StateReleasing) did not stamp ReleasingSince")
+	}
 	// Also force the container into a stopped shape via the fake, so the reap
-	// path would fire on either signal (TTL past OR container died).
+	// path would fire on either signal (TTL past OR container died) if the
+	// in-grace skip were removed.
 	fake.InspectOverrides = map[string]runtime.LivenessState{cid: runtime.LivenessStopped}
 
 	rp := New(store, fake, Options{
-		Lead:   time.Minute,
-		Logger: discardLogger(),
-		Now:    func() time.Time { return past.Add(time.Hour) },
+		Lead:         time.Minute,
+		ReleaseGrace: 30 * time.Second,
+		Logger:       discardLogger(),
+		// Well past the TTL but well inside the release grace so the reaper is
+		// facing both reap-triggering signals AND the in-grace fence at once.
+		Now: func() time.Time { return c.ReleasingSince.Add(time.Second) },
 		Notify: func(e Event) {
 			t.Errorf("reaper transitioned a releasing contract: %+v", e)
 		},
@@ -736,10 +735,102 @@ func TestReaperSkipsReleasingContract(t *testing.T) {
 		t.Fatalf("Get after tick: %v", err)
 	}
 	if got.State != contract.StateReleasing {
-		t.Errorf("state = %q, want releasing (fence must hold across a tick)", got.State)
+		t.Errorf("state = %q, want releasing (fence must hold across a tick inside the grace)", got.State)
 	}
 	if _, ok := fake.Container(cid); !ok {
-		t.Error("reaper killed the container of a releasing contract; the fence must forbid it")
+		t.Error("reaper killed the container of a releasing contract inside the grace; the fence must forbid it")
+	}
+}
+
+// TestReaperExpiresStuckReleasingContract pins the release-grace escape hatch:
+// a contract that has sat in StateReleasing past the reaper's release grace
+// (the DELETE handler crashed mid-release, or its Kill hung) is treated like
+// any other non-terminal contract: the reaper kills the container, expires the
+// contract, and returns its reserved capacity to the allocator. Without this
+// path the lease's capacity would leak until wispd restarted.
+func TestReaperExpiresStuckReleasingContract(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	ctx := context.Background()
+
+	c, cid := readyContract(t, store, fake, time.Hour)
+	if _, err := store.UpdateState(c.ID, contract.StateReleasing); err != nil {
+		t.Fatalf("UpdateState releasing: %v", err)
+	}
+	c, err := store.Get(c.ID)
+	if err != nil {
+		t.Fatalf("Get after UpdateState: %v", err)
+	}
+	if c.ReleasingSince.IsZero() {
+		t.Fatal("UpdateState(StateReleasing) did not stamp ReleasingSince")
+	}
+
+	var events []Event
+	freed := 0
+	rp := New(store, fake, Options{
+		Lead:         time.Minute,
+		ReleaseGrace: 30 * time.Second,
+		Logger:       discardLogger(),
+		// Just past the grace: the release is presumed stuck, so the reaper
+		// takes over even though the contract is still well within its TTL.
+		Now:             func() time.Time { return c.ReleasingSince.Add(31 * time.Second) },
+		Notify:          func(e Event) { events = append(events, e) },
+		ReleaseCapacity: func(contract.Contract) { freed++ },
+	})
+	rp.Tick(ctx)
+
+	got, err := store.Get(c.ID)
+	if err != nil {
+		t.Fatalf("Get after tick: %v", err)
+	}
+	if got.State != contract.StateExpired {
+		t.Fatalf("state = %q, want expired (release stuck past grace must be reaped)", got.State)
+	}
+	if _, ok := fake.Container(cid); ok {
+		t.Error("reaper did not kill the container of a stuck releasing contract past grace")
+	}
+	if freed != 1 {
+		t.Errorf("ReleaseCapacity fired %d times, want 1 (capacity must return to the allocator)", freed)
+	}
+	if len(events) != 1 || events[0].To != contract.StateExpired || events[0].From != contract.StateReleasing {
+		t.Fatalf("events = %+v, want one releasing→expired transition", events)
+	}
+}
+
+// TestReaperDefaultReleaseGraceSkipsFreshReleasing pins that the default
+// release-grace window (see defaultReleaseGrace) is long enough that a
+// just-transitioned StateReleasing contract is skipped even without an
+// explicit ReleaseGrace on the Options.
+func TestReaperDefaultReleaseGraceSkipsFreshReleasing(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	ctx := context.Background()
+
+	c, cid := readyContract(t, store, fake, time.Hour)
+	if _, err := store.UpdateState(c.ID, contract.StateReleasing); err != nil {
+		t.Fatalf("UpdateState releasing: %v", err)
+	}
+	c, err := store.Get(c.ID)
+	if err != nil {
+		t.Fatalf("Get after UpdateState: %v", err)
+	}
+
+	rp := New(store, fake, Options{
+		Lead:   time.Minute,
+		Logger: discardLogger(),
+		// One second after the fence went up: well inside the default 30 s grace.
+		Now: func() time.Time { return c.ReleasingSince.Add(time.Second) },
+		Notify: func(e Event) {
+			t.Errorf("reaper transitioned a fresh releasing contract under the default grace: %+v", e)
+		},
+	})
+	rp.Tick(ctx)
+
+	if got, _ := store.Get(c.ID); got.State != contract.StateReleasing {
+		t.Errorf("state = %q, want releasing (default grace must skip a fresh releasing contract)", got.State)
+	}
+	if _, ok := fake.Container(cid); !ok {
+		t.Error("reaper killed the container of a fresh releasing contract under the default grace")
 	}
 }
 
@@ -802,6 +893,9 @@ func TestReaperDefaults(t *testing.T) {
 	}
 	if rp.interval != defaultInterval {
 		t.Errorf("interval = %v, want %v", rp.interval, defaultInterval)
+	}
+	if rp.releaseGrace != defaultReleaseGrace {
+		t.Errorf("releaseGrace = %v, want %v", rp.releaseGrace, defaultReleaseGrace)
 	}
 	if rp.now == nil {
 		t.Error("now is nil; want default time.Now")

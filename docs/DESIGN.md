@@ -98,13 +98,20 @@ requested → provisioning → ready → (in use) → expiring → releasing →
   (`WISP_EXPIRING_LEAD_SECONDS`, default 60), so the client can exfiltrate work (push a branch,
   POST results out) before the hard kill. Exec and shell stay usable through the lead window
   (accepted in both `ready` and `expiring`) so a client can actually use the grace period; only
-  once the contract reaches a terminal state do they return `409`.
-- **releasing**: the transient fence a `DELETE /contracts/:id` installs BEFORE killing the
-  container so the reaper's TTL / container-died sweeps cannot race the release. The reaper skips
-  `releasing` contracts, so during this window the DELETE handler is the sole owner of the
-  container kill and the terminal transition. Only `released` is a legal successor. The state is
-  internal to the release handler (it lives at most for one container-kill call) and is excluded
-  from `GET /contracts` the same way `requested` is.
+  once the contract reaches `releasing` or a terminal state do they return `409`.
+- **releasing**: the transient, **non-terminal** fence a `DELETE /contracts/:id` installs BEFORE
+  killing the container so the reaper's TTL / container-died sweeps cannot race the release. The
+  reaper skips `releasing` contracts for a short release grace (30 s), and inside that window the
+  DELETE handler is the sole owner of the container kill and the terminal transition. Past the
+  grace the release is presumed stuck (the handler crashed mid-release, or its `Kill` hung) and
+  the reaper expires the contract just like any other non-terminal one, so the lease's capacity
+  and GPUs return to the allocators instead of leaking until restart; `expired` is therefore also
+  a legal successor from `releasing`. Exec and shell are `409` against a `releasing` contract
+  (the container is being torn down). A `DELETE` against a contract already in `releasing` is an
+  idempotent success (200 echoing the current `releasing` status) so a concurrent second DELETE
+  does not double-kill or double-free. The state is internal to the release handler (it lives at
+  most for one container-kill call under normal conditions) and is excluded from `GET /contracts`
+  the same way `requested` is, so the list `status` enum stays `provisioning|ready|expiring`.
 - **released**: client called `DELETE /contracts/:id`. A `DELETE` against a contract that is
   already `released` or `expired` is an idempotent success (200 echoing the terminal status) and
   never frees capacity or GPUs a second time. A `DELETE` whose fence-installing transition finds
@@ -115,7 +122,9 @@ requested → provisioning → ready → (in use) → expiring → releasing →
 
 Legal transitions: `requested` may go to `provisioning`, `releasing`, or `expired`; `provisioning`
 to `ready`, `releasing`, or `expired`; `ready` to `expiring`, `releasing`, or `expired`;
-`expiring` to `releasing` or `expired`; `releasing` to `released` only. The terminal states have
+`expiring` to `releasing` or `expired`; `releasing` to `released` (the DELETE handler's success
+path) or `expired` (the reaper's release-grace escape hatch: past the grace the reaper reclaims
+a stuck release the same way it would any other non-terminal contract). The terminal states have
 no outgoing transitions, and the store rejects anything else, which is what makes every terminal
 side effect (freeing capacity and GPUs, publishing the lifecycle event) happen exactly once even
 when a `DELETE` races the reaper. A terminal contract stays readable for one reaper sweep and is
@@ -513,9 +522,9 @@ Single Go binary (daemon). As built:
 ```
 POST   /contracts                     create + boot + run userdata (optional env, external_id); 201 {contract_id, token, status}
 GET    /contracts                     list every live contract: {"contracts":[{id, external_id, token, status, expires_at, ttl_seconds_remaining, reserved_cpus, reserved_memory_mb, gpus}]}
-                                      status is one of provisioning|ready|expiring (terminal and transient `requested` contracts are excluded; gpus is always an array)
-GET    /contracts/:id                 {contract_id, status, ttl_seconds_remaining, gpus?, meta?, external_id}; 404 once purged
-DELETE /contracts/:id                 release now (destroy container); same body as GET; idempotent 200 on an already-terminal contract
+                                      status is one of provisioning|ready|expiring (terminal contracts and the transient `requested` / `releasing` states are excluded; gpus is always an array)
+GET    /contracts/:id                 {contract_id, status, ttl_seconds_remaining, gpus?, meta?, external_id}; status is provisioning|ready|expiring|releasing|released|expired (releasing is non-terminal); 404 once purged
+DELETE /contracts/:id                 release now (destroy container); same body as GET; idempotent 200 on an already-terminal contract, and 200 echoing status=releasing when a concurrent release is already in flight
 POST   /contracts/:id/exec            run a command (sync)         { command } -> {stdout, stderr, exit_code}; 409 unless ready
 POST   /contracts/:id/exec?stream=1   run a command (Server-Sent Events: chunk / exit / error)
 WS     /contracts/:id/shell           interactive PTY console (binary frames; text {"type":"resize","rows","cols"} control frame)
@@ -605,6 +614,12 @@ switches it**, it only serves whichever mode the host is in.
   contract through the normal path (capacity and GPUs freed exactly once). Paused or restarting
   containers still report running on the daemon side and are left alone; a transport error is
   inconclusive and retried next sweep.
+- **Release grace bounds the fence**, the reaper skips a `releasing` contract for a short grace
+  (30 s) after the DELETE handler installed the fence, so the handler owns the tear down without
+  the reaper racing it. Past the grace the release is presumed stuck (the handler crashed
+  mid-release, or its `Kill` hung) and the reaper expires the contract like any other
+  non-terminal one, returning its capacity and GPUs to the allocators so a stalled release never
+  leaks a lease's reservation until wispd restarts.
 
 ## 14. Open questions
 

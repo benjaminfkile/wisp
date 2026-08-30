@@ -25,8 +25,11 @@ import (
 // StateReleasing before killing the container, and only after the container
 // is torn down does it complete the terminal transition to StateReleased.
 // The TTL reaper may expire an active contract from any state where a
-// container exists, but skips StateReleasing so it cannot race the release
-// handler.
+// container exists, and skips StateReleasing only for a short grace window
+// after the fence goes up so the release handler owns the tear down; past
+// the grace the release is presumed stuck (the handler crashed mid-release
+// or its Kill hung) and the reaper expires the contract like any other
+// non-terminal one so its capacity and GPUs return to the allocators.
 type State string
 
 const (
@@ -50,10 +53,14 @@ const (
 	// down window so the reaper's TTL / container-died sweeps cannot race the
 	// release, double-kill the container ("removal already in progress"), and
 	// then expire-and-purge the contract from under the handler (the exact
-	// 2026-08-29 wisp-log 500 the state was added for). Only StateReleased is
-	// a legal successor, which is what serializes the terminal side effects
-	// (freeing capacity and GPUs, publishing contract.released) to exactly
-	// one caller.
+	// 2026-08-29 wisp-log 500 the state was added for). StateReleased is the
+	// DELETE handler's normal successor (serializing the terminal side effects
+	// so freeing capacity and GPUs and publishing contract.released happens
+	// exactly once), and StateExpired is the reaper's escape hatch: if the
+	// contract sits in StateReleasing past the reaper's release grace, the
+	// release is presumed stuck and the reaper expires it so the lease's
+	// capacity and GPUs return to the allocators rather than leaking until
+	// restart.
 	StateReleasing State = "releasing"
 
 	// StateReleased is terminal: the client called DELETE and the container
@@ -88,9 +95,14 @@ var legalTransitions = map[State]map[State]bool{
 		StateExpired:   true, // TTL elapsed
 	},
 	StateReleasing: {
-		// Only the DELETE handler's final "mark released" can leave the fence;
-		// the reaper skips StateReleasing so it cannot expire this contract.
+		// The DELETE handler's final "mark released" is the normal successor,
+		// serializing the terminal side effects (freeing capacity and GPUs) to
+		// one caller. StateExpired is the reaper's stuck-release escape hatch:
+		// past the release grace the reaper expires a contract still in
+		// StateReleasing so its capacity is not leaked. Whichever side wins the
+		// state-machine transition owns the terminal side effects.
 		StateReleased: true,
+		StateExpired:  true,
 	},
 	// StateReleased and StateExpired are terminal: no outgoing transitions.
 	StateReleased: {},
@@ -187,6 +199,15 @@ type Contract struct {
 
 	// ExpiresAt is when the TTL elapses (CreatedAt + TTL).
 	ExpiresAt time.Time
+
+	// ReleasingSince is the time the contract transitioned into StateReleasing,
+	// stamped by the store's clock on the winning UpdateState. The reaper reads
+	// it to enforce its release grace: a contract that has been in StateReleasing
+	// for less than the grace is skipped (the DELETE handler owns the tear down),
+	// past that the release is presumed stuck and the reaper expires the contract
+	// so its capacity and GPUs return to the allocators. Zero for a contract that
+	// has never entered StateReleasing.
+	ReleasingSince time.Time
 
 	// Token is the bearer token required on contract-scoped calls (see
 	// docs/DESIGN.md §8).

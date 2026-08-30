@@ -268,36 +268,47 @@ WS     /events                        subscribe, optional ?type=a,b filter      
 
 - `GET /contracts` returns `{"contracts":[{id, external_id, token, status,
   expires_at, ttl_seconds_remaining, reserved_cpus, reserved_memory_mb, gpus}]}`
-  for every contract in `provisioning`, `ready`, or `expiring` (terminal
-  contracts and the transient `requested` / `releasing` states are excluded;
-  `gpus` is always an array). It includes each contract's current bearer token
-  so a restarted local agent can rebuild its lease map, which is why it is
-  app-token gated.
+  for every contract in `provisioning`, `ready`, or `expiring`. Terminal
+  contracts (`released`, `expired`) are excluded; the transient pre-provision
+  `requested` state and the transient (non-terminal) `releasing` fence are
+  also excluded, so consumers may treat those three as an exhaustive `status`
+  enum. `gpus` is always an array. The list includes each contract's current
+  bearer token so a restarted local agent can rebuild its lease map, which is
+  why it is app-token gated.
 - `GET /contracts/:id` and `DELETE /contracts/:id` return
   `{contract_id, status, ttl_seconds_remaining, gpus?, meta?, external_id}`.
-  `DELETE` first transitions the contract to `releasing` to fence the reaper
-  off it, then kills the container, then completes the transition to
-  `released`. `DELETE` of an already `released` or `expired` contract is an
-  **idempotent success** (200 echoing the terminal status; nothing is freed
-  twice). A `DELETE` whose fence-installing transition finds the contract
-  already purged, or whose final mark-released finds the store has since
-  purged it, also returns 200 with a `released` status. Unknown ids are `404`.
-  Terminal contracts are purged from the store one reaper sweep after they
-  become terminal, after which their id is `404`.
+  `status` is one of `provisioning`, `ready`, `expiring`, `releasing`,
+  `released`, or `expired`; only `released` and `expired` are terminal, and
+  `releasing` is the transient (non-terminal) fence the release handler
+  installs before killing the container. `DELETE` first transitions the
+  contract to `releasing` to fence the reaper off it, then kills the
+  container, then completes the transition to `released`. `DELETE` of an
+  already `released` or `expired` contract is an **idempotent success** (200
+  echoing the terminal status; nothing is freed twice); `DELETE` of a
+  contract already in `releasing` (a concurrent release is in flight) is
+  likewise 200 echoing the current `releasing` status without a second
+  container kill or a double free. A `DELETE` whose fence-installing
+  transition finds the contract already purged, or whose final mark-released
+  finds the store has since purged it, also returns 200 with a `released`
+  status. Unknown ids are `404`. Terminal contracts are purged from the
+  store one reaper sweep after they become terminal, after which their id is
+  `404`.
 - `POST /contracts/:id/exec` runs the command through `/bin/sh -c` (or `cmd /c`
   on a Windows daemon) as a fresh process and returns
   `{stdout, stderr, exit_code}` (a non-zero exit is still `200`). It is `409`
   unless the contract is `ready` or `expiring` (execs stay usable through the
-  lead window so the client can exfiltrate work before the hard kill), `400` on
-  an empty command. With `?stream=1` the response is `text/event-stream`:
-  `chunk` events carrying `{"stream":"stdout"|"stderr","data":"..."}`, then one
-  `exit` event with `{"exit_code":n}` (or an `error` event if the exec fails
-  mid-stream).
+  lead window so the client can exfiltrate work before the hard kill; execs
+  against a contract in `releasing`, `released`, or `expired` are `409`),
+  `400` on an empty command. With `?stream=1` the response is
+  `text/event-stream`: `chunk` events carrying
+  `{"stream":"stdout"|"stderr","data":"..."}`, then one `exit` event with
+  `{"exit_code":n}` (or an `error` event if the exec fails mid-stream).
 - `WS /contracts/:id/shell` bridges a TTY exec of `/bin/sh` (`cmd.exe` on
   Windows). Raw bytes ride binary messages both ways; a text message
   `{"type":"resize","rows":n,"cols":n}` resizes the TTY and any other text is
   written to stdin verbatim. Pre-upgrade rejections are `404` / `401` / `409`
-  (not `ready` or `expiring`; shells stay usable through the lead window too).
+  (not `ready` or `expiring`; shells stay usable through the lead window too,
+  and are `409` in `releasing` / `released` / `expired`).
 
 Every response body other than the SSE stream is JSON; errors are
 `{"error":"..."}`.
@@ -307,11 +318,16 @@ Every response body other than the SSE stream is JSON; errors are
 A contract moves `requested -> provisioning -> ready -> expiring -> releasing -> released`,
 or exits to `expired` from any active state. `released` (client `DELETE`) and
 `expired` (TTL elapsed, provisioning failure, or container death) are terminal
-and destroy the container. The `releasing` state is the transient fence a
-`DELETE` installs BEFORE killing the container so the reaper cannot expire (and
-then purge) the contract from under the handler: the reaper skips `releasing`
-contracts, so the DELETE handler is the sole owner of the container kill and
-the terminal transition to `released`. The reaper sweeps every
+and destroy the container. The `releasing` state is the transient,
+**non-terminal** fence a `DELETE` installs BEFORE killing the container so the
+reaper cannot expire (and then purge) the contract from under the handler: the
+reaper skips `releasing` contracts for a short release grace (30 s), so within
+that window the DELETE handler is the sole owner of the container kill and the
+terminal transition to `released`. Past the grace the release is presumed
+stuck (the handler crashed mid-release, or its `Kill` hung) and the reaper
+expires the contract like any other non-terminal one, killing the container if
+needed and returning its capacity and GPUs to the allocators rather than
+leaking them until restart. The reaper sweeps every
 `WISP_REAP_INTERVAL_SECONDS`: a `ready` contract inside the
 `WISP_EXPIRING_LEAD_SECONDS` window becomes `expiring`; a contract past its TTL
 is killed and `expired`; and a `ready`/`expiring` contract whose container has

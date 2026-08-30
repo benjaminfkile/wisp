@@ -44,9 +44,10 @@ const (
 	defaultReleaseGrace = 30 * time.Second
 
 	// defaultKillTimeout bounds a single reaper Kill call so a hung Docker
-	// daemon cannot stall the tick: on timeout the contract is left in place
-	// for the next tick and the sweep continues with the remaining contracts,
-	// so one wedged container never freezes reaping for the whole store.
+	// daemon cannot stall the reaper: the bounded Kill runs OFF the tick in
+	// its own goroutine, so a wedged container adds no latency to the sweep.
+	// On timeout the contract is left in place for a later kill attempt while
+	// the sweep proceeds with the remaining contracts.
 	defaultKillTimeout = 30 * time.Second
 )
 
@@ -107,9 +108,10 @@ type Options struct {
 	ReleaseGrace time.Duration
 
 	// KillTimeout bounds a single reaper Kill call so a hung Docker daemon
-	// cannot stall the tick. On timeout the contract is left in place and the
-	// reaper moves on to the remaining contracts; the next tick tries again.
-	// Defaults to defaultKillTimeout.
+	// cannot stall the reaper. The bounded Kill runs off the tick in its own
+	// goroutine, so a wedged container adds no latency to the sweep. On
+	// timeout the contract is left in place for a later kill attempt. Defaults
+	// to defaultKillTimeout.
 	KillTimeout time.Duration
 
 	// Now is the injectable clock. Defaults to time.Now. Tests set this to make
@@ -163,6 +165,19 @@ type Reaper struct {
 
 	mu     sync.RWMutex
 	notify func(Event)
+
+	// killMu guards killing, the set of contract IDs whose reaper-driven Kill
+	// is currently outstanding. reap() skips a contract in this set so a hung
+	// Kill goroutine is not fanned out again by a subsequent tick (bounding
+	// concurrency to one in-flight kill per contract), and the goroutine
+	// clears the entry on completion so a timed-out kill is retried on a
+	// later tick.
+	killMu  sync.Mutex
+	killing map[string]struct{}
+
+	// killWG counts every off-tick Kill goroutine so tests can synchronize on
+	// the async completion path via waitForKills.
+	killWG sync.WaitGroup
 }
 
 // New builds a Reaper over store and rt, applying option defaults.
@@ -197,6 +212,7 @@ func New(store *contract.Store, rt runtime.Runtime, opts Options) *Reaper {
 		notify:          opts.Notify,
 		releaseGPUs:     opts.ReleaseGPUs,
 		releaseCapacity: opts.ReleaseCapacity,
+		killing:         make(map[string]struct{}),
 	}
 }
 
@@ -275,8 +291,16 @@ func (r *Reaper) Tick(ctx context.Context) {
 // other non-terminal one so its capacity and GPUs return to the allocators
 // rather than leaking until restart. A hung Docker daemon on the reaper's own
 // Kill is bounded by killTimeout in expire, not by this grace.
+//
+// A contract with a reaper-driven Kill already outstanding is skipped
+// unconditionally: the previous tick launched an off-tick Kill goroutine and
+// the completion path owns the terminal transition; skipping here is what
+// stops a subsequent tick from double-killing the same container.
 func (r *Reaper) reap(ctx context.Context, c contract.Contract) {
 	if c.State.Terminal() {
+		return
+	}
+	if r.isKilling(c.ID) {
 		return
 	}
 	now := r.now()
@@ -330,41 +354,81 @@ func (r *Reaper) containerDied(ctx context.Context, c contract.Contract) bool {
 	return state != runtime.LivenessRunning
 }
 
-// expire kills the contract's container (if one was provisioned) and marks the
-// contract expired. A container the runtime no longer knows about is treated as
-// already gone. reason categorises WHY the reaper is expiring the contract (TTL
-// vs container death) and rides through to the fired Event so the bus can
-// republish it on contract.expired.
+// expire drives the contract's terminal transition. When a container is
+// provisioned the Kill runs OFF the tick in its own goroutine so a hung
+// Docker daemon (a wedged ContainerRemove) adds no latency to the sweep: the
+// contract is marked "kill in flight", the bounded Kill is launched, and the
+// state transition plus capacity / GPU free apply in the goroutine's
+// completion. reap() skips a contract with a Kill in flight so the next tick
+// never double-kills the same container. reason categorises WHY the reaper is
+// expiring the contract (TTL vs container death) and rides through to the
+// fired Event so the bus can republish it on contract.expired.
 //
-// The Kill is bounded by killTimeout so a hung Docker daemon (a wedged
-// ContainerRemove) cannot stall the tick. On timeout the contract is left in
-// its current state for the next tick to retry, and the sweep proceeds with the
-// remaining contracts; without the bound the whole reaper loop would block on
-// the wedged container and no other contract would be reaped, no capacity or
-// GPUs freed, until the daemon eventually responded. Kill's own return-value
-// error (a real not-found or any other daemon reply) is a normal observation
-// and does not stop the expire: not-found is treated as already-gone, and
-// anything else is logged and the transition still runs so capacity is freed.
+// A contract with no ContainerID is transitioned inline: there is no
+// container to kill and no need to spend a goroutine on it.
 func (r *Reaper) expire(ctx context.Context, c contract.Contract, now time.Time, reason string) {
-	if c.ContainerID != "" {
-		killCtx, cancel := context.WithTimeout(ctx, r.killTimeout)
-		err := r.rt.Kill(killCtx, c.ContainerID)
-		cancel()
-		if err != nil {
-			// A killCtx deadline that fired means the daemon has not answered
-			// within killTimeout. Leave the contract in place so the next tick
-			// retries the kill, and move on to the remaining contracts so one
-			// wedged container never freezes the whole sweep.
-			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-				r.logger.Error("reaper: kill container timed out; leaving for next tick",
-					"contract_id", c.ID, "container_id", c.ContainerID, "timeout", r.killTimeout)
-				return
-			}
-			if !errors.Is(err, runtime.ErrNotFound) {
-				r.logger.Error("reaper: kill container", "contract_id", c.ID, "error", err)
-			}
+	if c.ContainerID == "" {
+		r.finishExpire(c, now, reason)
+		return
+	}
+	if !r.beginKill(c.ID) {
+		// A previous tick's Kill goroutine is still outstanding for this
+		// contract; the completion path owns the terminal transition. Bounding
+		// concurrency to one in-flight kill per contract is what stops a
+		// wedged Kill from being fanned out again by subsequent ticks.
+		return
+	}
+	r.killWG.Add(1)
+	go func() {
+		defer r.killWG.Done()
+		r.killAndFinish(ctx, c, now, reason)
+	}()
+}
+
+// WaitForKills blocks until every off-tick Kill goroutine launched so far has
+// returned. It is exposed so tests (and, at shutdown, callers) can synchronize
+// on the async completion path without polling: a test that asserts an
+// expire's side effects (container killed, state transitioned, capacity
+// freed) waits here after Tick before checking.
+func (r *Reaper) WaitForKills() {
+	r.killWG.Wait()
+}
+
+// killAndFinish runs the bounded Kill for the contract's container and then
+// applies the terminal transition plus capacity / GPU free on completion. It
+// always clears the in-flight mark on return so a later tick can retry a
+// timed-out Kill. Kill's own return-value error (a real not-found or any
+// other daemon reply) is a normal observation and does not stop the expire:
+// not-found is treated as already-gone, and anything else is logged and the
+// transition still runs so capacity is freed. A killCtx deadline that fired
+// means the daemon has not answered within killTimeout: the contract is left
+// in place for a later kill attempt and no terminal transition is applied.
+func (r *Reaper) killAndFinish(ctx context.Context, c contract.Contract, now time.Time, reason string) {
+	defer r.endKill(c.ID)
+
+	killCtx, cancel := context.WithTimeout(ctx, r.killTimeout)
+	err := r.rt.Kill(killCtx, c.ContainerID)
+	cancel()
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			r.logger.Error("reaper: kill container timed out; leaving for later attempt",
+				"contract_id", c.ID, "container_id", c.ContainerID, "timeout", r.killTimeout)
+			return
+		}
+		if !errors.Is(err, runtime.ErrNotFound) {
+			r.logger.Error("reaper: kill container", "contract_id", c.ID, "error", err)
 		}
 	}
+	r.finishExpire(c, now, reason)
+}
+
+// finishExpire applies the GPU release, the terminal transition, and the
+// capacity free for a contract whose container has been killed (or was never
+// provisioned). It is the shared completion path for both the inline
+// no-container branch of expire and the async killAndFinish goroutine, so
+// the state-machine gate that keeps capacity freeing exactly once is applied
+// identically in both cases.
+func (r *Reaper) finishExpire(c contract.Contract, now time.Time, reason string) {
 	// Reclaim any whole GPU devices the lease held so an expired lease's devices
 	// return to the allocator for reuse. The allocator's Free is idempotent, so a
 	// lease already released and freed elsewhere is safe to free again here.
@@ -379,6 +443,38 @@ func (r *Reaper) expire(ctx context.Context, c contract.Contract, now time.Time,
 	if r.transition(c, contract.StateExpired, now, reason) && r.releaseCapacity != nil {
 		r.releaseCapacity(c)
 	}
+}
+
+// beginKill marks the contract as having a reaper-driven Kill in flight. It
+// reports true when this call installed the mark (proceed with the Kill), and
+// false when another goroutine already holds one (bound concurrency to one
+// in-flight Kill per contract). endKill clears the mark on the goroutine's
+// return, so a timed-out Kill is retried on a later tick.
+func (r *Reaper) beginKill(id string) bool {
+	r.killMu.Lock()
+	defer r.killMu.Unlock()
+	if _, ok := r.killing[id]; ok {
+		return false
+	}
+	r.killing[id] = struct{}{}
+	return true
+}
+
+// endKill clears the in-flight mark for the contract.
+func (r *Reaper) endKill(id string) {
+	r.killMu.Lock()
+	defer r.killMu.Unlock()
+	delete(r.killing, id)
+}
+
+// isKilling reports whether a reaper-driven Kill for the contract is
+// currently in flight so reap() can skip it and let the goroutine own the
+// outcome.
+func (r *Reaper) isKilling(id string) bool {
+	r.killMu.Lock()
+	defer r.killMu.Unlock()
+	_, ok := r.killing[id]
+	return ok
 }
 
 // transition moves the contract to next and, on success, fires the hook. It

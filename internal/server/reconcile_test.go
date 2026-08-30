@@ -296,6 +296,7 @@ func TestReconcileThenReaperExpiresStaleAndKeepsValid(t *testing.T) {
 		Logger: discardLogger(),
 	})
 	rp.Tick(ctx)
+	rp.WaitForKills()
 
 	stale, err := store.Get("contract-stale")
 	if err != nil {

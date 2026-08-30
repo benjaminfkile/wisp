@@ -16,10 +16,14 @@ const defaultAddr = "127.0.0.1:8080"
 // ReapInterval and warns contracts ExpiringLead before their TTL. ReleaseGrace
 // bounds how long a contract may sit in StateReleasing before the reaper stops
 // skipping it and expires the contract like any other non-terminal one.
+// KillTimeout bounds a single reaper Kill call so a hung Docker daemon cannot
+// stall the sweep; the reaper runs the bounded Kill off the tick, so on
+// timeout the contract is left for a later attempt while the tick proceeds.
 const (
 	defaultReapInterval = time.Second
 	defaultExpiringLead = time.Minute
 	defaultReleaseGrace = 30 * time.Second
+	defaultKillTimeout  = 30 * time.Second
 )
 
 // Config holds runtime configuration for the daemon.
@@ -41,6 +45,12 @@ type Config struct {
 	// transition) and the reaper expires the contract like any other
 	// non-terminal one so its capacity and GPUs return to the allocators.
 	ReleaseGrace time.Duration
+
+	// KillTimeout bounds a single reaper Kill call so a hung Docker daemon
+	// cannot stall the sweep. The reaper launches the bounded Kill off the tick,
+	// so on timeout the contract is left in place for a later kill attempt
+	// while the tick proceeds with the remaining contracts.
+	KillTimeout time.Duration
 
 	// ImageConfigFile is an optional path to a JSON policy config file defining
 	// the image allow-list, default image, and limits (see docs/DESIGN.md §7).
@@ -67,6 +77,9 @@ type Config struct {
 //	WISP_RELEASE_GRACE_SECONDS  release-grace window in seconds (positive integer); how
 //	                            long a contract may sit in StateReleasing before the
 //	                            reaper expires it. Defaults to 30.
+//	WISP_KILL_TIMEOUT_SECONDS   reaper Kill timeout in seconds (positive integer); a
+//	                            hung Docker daemon on a single Kill cannot stall the
+//	                            sweep past this. Defaults to 30.
 //	WISP_CONFIG                 path to a JSON image allow-list + limits config (optional).
 //	WISP_APP_TOKEN              app-level bearer token gating contract creation (optional).
 func Load() (Config, error) {
@@ -75,6 +88,7 @@ func Load() (Config, error) {
 		ReapInterval:    defaultReapInterval,
 		ExpiringLead:    defaultExpiringLead,
 		ReleaseGrace:    defaultReleaseGrace,
+		KillTimeout:     defaultKillTimeout,
 		ImageConfigFile: os.Getenv("WISP_CONFIG"),
 		AppToken:        os.Getenv("WISP_APP_TOKEN"),
 	}
@@ -98,6 +112,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.ReleaseGrace, err = positiveSecondsEnv("WISP_RELEASE_GRACE_SECONDS", defaultReleaseGrace); err != nil {
+		return Config{}, err
+	}
+	if cfg.KillTimeout, err = positiveSecondsEnv("WISP_KILL_TIMEOUT_SECONDS", defaultKillTimeout); err != nil {
 		return Config{}, err
 	}
 

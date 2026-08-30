@@ -99,6 +99,7 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, pol *policy
 		Lead:            cfg.ExpiringLead,
 		Interval:        cfg.ReapInterval,
 		ReleaseGrace:    cfg.ReleaseGrace,
+		KillTimeout:     cfg.KillTimeout,
 		Logger:          logger,
 		Notify:          server.LifecycleNotify(eventBus, logger),
 		ReleaseGPUs:     daemon.ReleaseGPUs,

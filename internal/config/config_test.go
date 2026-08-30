@@ -97,6 +97,7 @@ func TestLoadReaperDefaults(t *testing.T) {
 	t.Setenv("WISP_REAP_INTERVAL_SECONDS", "")
 	t.Setenv("WISP_EXPIRING_LEAD_SECONDS", "")
 	t.Setenv("WISP_RELEASE_GRACE_SECONDS", "")
+	t.Setenv("WISP_KILL_TIMEOUT_SECONDS", "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -111,12 +112,16 @@ func TestLoadReaperDefaults(t *testing.T) {
 	if cfg.ReleaseGrace != defaultReleaseGrace {
 		t.Errorf("ReleaseGrace = %v, want %v", cfg.ReleaseGrace, defaultReleaseGrace)
 	}
+	if cfg.KillTimeout != defaultKillTimeout {
+		t.Errorf("KillTimeout = %v, want %v", cfg.KillTimeout, defaultKillTimeout)
+	}
 }
 
 func TestLoadReaperOverride(t *testing.T) {
 	t.Setenv("WISP_REAP_INTERVAL_SECONDS", "5")
 	t.Setenv("WISP_EXPIRING_LEAD_SECONDS", "120")
 	t.Setenv("WISP_RELEASE_GRACE_SECONDS", "45")
+	t.Setenv("WISP_KILL_TIMEOUT_SECONDS", "10")
 
 	cfg, err := Load()
 	if err != nil {
@@ -131,15 +136,19 @@ func TestLoadReaperOverride(t *testing.T) {
 	if cfg.ReleaseGrace != 45*time.Second {
 		t.Errorf("ReleaseGrace = %v, want 45s", cfg.ReleaseGrace)
 	}
+	if cfg.KillTimeout != 10*time.Second {
+		t.Errorf("KillTimeout = %v, want 10s", cfg.KillTimeout)
+	}
 }
 
 func TestLoadInvalidReaperEnv(t *testing.T) {
-	for _, name := range []string{"WISP_REAP_INTERVAL_SECONDS", "WISP_EXPIRING_LEAD_SECONDS", "WISP_RELEASE_GRACE_SECONDS"} {
+	for _, name := range []string{"WISP_REAP_INTERVAL_SECONDS", "WISP_EXPIRING_LEAD_SECONDS", "WISP_RELEASE_GRACE_SECONDS", "WISP_KILL_TIMEOUT_SECONDS"} {
 		for _, val := range []string{"notanint", "0", "-3"} {
 			t.Run(name+"="+val, func(t *testing.T) {
 				t.Setenv("WISP_REAP_INTERVAL_SECONDS", "")
 				t.Setenv("WISP_EXPIRING_LEAD_SECONDS", "")
 				t.Setenv("WISP_RELEASE_GRACE_SECONDS", "")
+				t.Setenv("WISP_KILL_TIMEOUT_SECONDS", "")
 				t.Setenv(name, val)
 				if _, err := Load(); err == nil {
 					t.Fatalf("Load() error = nil, want error for %s=%q", name, val)

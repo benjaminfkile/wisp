@@ -8,6 +8,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -417,6 +418,13 @@ func (d *DockerRuntime) CopyFilesToContainer(ctx context.Context, id string, fil
 	}
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
+	// Stamp every entry with the current wall-clock time so ingested files
+	// carry a real mtime in the container. A zero-value ModTime writes tar
+	// entries as Jan 1 1970 (the tar epoch), which surfaces as "1970" in
+	// ls -l and confuses userdata scripts that key on file freshness. All
+	// entries in one archive share the same instant so a batch shows a
+	// consistent timestamp.
+	now := time.Now()
 	for _, f := range files {
 		if f.Path == "" {
 			return fmt.Errorf("runtime: copy files: empty path")
@@ -434,6 +442,7 @@ func (d *DockerRuntime) CopyFilesToContainer(ctx context.Context, id string, fil
 			Name:     name,
 			Mode:     mode,
 			Size:     int64(len(f.Content)),
+			ModTime:  now,
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return fmt.Errorf("runtime: copy files: write header for %s: %w", f.Path, err)

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -142,6 +143,27 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // writeError writes a JSON error body {"error": msg} with the given status.
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// decodeJSONBody wraps r.Body in an http.MaxBytesReader capped at maxBytes and
+// JSON-decodes it into v. A body larger than the cap is rejected with 400
+// "request body too large (max N bytes)" so an oversized payload is refused up
+// front, never fully buffered and decoded in memory before a per-field cap can
+// see it. Any other decode failure surfaces as 400 "invalid JSON body", the
+// stable error shape callers already match on. Returns true when v is filled
+// and the caller may proceed; false when an error response was written.
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, maxBytes int64, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("request body too large (max %d bytes)", maxBytes))
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return false
+	}
+	return true
 }
 
 // statusRecorder captures the response status for logging.

@@ -96,6 +96,21 @@ const defaultReleaseKillTimeout = 30 * time.Second
 // the terminal transition.
 const releaseKillDrainGrace = 250 * time.Millisecond
 
+// Per-route JSON request body caps enforced via http.MaxBytesReader. Wrapping
+// each JSON handler up front is what stops an oversized body (e.g. an enormous
+// content_base64 blob on POST /contracts) from being fully read, JSON-decoded,
+// and base64-decoded in memory before any per-field cap can reject it. A body
+// past the cap surfaces as a stable "request body too large" 400, not a panic
+// or an opaque decode error. The create cap is deliberately generous enough to
+// carry the 1 MiB decoded files total plus base64 (~1.33x) and JSON overhead;
+// exec and events carry only a small command string or opaque event, so they
+// get the tighter cap.
+const (
+	maxCreateBodyBytes = 4 * 1024 * 1024
+	maxExecBodyBytes   = 512 * 1024
+	maxEventBodyBytes  = 512 * 1024
+)
+
 // broker wires the contract model to the Runtime over HTTP. It owns the
 // lifecycle of a contract: create + boot + run userdata on POST, report status
 // on GET, and release (kill + mark released) on DELETE.
@@ -539,8 +554,7 @@ type launchSpec struct {
 // token, and final status (see docs/DESIGN.md §4, §7).
 func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 	var req createRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, maxCreateBodyBytes, &req) {
 		return
 	}
 	if req.TTLSeconds <= 0 {
@@ -1554,8 +1568,7 @@ func (b *broker) exec(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req execRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, maxExecBodyBytes, &req) {
 		return
 	}
 	if req.Command == "" {

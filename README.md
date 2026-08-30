@@ -351,6 +351,13 @@ WS     /events                        subscribe, optional ?type=a,b filter      
 Every response body other than the SSE stream is JSON; errors are
 `{"error":"..."}`.
 
+Every JSON-body handler is fronted by `http.MaxBytesReader` so an oversized
+body is refused up front with `400 request body too large (max N bytes)`
+rather than being fully buffered and decoded in memory. Per-route caps:
+`POST /contracts` accepts up to 4 MiB (large enough for the 1 MiB decoded
+files total plus base64 and JSON overhead); `POST /contracts/:id/exec` and
+`POST /events` accept up to 512 KiB.
+
 ## Lifecycle, reaper & restart reconcile
 
 A contract moves `requested -> provisioning -> ready -> expiring -> releasing -> released`,

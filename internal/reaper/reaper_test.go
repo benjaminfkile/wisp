@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,17 +88,25 @@ func TestReaperReleasesGPUsOnExpiry(t *testing.T) {
 		t.Fatalf("Adopt plain: %v", err)
 	}
 
+	var freedMu sync.Mutex
 	var freed [][]string
 	rp := New(store, fake, Options{
-		Logger:      discardLogger(),
-		Now:         func() time.Time { return past.Add(time.Hour) },
-		ReleaseGPUs: func(ids []string) { freed = append(freed, ids) },
+		Logger: discardLogger(),
+		Now:    func() time.Time { return past.Add(time.Hour) },
+		ReleaseGPUs: func(ids []string) {
+			freedMu.Lock()
+			defer freedMu.Unlock()
+			freed = append(freed, ids)
+		},
 	})
 	rp.Tick(ctx)
+	rp.WaitForKills()
 
 	if c, _ := store.Get("gpu-contract"); c.State != contract.StateExpired {
 		t.Fatalf("gpu-contract state = %q, want expired", c.State)
 	}
+	freedMu.Lock()
+	defer freedMu.Unlock()
 	if len(freed) != 1 {
 		t.Fatalf("ReleaseGPUs called %d times, want 1 (only the GPU-holding lease)", len(freed))
 	}
@@ -158,13 +168,18 @@ func TestReaperExpiringThenExpired(t *testing.T) {
 	fake := runtime.NewFake()
 	c, cid := readyContract(t, store, fake, time.Hour)
 
+	var eventsMu sync.Mutex
 	var events []Event
 	now := c.ExpiresAt.Add(-30 * time.Second) // start inside the lead window
 	rp := New(store, fake, Options{
 		Lead:   time.Minute,
 		Logger: discardLogger(),
 		Now:    func() time.Time { return now },
-		Notify: func(e Event) { events = append(events, e) },
+		Notify: func(e Event) {
+			eventsMu.Lock()
+			defer eventsMu.Unlock()
+			events = append(events, e)
+		},
 	})
 
 	// First tick: warning only.
@@ -179,6 +194,7 @@ func TestReaperExpiringThenExpired(t *testing.T) {
 	// Advance the clock past the TTL and tick again: hard kill.
 	now = c.ExpiresAt.Add(time.Second)
 	rp.Tick(context.Background())
+	rp.WaitForKills()
 
 	got, _ := store.Get(c.ID)
 	if got.State != contract.StateExpired {
@@ -191,6 +207,8 @@ func TestReaperExpiringThenExpired(t *testing.T) {
 		t.Errorf("live container count = %d, want 0", fake.Count())
 	}
 
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
 	if len(events) != 2 {
 		t.Fatalf("events = %+v, want two (expiring then expired)", events)
 	}
@@ -212,15 +230,21 @@ func TestReaperExpiresReadyPastTTL(t *testing.T) {
 	fake := runtime.NewFake()
 	c, cid := readyContract(t, store, fake, time.Hour)
 
+	var eventsMu sync.Mutex
 	var events []Event
 	rp := New(store, fake, Options{
 		Lead:   time.Minute,
 		Logger: discardLogger(),
 		Now:    func() time.Time { return c.ExpiresAt.Add(time.Second) },
-		Notify: func(e Event) { events = append(events, e) },
+		Notify: func(e Event) {
+			eventsMu.Lock()
+			defer eventsMu.Unlock()
+			events = append(events, e)
+		},
 	})
 
 	rp.Tick(context.Background())
+	rp.WaitForKills()
 
 	got, _ := store.Get(c.ID)
 	if got.State != contract.StateExpired {
@@ -229,6 +253,8 @@ func TestReaperExpiresReadyPastTTL(t *testing.T) {
 	if _, ok := fake.Container(cid); ok {
 		t.Error("container survived; want killed")
 	}
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
 	if len(events) != 1 || events[0].Reason != ReasonTTLExpired {
 		t.Fatalf("events = %+v, want one expired event with Reason=%q", events, ReasonTTLExpired)
 	}
@@ -341,6 +367,7 @@ func TestReaperExpiresEvenIfKillFails(t *testing.T) {
 	})
 
 	rp.Tick(context.Background())
+	rp.WaitForKills()
 
 	if got, _ := store.Get(c.ID); got.State != contract.StateExpired {
 		t.Errorf("State = %q, want expired despite kill failure", got.State)
@@ -354,23 +381,35 @@ func TestReaperSetNotify(t *testing.T) {
 	fake := runtime.NewFake()
 	c, _ := readyContract(t, store, fake, time.Hour)
 
+	var gotMu sync.Mutex
 	var got []Event
 	rp := New(store, fake, Options{
 		Lead:   time.Minute,
 		Logger: discardLogger(),
 		Now:    func() time.Time { return c.ExpiresAt.Add(time.Second) },
 	})
-	rp.SetNotify(func(e Event) { got = append(got, e) })
+	rp.SetNotify(func(e Event) {
+		gotMu.Lock()
+		defer gotMu.Unlock()
+		got = append(got, e)
+	})
 
 	rp.Tick(context.Background())
+	rp.WaitForKills()
 
+	gotMu.Lock()
 	if len(got) != 1 || got[0].To != contract.StateExpired {
+		gotMu.Unlock()
 		t.Fatalf("events = %+v, want one expired event", got)
 	}
+	gotMu.Unlock()
 
 	// Disabling the hook stops further notifications.
 	rp.SetNotify(nil)
 	rp.Tick(context.Background()) // no-op: contract already terminal
+	rp.WaitForKills()
+	gotMu.Lock()
+	defer gotMu.Unlock()
 	if len(got) != 1 {
 		t.Errorf("events = %+v, want no new events after SetNotify(nil)", got)
 	}
@@ -391,16 +430,22 @@ func TestReaperReapsDeadContainerBeforeTTL(t *testing.T) {
 	// the liveness check on the next tick — well before the lead window.
 	fake.InspectOverrides = map[string]runtime.LivenessState{cid: runtime.LivenessGone}
 
+	var eventsMu sync.Mutex
 	var events []Event
 	rp := New(store, fake, Options{
 		Lead:   time.Minute,
 		Logger: discardLogger(),
 		// Nowhere near the TTL: only the liveness signal can trigger the reap.
-		Now:    func() time.Time { return c.ExpiresAt.Add(-30 * time.Minute) },
-		Notify: func(e Event) { events = append(events, e) },
+		Now: func() time.Time { return c.ExpiresAt.Add(-30 * time.Minute) },
+		Notify: func(e Event) {
+			eventsMu.Lock()
+			defer eventsMu.Unlock()
+			events = append(events, e)
+		},
 	})
 
 	rp.Tick(context.Background())
+	rp.WaitForKills()
 
 	got, _ := store.Get(c.ID)
 	if !got.State.Terminal() {
@@ -409,6 +454,8 @@ func TestReaperReapsDeadContainerBeforeTTL(t *testing.T) {
 	if got.State != contract.StateExpired {
 		t.Errorf("state = %q, want %q", got.State, contract.StateExpired)
 	}
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
 	if len(events) != 1 || events[0].To != contract.StateExpired {
 		t.Fatalf("events = %+v, want one ready→expired event", events)
 	}
@@ -435,6 +482,7 @@ func TestReaperReapsStoppedContainerBeforeTTL(t *testing.T) {
 		Now:    func() time.Time { return c.ExpiresAt.Add(-30 * time.Minute) },
 	})
 	rp.Tick(context.Background())
+	rp.WaitForKills()
 
 	if got, _ := store.Get(c.ID); got.State != contract.StateExpired {
 		t.Errorf("state = %q, want %q after out-of-band container stop", got.State, contract.StateExpired)
@@ -453,20 +501,25 @@ func TestReaperDeadContainerFreesCapacityExactlyOnce(t *testing.T) {
 
 	fake.InspectOverrides = map[string]runtime.LivenessState{cid: runtime.LivenessGone}
 
-	freed := 0
+	var freed atomic.Int64
 	rp := New(store, fake, Options{
 		Lead:            time.Minute,
 		Logger:          discardLogger(),
 		Now:             func() time.Time { return c.ExpiresAt.Add(-30 * time.Minute) },
-		ReleaseCapacity: func(contract.Contract) { freed++ },
+		ReleaseCapacity: func(contract.Contract) { freed.Add(1) },
 	})
 
 	for i := 0; i < 5; i++ {
 		rp.Tick(context.Background())
+		// Each tick may launch an off-tick Kill goroutine; wait for it so a
+		// subsequent tick sees the winning terminal transition (and skips) rather
+		// than racing on the in-flight mark, which would let the assertion below
+		// depend on the goroutine's timing.
+		rp.WaitForKills()
 	}
 
-	if freed != 1 {
-		t.Fatalf("ReleaseCapacity fired %d times across 5 ticks; want exactly 1", freed)
+	if got := freed.Load(); got != 1 {
+		t.Fatalf("ReleaseCapacity fired %d times across 5 ticks; want exactly 1", got)
 	}
 	// After the first tick the contract is expired; a subsequent tick's cleanup
 	// sweep removes it (it was terminal at start of tick), so five ticks in it is
@@ -506,14 +559,22 @@ func TestReaperDeadContainerFreesGPUs(t *testing.T) {
 	// Simulate the container being killed by docker kill / OOM.
 	fake.InspectOverrides = map[string]runtime.LivenessState{cid: runtime.LivenessGone}
 
+	var freedMu sync.Mutex
 	var freed [][]string
 	rp := New(store, fake, Options{
-		Logger:      discardLogger(),
-		Now:         func() time.Time { return future.Add(-time.Hour) },
-		ReleaseGPUs: func(ids []string) { freed = append(freed, ids) },
+		Logger: discardLogger(),
+		Now:    func() time.Time { return future.Add(-time.Hour) },
+		ReleaseGPUs: func(ids []string) {
+			freedMu.Lock()
+			defer freedMu.Unlock()
+			freed = append(freed, ids)
+		},
 	})
 	rp.Tick(ctx)
+	rp.WaitForKills()
 
+	freedMu.Lock()
+	defer freedMu.Unlock()
 	if len(freed) != 1 {
 		t.Fatalf("ReleaseGPUs fired %d times, want 1", len(freed))
 	}
@@ -667,6 +728,7 @@ func TestReaperNoErrorLogOnDockerConflictKill(t *testing.T) {
 	})
 
 	rp.Tick(context.Background())
+	rp.WaitForKills()
 
 	if got, _ := store.Get(adopted.ID); got.State != contract.StateExpired {
 		t.Fatalf("state = %q, want expired after container-died reap", got.State)
@@ -744,10 +806,13 @@ func TestReaperSkipsReleasingContract(t *testing.T) {
 
 // TestReaperExpiresStuckReleasingContract pins the release-grace escape hatch:
 // a contract that has sat in StateReleasing past the reaper's release grace
-// (the DELETE handler crashed mid-release, or its Kill hung) is treated like
-// any other non-terminal contract: the reaper kills the container, expires the
-// contract, and returns its reserved capacity to the allocator. Without this
-// path the lease's capacity would leak until wispd restarted.
+// (the DELETE handler crashed mid-release, or its request was cancelled
+// before the final mark-released transition) is treated like any other
+// non-terminal contract: the reaper kills the container, expires the
+// contract, and returns its reserved capacity to the allocator. A hung Docker
+// daemon on the reaper's own Kill is bounded separately by killTimeout and
+// runs off the tick, not by this grace. Without this path the lease's
+// capacity would leak until wispd restarted.
 func TestReaperExpiresStuckReleasingContract(t *testing.T) {
 	store := contract.NewStore()
 	fake := runtime.NewFake()
@@ -765,19 +830,25 @@ func TestReaperExpiresStuckReleasingContract(t *testing.T) {
 		t.Fatal("UpdateState(StateReleasing) did not stamp ReleasingSince")
 	}
 
+	var eventsMu sync.Mutex
 	var events []Event
-	freed := 0
+	var freed atomic.Int64
 	rp := New(store, fake, Options{
 		Lead:         time.Minute,
 		ReleaseGrace: 30 * time.Second,
 		Logger:       discardLogger(),
 		// Just past the grace: the release is presumed stuck, so the reaper
 		// takes over even though the contract is still well within its TTL.
-		Now:             func() time.Time { return c.ReleasingSince.Add(31 * time.Second) },
-		Notify:          func(e Event) { events = append(events, e) },
-		ReleaseCapacity: func(contract.Contract) { freed++ },
+		Now: func() time.Time { return c.ReleasingSince.Add(31 * time.Second) },
+		Notify: func(e Event) {
+			eventsMu.Lock()
+			defer eventsMu.Unlock()
+			events = append(events, e)
+		},
+		ReleaseCapacity: func(contract.Contract) { freed.Add(1) },
 	})
 	rp.Tick(ctx)
+	rp.WaitForKills()
 
 	got, err := store.Get(c.ID)
 	if err != nil {
@@ -789,9 +860,11 @@ func TestReaperExpiresStuckReleasingContract(t *testing.T) {
 	if _, ok := fake.Container(cid); ok {
 		t.Error("reaper did not kill the container of a stuck releasing contract past grace")
 	}
-	if freed != 1 {
-		t.Errorf("ReleaseCapacity fired %d times, want 1 (capacity must return to the allocator)", freed)
+	if got := freed.Load(); got != 1 {
+		t.Errorf("ReleaseCapacity fired %d times, want 1 (capacity must return to the allocator)", got)
 	}
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
 	if len(events) != 1 || events[0].To != contract.StateExpired || events[0].From != contract.StateReleasing {
 		t.Fatalf("events = %+v, want one releasing→expired transition", events)
 	}
@@ -872,6 +945,7 @@ func TestReaperNoErrorLogOnDockerNotFoundKill(t *testing.T) {
 	})
 
 	rp.Tick(context.Background())
+	rp.WaitForKills()
 
 	if got, _ := store.Get(adopted.ID); got.State != contract.StateExpired {
 		t.Fatalf("state = %q, want expired after out-of-band container removal", got.State)
@@ -912,82 +986,253 @@ func TestReaperDefaults(t *testing.T) {
 // the caller's context is cancelled, standing in for a Docker daemon whose
 // ContainerRemove has wedged. Any other id delegates to the fake's normal Kill.
 // Embedding the concrete *runtime.Fake means Kill defined here shadows the
-// embedded Kill and the wrapper still satisfies runtime.Runtime.
+// embedded Kill and the wrapper still satisfies runtime.Runtime. started is
+// closed the first time Kill enters the hang so tests can synchronize on the
+// hung goroutine actually being in flight, and calls counts every entry into
+// Kill for the hangID so a test can assert the in-flight mark prevents the
+// next tick from launching a second Kill.
 type hangingKillRuntime struct {
 	*runtime.Fake
-	hangID string
+	hangID    string
+	started   chan struct{}
+	startedMu sync.Mutex
+	calls     atomic.Int64
 }
 
 func (h *hangingKillRuntime) Kill(ctx context.Context, id string) error {
 	if id == h.hangID {
+		h.calls.Add(1)
+		h.startedMu.Lock()
+		select {
+		case <-h.started:
+			// already closed by an earlier call
+		default:
+			close(h.started)
+		}
+		h.startedMu.Unlock()
 		<-ctx.Done()
 		return ctx.Err()
 	}
 	return h.Fake.Kill(ctx, id)
 }
 
-// TestReaperKillTimeoutContinuesTick pins the fix for the "one hung Kill stalls
-// the whole tick" scenario: with a bounded Kill, a runtime whose Kill blocks on
-// the first contract processed must NOT prevent the reaper from moving on and
-// expiring the remaining contracts. Without the bound the reaper loop would
-// block on the wedged Kill and the second contract's TTL expiry would sit
-// unenforced until the daemon responded, dropping capacity and GPUs on the
-// floor for the duration.
-func TestReaperKillTimeoutContinuesTick(t *testing.T) {
+// TestReaperKillDoesNotStallTick pins the async Kill behavior: with the
+// reaper's Kill running OFF the tick in its own goroutine, a hung Docker
+// daemon on one contract's Kill must add no latency to the sweep, so Tick
+// returns well under the KillTimeout while the remaining contracts are still
+// reaped. Without the off-tick change the sweep would block on the wedged
+// Kill for the whole KillTimeout and a co-tick expiry would sit unenforced
+// until the daemon responded (measured: a TTL-expired contract reaped 17 s
+// late).
+func TestReaperKillDoesNotStallTick(t *testing.T) {
 	store := contract.NewStore()
 	fake := runtime.NewFake()
 
 	// Two ready contracts, both past their TTL. The store lists in CreatedAt
 	// order, so the first-created (hung) contract is processed first; without
-	// the Kill bound the sweep would block there and never reach live.
+	// the off-tick change the sweep would block there and never reach live.
 	hung, hungCID := readyContract(t, store, fake, time.Hour)
 	live, liveCID := readyContract(t, store, fake, time.Hour)
 
-	rt := &hangingKillRuntime{Fake: fake, hangID: hungCID}
+	rt := &hangingKillRuntime{Fake: fake, hangID: hungCID, started: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		// Let the hung goroutine unwind before the test returns so the -race
+		// detector does not flag its lingering write to killWG under teardown.
+	}()
 
 	rp := New(store, rt, Options{
-		Lead:        time.Minute,
-		KillTimeout: 50 * time.Millisecond,
+		Lead: time.Minute,
+		// A generous KillTimeout so any inline-Kill regression is obvious: even
+		// a "slow" inline Kill would stall the tick for the full hour, not the
+		// sub-second bound below.
+		KillTimeout: time.Hour,
 		Logger:      discardLogger(),
-		// Past both TTLs so both contracts are due for expiry.
-		Now: func() time.Time { return hung.ExpiresAt.Add(time.Second) },
+		Now:         func() time.Time { return hung.ExpiresAt.Add(time.Second) },
 	})
 
-	done := make(chan struct{})
-	go func() {
-		rp.Tick(context.Background())
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("Tick stalled on a hung Kill; each reaper Kill must be bounded so the sweep can continue with the remaining contracts")
+	start := time.Now()
+	rp.Tick(ctx)
+	elapsed := time.Since(start)
+	// Off-the-tick Kill: Tick returns as soon as it has fanned out the
+	// goroutines, regardless of a hung one. The bound is orders of magnitude
+	// below KillTimeout so a stall regression is unambiguous.
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("Tick took %v with a hung Kill in flight; the reaper Kill must run off the tick (KillTimeout = %v)", elapsed, time.Hour)
 	}
 
-	// The hung contract must be left in place so the next tick can retry the
-	// kill; a timed-out Kill is inconclusive and must not fake a terminal
-	// transition on the store side either.
+	// The hung Kill goroutine must actually be in flight while the live
+	// contract is being reaped, otherwise the "off the tick" claim is
+	// meaningless. Wait for it before making the live-side assertions.
+	select {
+	case <-rt.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hung Kill goroutine never entered Kill; the reaper did not launch it")
+	}
+
+	// The live contract's Kill goroutine completes quickly against the fake
+	// runtime; poll for its terminal transition rather than sleeping.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got, err := store.Get(live.ID)
+		if err == nil && got.State == contract.StateExpired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("live contract not expired within 2s; got state = %q err = %v", got.State, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, ok := fake.Container(liveCID); ok {
+		t.Error("live contract's container survived; it must be reaped while another Kill hangs")
+	}
+
+	// The hung contract must be left in place: its Kill is still in flight
+	// (blocked on ctx.Done), so no terminal transition has fired and the
+	// in-flight mark still holds.
 	got, err := store.Get(hung.ID)
 	if err != nil {
 		t.Fatalf("Get hung contract: %v", err)
 	}
 	if got.State == contract.StateExpired {
-		t.Errorf("hung contract state = %q; a Kill timeout must leave the contract for the next tick, not transition it to expired", got.State)
+		t.Errorf("hung contract state = %q; the terminal transition must not fire while Kill is still in flight", got.State)
+	}
+	if !rp.isKilling(hung.ID) {
+		t.Error("hung contract is not marked in-flight; the mark must hold across the sweep")
 	}
 	if _, ok := fake.Container(hungCID); !ok {
-		t.Error("hung container was removed despite the Kill timing out")
+		t.Error("hung container was removed despite the Kill still hanging")
 	}
 
-	// The live contract must have been reaped despite the earlier hung Kill;
-	// this is the regression the timeout was added to prevent.
-	liveGot, err := store.Get(live.ID)
+	// Cancel the outer context so the hung goroutine's killCtx unblocks and
+	// the goroutine cleans up before the test returns.
+	cancel()
+	rp.WaitForKills()
+}
+
+// TestReaperKillTimeoutLeavesContractInPlace pins the fix for a bounded Kill:
+// when the Kill goroutine's killCtx timeout fires with the outer context
+// still alive, the contract is left in place for a later kill attempt (no
+// terminal transition, no capacity free). The reaper's tick sweep is
+// unaffected; this test focuses on the goroutine's completion path.
+func TestReaperKillTimeoutLeavesContractInPlace(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	c, cid := readyContract(t, store, fake, time.Hour)
+
+	rt := &hangingKillRuntime{Fake: fake, hangID: cid, started: make(chan struct{})}
+
+	var freed atomic.Int64
+	rp := New(store, rt, Options{
+		Lead: time.Minute,
+		// Short timeout so the goroutine exits via the killCtx deadline path
+		// quickly under the test's outer context (still alive).
+		KillTimeout:     50 * time.Millisecond,
+		Logger:          discardLogger(),
+		Now:             func() time.Time { return c.ExpiresAt.Add(time.Second) },
+		ReleaseCapacity: func(contract.Contract) { freed.Add(1) },
+	})
+
+	rp.Tick(context.Background())
+	rp.WaitForKills()
+
+	// The goroutine exited via killCtx.DeadlineExceeded with the outer ctx
+	// still alive: no terminal transition, no capacity free.
+	got, err := store.Get(c.ID)
 	if err != nil {
-		t.Fatalf("Get live contract: %v", err)
+		t.Fatalf("Get: %v", err)
 	}
-	if liveGot.State != contract.StateExpired {
-		t.Errorf("live contract state = %q; want expired (the reaper must reap the remaining contracts even when one Kill hangs)", liveGot.State)
+	if got.State == contract.StateExpired {
+		t.Errorf("state = %q; a Kill timeout under a live outer ctx must leave the contract for a later attempt", got.State)
 	}
-	if _, ok := fake.Container(liveCID); ok {
-		t.Error("live contract's container survived; it must be reaped even when another contract's Kill hangs")
+	if n := freed.Load(); n != 0 {
+		t.Errorf("ReleaseCapacity fired %d times; want 0 on a Kill timeout (nothing was actually freed)", n)
+	}
+	// The in-flight mark must be cleared so a later tick can retry.
+	if rp.isKilling(c.ID) {
+		t.Error("in-flight mark still held after Kill timeout; the mark must clear so a later tick can retry")
+	}
+}
+
+// TestReaperInFlightContractNotDoubleKilled pins that the in-flight mark
+// prevents a subsequent tick from launching a second Kill goroutine on a
+// contract whose previous Kill is still outstanding. Without this the reaper
+// would fan out a new Kill every tick while the daemon was wedged, all
+// competing on the same container.
+func TestReaperInFlightContractNotDoubleKilled(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	c, cid := readyContract(t, store, fake, time.Hour)
+
+	rt := &hangingKillRuntime{Fake: fake, hangID: cid, started: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+	}()
+
+	rp := New(store, rt, Options{
+		Lead:        time.Minute,
+		KillTimeout: time.Hour,
+		Logger:      discardLogger(),
+		Now:         func() time.Time { return c.ExpiresAt.Add(time.Second) },
+	})
+
+	// First tick: launches the hung Kill goroutine.
+	rp.Tick(ctx)
+	select {
+	case <-rt.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hung Kill goroutine did not start on the first tick")
+	}
+
+	// A second tick with the previous Kill still in flight must skip the
+	// contract entirely (no new goroutine, no new Kill call).
+	rp.Tick(ctx)
+	// Give a stray second goroutine a moment to enter Kill if the in-flight
+	// mark did not stop it, so the assertion catches the regression.
+	time.Sleep(50 * time.Millisecond)
+
+	if n := rt.calls.Load(); n != 1 {
+		t.Fatalf("Kill called %d times; want 1 (an in-flight contract must not be double-killed by the next tick)", n)
+	}
+
+	cancel()
+	rp.WaitForKills()
+}
+
+// TestReaperAsyncExpiryFreesCapacityExactlyOnce: the completion of an off-tick
+// Kill goroutine that transitions a contract to expired fires
+// ReleaseCapacity exactly once per contract, even across multiple ticks that
+// would each try to expire it if not for the in-flight mark and the terminal
+// state-machine gate.
+func TestReaperAsyncExpiryFreesCapacityExactlyOnce(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	c, _ := readyContract(t, store, fake, time.Hour)
+
+	var freed atomic.Int64
+	rp := New(store, fake, Options{
+		Lead:            time.Minute,
+		Logger:          discardLogger(),
+		Now:             func() time.Time { return c.ExpiresAt.Add(time.Second) },
+		ReleaseCapacity: func(contract.Contract) { freed.Add(1) },
+	})
+
+	// Two ticks in quick succession before the first goroutine's completion
+	// has a chance to fire on a slow scheduler; the in-flight mark must gate
+	// the second tick's would-be expire.
+	rp.Tick(context.Background())
+	rp.Tick(context.Background())
+	rp.WaitForKills()
+	// A third tick after completion sees the contract as terminal and reap()
+	// short-circuits.
+	rp.Tick(context.Background())
+	rp.WaitForKills()
+
+	if got := freed.Load(); got != 1 {
+		t.Fatalf("ReleaseCapacity fired %d times across three ticks; want exactly 1", got)
 	}
 }

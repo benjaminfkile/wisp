@@ -46,6 +46,7 @@ Configuration (environment):
 | `WISP_REAP_INTERVAL_SECONDS`  | `1`              | How often the TTL reaper sweeps (positive integer). |
 | `WISP_EXPIRING_LEAD_SECONDS`  | `60`             | How long before the TTL a ready contract moves to `expiring` (positive integer). |
 | `WISP_RELEASE_GRACE_SECONDS`  | `30`             | How long the reaper skips a contract sitting in `releasing` before expiring it as a stuck release (positive integer). |
+| `WISP_KILL_TIMEOUT_SECONDS`   | `30`             | How long a single reaper `Kill` may run before it is bounded out so the sweep can move on (positive integer). |
 
 `wispd` needs a reachable Docker daemon (ambient `DOCKER_HOST` etc.) and exits at
 startup if the client cannot be built or the config fails to load or validate.
@@ -331,8 +332,12 @@ mark-released transition) and the reaper expires the contract like any other
 non-terminal one, killing the container if needed and returning its capacity
 and GPUs to the allocators rather than leaking them until restart. A hung
 Docker daemon on the reaper's own `Kill` is bounded separately: each reaper
-`Kill` runs under a 30 s timeout, so one wedged container cannot stall the
-sweep, and a timed-out contract is left in place for the next tick to retry. The reaper sweeps every
+`Kill` runs under `WISP_KILL_TIMEOUT_SECONDS` (default 30 s) and runs off the
+sweep in its own goroutine, so a wedged container adds no latency to the tick;
+the state transition and capacity free apply in that goroutine's completion,
+the tick skips any contract with a kill in flight so the next sweep never
+double-kills it, and a timed-out contract is left in place for a later kill
+attempt while the sweep proceeds with the remaining contracts. The reaper sweeps every
 `WISP_REAP_INTERVAL_SECONDS`: a `ready` contract inside the
 `WISP_EXPIRING_LEAD_SECONDS` window becomes `expiring`; a contract past its TTL
 is killed and `expired`; and a `ready`/`expiring` contract whose container has

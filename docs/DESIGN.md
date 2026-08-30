@@ -108,8 +108,9 @@ requested → provisioning → ready → (in use) → expiring → releasing →
   the final mark-released transition) and the reaper expires the contract just like any other
   non-terminal one, so the lease's capacity and GPUs return to the allocators instead of leaking
   until restart; `expired` is therefore also a legal successor from `releasing`. A hung Docker
-  daemon on the reaper's own `Kill` is bounded separately (see §13, "Release grace bounds the
-  fence"), not by this grace. Exec and shell are `409` against a `releasing` contract
+  daemon on the reaper's own `Kill` is bounded separately by `WISP_KILL_TIMEOUT_SECONDS` and
+  runs off the tick in its own goroutine (see §13, "Reaper Kill is bounded and runs off the
+  tick"), not by this grace. Exec and shell are `409` against a `releasing` contract
   (the container is being torn down). A `DELETE` against a contract already in `releasing` is an
   idempotent success (200 echoing the current `releasing` status) so a concurrent second DELETE
   does not double-kill or double-free. The state is internal to the release handler (it lives at
@@ -624,11 +625,17 @@ switches it**, it only serves whichever mode the host is in.
   mark-released transition) and the reaper expires the contract like any other non-terminal one,
   returning its capacity and GPUs to the allocators so a stalled release never leaks a lease's
   reservation until wispd restarts.
-- **Reaper Kill is bounded**, each reaper `Kill` runs under a 30 s timeout so a hung Docker
-  daemon (a wedged `ContainerRemove`) cannot stall the sweep. On timeout the contract is left
-  in place for the next tick to retry, and the sweep proceeds with the remaining contracts, so
-  one wedged container never freezes reaping for the whole store or keeps other capacity
-  reservations from returning to the allocators.
+- **Reaper Kill is bounded and runs off the tick**, each reaper `Kill` runs under
+  `WISP_KILL_TIMEOUT_SECONDS` (default 30 s) so a hung Docker daemon (a wedged
+  `ContainerRemove`) cannot stall the sweep, and the bounded `Kill` is launched in its
+  own goroutine so a stuck container adds no latency to the tick at all. The tick marks
+  the contract as having a kill in flight and moves on to the remaining contracts, and a
+  later tick skips a contract already in flight so the next sweep never double-kills it.
+  The state transition (to `expired`) and the capacity / GPU free apply in that
+  goroutine's completion under the same idempotent transition rules as an inline expire,
+  so the DELETE handler path is unchanged and terminal side effects still happen exactly
+  once even when a `DELETE` wins the race. On timeout the contract is left in place for a
+  later kill attempt.
 
 ## 14. Open questions
 

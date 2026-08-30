@@ -180,6 +180,7 @@ func TestReaperExpiryFreesCapacity(t *testing.T) {
 		ReleaseCapacity: func(c contract.Contract) { b.cap.Free(c.ReservedCPUs, c.ReservedMemoryMB) },
 	})
 	rp.Tick(context.Background())
+	rp.WaitForKills()
 
 	if got, _ := store.Get(created.ContractID); got.State != contract.StateExpired {
 		t.Fatalf("state after reaper = %q, want expired", got.State)
@@ -227,9 +228,15 @@ func TestReaperReapsDeadContainerFreesCapacityAndImagesReflects(t *testing.T) {
 	// state-machine gate on the winning expired transition must keep ReleaseCapacity
 	// firing EXACTLY ONCE across all three, so used cpus/memory land at zero — not
 	// underflow — and stay there.
+	// Each tick launches the Kill off the sweep in its own goroutine; wait
+	// between them so the sweep sees the winning terminal transition rather
+	// than racing on the in-flight mark.
 	rp.Tick(context.Background())
+	rp.WaitForKills()
 	rp.Tick(context.Background())
+	rp.WaitForKills()
 	rp.Tick(context.Background())
+	rp.WaitForKills()
 
 	// After three ticks the contract has been expired (first tick) and then
 	// cleaned up (a terminal-at-start tick removes it), so a subsequent Get

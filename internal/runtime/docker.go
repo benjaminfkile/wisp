@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"fmt"
@@ -402,6 +403,110 @@ func (d *DockerRuntime) Kill(ctx context.Context, id string) error {
 	}
 	return nil
 }
+
+// CopyFilesToContainer implements Runtime. It builds one in-memory tar archive
+// carrying every FileEntry as a regular file (typeflag tar.TypeReg) and pipes
+// it to the Docker daemon's copy-to-container endpoint, which extracts it
+// under "/". Parent directories are created by the extraction (a tar entry for
+// /foo/bar.txt materialises /foo automatically). The whole archive is written
+// in one Docker round trip so a create's file-write cost stays flat in the
+// number of files. Empty file list is a no-op.
+func (d *DockerRuntime) CopyFilesToContainer(ctx context.Context, id string, files []FileEntry) error {
+	if len(files) == 0 {
+		return nil
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, f := range files {
+		if f.Path == "" {
+			return fmt.Errorf("runtime: copy files: empty path")
+		}
+		// Docker expects tar names without a leading slash even though the
+		// destination extraction is at "/"; strip it so the header name is the
+		// same relative path in every entry.
+		name := strings.TrimPrefix(f.Path, "/")
+		mode := f.Mode
+		if mode == 0 {
+			mode = 0o644
+		}
+		hdr := &tar.Header{
+			Typeflag: tar.TypeReg,
+			Name:     name,
+			Mode:     mode,
+			Size:     int64(len(f.Content)),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return fmt.Errorf("runtime: copy files: write header for %s: %w", f.Path, err)
+		}
+		if _, err := tw.Write(f.Content); err != nil {
+			return fmt.Errorf("runtime: copy files: write body for %s: %w", f.Path, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("runtime: copy files: close tar: %w", err)
+	}
+	if err := d.cli.CopyToContainer(ctx, id, "/", &buf, types.CopyToContainerOptions{}); err != nil {
+		if client.IsErrNotFound(err) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("runtime: copy files to container %s: %w", id, err)
+	}
+	return nil
+}
+
+// CopyFileFromContainer implements Runtime. It asks the Docker daemon for a
+// tar archive covering exactly one path, reads the single tar entry, and
+// returns a reader over its body bytes. The tar wrapper is stripped so the
+// caller streams plain file bytes (no framing); io.LimitReader keeps the
+// stream honest at the header's declared size in case the daemon's tar
+// contains padding past the file. A tar entry whose typeflag is not a regular
+// file maps to ErrFileIsDirectory / ErrFileIsSymlink / ErrFileNotRegular so
+// the caller (the GET files handler) can turn each into a 404 with a stable
+// error body without ever leaking directory listings, symlink targets, or
+// special-file bytes.
+func (d *DockerRuntime) CopyFileFromContainer(ctx context.Context, id, srcPath string) (FileReadResult, error) {
+	rc, _, err := d.cli.CopyFromContainer(ctx, id, srcPath)
+	if err != nil {
+		if client.IsErrNotFound(err) {
+			return FileReadResult{}, ErrNotFound
+		}
+		return FileReadResult{}, fmt.Errorf("runtime: copy file from container %s: %w", id, err)
+	}
+	tr := tar.NewReader(rc)
+	hdr, err := tr.Next()
+	if err == io.EOF {
+		rc.Close()
+		return FileReadResult{}, ErrNotFound
+	}
+	if err != nil {
+		rc.Close()
+		return FileReadResult{}, fmt.Errorf("runtime: copy file from container %s: read tar: %w", id, err)
+	}
+	switch hdr.Typeflag {
+	case tar.TypeReg:
+	case tar.TypeDir:
+		rc.Close()
+		return FileReadResult{}, ErrFileIsDirectory
+	case tar.TypeSymlink, tar.TypeLink:
+		rc.Close()
+		return FileReadResult{}, ErrFileIsSymlink
+	default:
+		rc.Close()
+		return FileReadResult{}, ErrFileNotRegular
+	}
+	body := &fileBodyReader{Reader: io.LimitReader(tr, hdr.Size), closer: rc}
+	return FileReadResult{Size: hdr.Size, Body: body}, nil
+}
+
+// fileBodyReader wires the tar-unwrapped file bytes to the underlying tar
+// stream's Close, so the caller closes one thing (Body) and the daemon
+// response is torn down with it.
+type fileBodyReader struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (r *fileBodyReader) Close() error { return r.closer.Close() }
 
 // Inspect implements Runtime by asking the daemon for the container's current
 // state. A "no such container" response from the daemon means the container was

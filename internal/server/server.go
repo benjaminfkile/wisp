@@ -92,6 +92,16 @@ func (d *Daemon) SetKillTimeout(timeout time.Duration) {
 	}
 }
 
+// SetMaxFileReadBytes configures the per-file download cap enforced by
+// GET /contracts/{id}/files. A non-positive value is ignored so the broker
+// keeps its constructor default (16 MiB). Wired from
+// WISP_MAX_FILE_READ_BYTES by cmd/wispd.
+func (d *Daemon) SetMaxFileReadBytes(n int64) {
+	if n > 0 && d.br != nil {
+		d.br.maxFileReadBytes = n
+	}
+}
+
 // Reconcile rebuilds in-memory contract tracking, GPU allocator occupancy, AND
 // aggregate capacity usage from the labels of containers a previous wispd left
 // behind. It binds the daemon's shared allocators so a rediscovered lease's devices

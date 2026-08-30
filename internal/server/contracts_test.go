@@ -850,7 +850,7 @@ func TestDeleteRaceWithReaperExpirySucceeds(t *testing.T) {
 	// transition.
 	const releaseGrace = 30 * time.Second
 	var (
-		raced                bool
+		raced                 bool
 		reaperTriedTransition bool
 	)
 	rt.onKill = func(id string) {

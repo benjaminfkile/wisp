@@ -121,7 +121,7 @@ func (w *fakeWS) Close() error {
 }
 
 // TestShellBridgePumpsBothDirections drives shellBridge against a fake duplex
-// stream and a fake WebSocket — no Docker daemon — asserting bytes flow shell →
+// stream and a fake WebSocket - no Docker daemon - asserting bytes flow shell →
 // client and client → shell, and that a client disconnect tears the bridge down.
 func TestShellBridgePumpsBothDirections(t *testing.T) {
 	ws := newFakeWS()
@@ -174,7 +174,7 @@ func TestShellBridgePumpsBothDirections(t *testing.T) {
 // TestShellBridgeResizeControlFrame checks the resize control channel: a text
 // message carrying a resize control frame is forwarded to the stream's Resize
 // (not written to stdin), while an unrecognized text message and binary
-// messages still flow to stdin as raw bytes — the backward-compatible path.
+// messages still flow to stdin as raw bytes - the backward-compatible path.
 func TestShellBridgeResizeControlFrame(t *testing.T) {
 	ws := newFakeWS()
 	stream := newFakeDuplex()
@@ -369,7 +369,7 @@ func TestShellEndToEnd(t *testing.T) {
 
 // The interactive shell must launch the OS-appropriate default binary: `/bin/sh`
 // on a Linux daemon (unchanged) and `cmd.exe` on a Windows daemon, which has no
-// /bin/sh. Uses the fake runtime with a stubbed OS — no real Windows Docker.
+// /bin/sh. Uses the fake runtime with a stubbed OS - no real Windows Docker.
 func TestShellDefaultBinaryByOS(t *testing.T) {
 	tests := []struct {
 		name string

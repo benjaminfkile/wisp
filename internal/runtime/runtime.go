@@ -3,9 +3,9 @@
 //
 // The abstraction has two implementations:
 //
-//   - DockerRuntime — the real backend over the official Docker SDK for Go
+//   - DockerRuntime - the real backend over the official Docker SDK for Go
 //     (github.com/docker/docker/client). It requires a running Docker daemon.
-//   - Fake — an in-memory implementation for tests. It requires no daemon and
+//   - Fake - an in-memory implementation for tests. It requires no daemon and
 //     lets tests drive deterministic container/exec behaviour.
 //
 // The broker, exec endpoint, shell endpoint, reaper, and startup reconcile all
@@ -22,7 +22,7 @@ import (
 // network backing the "egress" network policy. A container attached to it
 // reaches the outside world (the network is a plain NAT bridge, not an
 // "internal" one, so outbound traffic still routes out) but cannot reach other
-// containers on the same bridge — inter-container communication is disabled via
+// containers on the same bridge - inter-container communication is disabled via
 // EgressICCOption. The DockerRuntime creates this network on demand and reuses
 // it if it already exists (see DockerRuntime.ensureEgressNetwork); Create
 // treats a CreateOptions.NetworkMode equal to this name as the signal to do so.
@@ -57,7 +57,7 @@ const ExpiresAtLabel = "wisp.expires_at"
 const GPUsLabel = "wisp.gpus"
 
 // CPUsLabel and MemoryMBLabel are the Docker labels carrying a lease's POST-CLAMP
-// reserved CPU (as a fraction of host cores) and reserved memory (mebibytes) —
+// reserved CPU (as a fraction of host cores) and reserved memory (mebibytes) -
 // exactly the amounts the aggregate capacity allocator reserved for it (see
 // internal/capacity). They are written at create time alongside ContractLabel so a
 // wispd restart can rebuild aggregate capacity usage from surviving containers'
@@ -110,7 +110,7 @@ var ErrNotRunning = errors.New("runtime: container not running")
 // down to the three cases the reaper acts on: still doing its job, or dead in a
 // way that means its backing contract should be reaped and its capacity freed.
 // Discrete non-running Docker statuses (created, exited, restarting, paused,
-// removing, dead) collapse into LivenessStopped — from the lease's point of view
+// removing, dead) collapse into LivenessStopped - from the lease's point of view
 // they all mean the container is no longer serving execs.
 type LivenessState int
 
@@ -123,7 +123,7 @@ const (
 	// same as LivenessGone: the backing contract is dead and must be reaped.
 	LivenessStopped
 
-	// LivenessGone means the container no longer exists — it was removed out of
+	// LivenessGone means the container no longer exists - it was removed out of
 	// band (docker rm, or a Docker daemon's auto-remove after exit) or was never
 	// there in the first place. The reaper treats it the same as LivenessStopped.
 	LivenessGone
@@ -163,7 +163,7 @@ type CreateOptions struct {
 	// extra options.
 	SecurityOpt []string
 
-	// Isolation selects HOW the container is launched — the strength of the
+	// Isolation selects HOW the container is launched - the strength of the
 	// boundary between it and the host. Its values mirror the contract's
 	// isolation levels: "" or "shared" leaves the launch mechanism at the
 	// default OCI runtime (runc), today's behavior; "sandboxed" selects the
@@ -266,7 +266,7 @@ type Resources struct {
 	PidsLimit int64
 
 	// GPUDeviceIDs are the stable IDs of the whole GPUs to attach exclusively to
-	// the container (see docs/DESIGN.md §7). Empty attaches no GPU — the common
+	// the container (see docs/DESIGN.md §7). Empty attaches no GPU - the common
 	// case. Wisp owns the assignment: the allocator hands these specific IDs to the
 	// create path, which passes them through here. The runtime maps a non-empty
 	// list to the device-attachment strategy for its launch mechanism (see
@@ -314,7 +314,7 @@ const (
 // "runsc", "kata-runtime") and its container OS mode. The startup
 // isolation-capability detection reads this to decide which isolation levels the
 // host can actually provide (see policy.SupportedIsolations). Unlike
-// ContainerOS — a value cached once at construction — DaemonInfo is a live query
+// ContainerOS - a value cached once at construction - DaemonInfo is a live query
 // and so can fail when the daemon is unreachable.
 type DaemonInfo struct {
 	// Runtimes is the set of registered OCI runtime names as reported by the

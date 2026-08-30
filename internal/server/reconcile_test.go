@@ -28,7 +28,7 @@ func leased(containerID, contractID, expiresAt string) runtime.LeasedContainer {
 }
 
 // leasedStopped builds a non-running LeasedContainer with the given contract id
-// and expiry label — the shape the runtime reports for a wisp container the
+// and expiry label - the shape the runtime reports for a wisp container the
 // prior process left behind that a host reboot (or a docker stop) has since
 // stopped. Reconcile must not adopt these.
 func leasedStopped(containerID, contractID, expiresAt string) runtime.LeasedContainer {
@@ -108,7 +108,7 @@ func TestReconcileReapsMalformedLabelContainers(t *testing.T) {
 			t.Errorf("contract %q should not be adopted, got err=%v", killed, err)
 		}
 	}
-	// Both malformed-label containers are force-removed from the runtime — a wisp
+	// Both malformed-label containers are force-removed from the runtime - a wisp
 	// container with no trustworthy id/expiry must not be left running.
 	for _, killedCID := range []string{badCID, nanCID} {
 		if _, ok := fake.Container(killedCID); ok {
@@ -128,7 +128,7 @@ func TestReconcileReapsMalformedLabelContainers(t *testing.T) {
 }
 
 // A container carrying the contract label that is not running (Exited after a
-// host reboot, or a docker stop) is a dead lease — its process holds no capacity
+// host reboot, or a docker stop) is a dead lease - its process holds no capacity
 // and would falsely reserve full CPU/memory if adopted, so Reconcile must not
 // adopt it. It must also force-remove it so a `docker ps -a` after startup no
 // longer shows the stale artifact.
@@ -138,7 +138,7 @@ func TestReconcileDropsStoppedContainersAndReservesNoCapacity(t *testing.T) {
 	fake := runtime.NewFake()
 	cap := capacity.NewAllocator(10, 100, 100_000)
 
-	// Two stopped labelled containers — a host reboot left them Exited. Create
+	// Two stopped labelled containers - a host reboot left them Exited. Create
 	// them in the fake but do NOT Start them, so ListLeased reports Running=false.
 	expiry := strconv.FormatInt(time.Unix(1_900_000_000, 0).Unix(), 10)
 	labels := func(id, cpus, mem string) map[string]string {
@@ -164,7 +164,7 @@ func TestReconcileDropsStoppedContainersAndReservesNoCapacity(t *testing.T) {
 	if got := cap.UsedMemoryMB(); got != 0 {
 		t.Errorf("cap.UsedMemoryMB() = %d, want 0", got)
 	}
-	// The stopped containers are force-removed — no artifact left in `docker ps -a`.
+	// The stopped containers are force-removed - no artifact left in `docker ps -a`.
 	for _, cid := range []string{stopped1, stopped2} {
 		if _, ok := fake.Container(cid); ok {
 			t.Errorf("stopped container %q should have been removed by reconcile", cid)
@@ -174,7 +174,7 @@ func TestReconcileDropsStoppedContainersAndReservesNoCapacity(t *testing.T) {
 
 // The realistic post-reboot mix: some labelled containers are still running
 // (adopt), some were left Exited (drop and remove). Only the running ones are
-// tracked and only they consume capacity — the stopped ones must not.
+// tracked and only they consume capacity - the stopped ones must not.
 func TestReconcileMixedRunningAndStopped(t *testing.T) {
 	ctx := context.Background()
 	store := contract.NewStore()
@@ -214,7 +214,7 @@ func TestReconcileMixedRunningAndStopped(t *testing.T) {
 	if _, err := store.Get("drop"); !errors.Is(err, contract.ErrNotFound) {
 		t.Errorf("stopped contract should not be adopted, got err=%v", err)
 	}
-	// Only the running one consumes budget — stopped containers must not reserve
+	// Only the running one consumes budget - stopped containers must not reserve
 	// any of it.
 	if got := cap.ActiveContracts(); got != 1 {
 		t.Errorf("cap.ActiveContracts() = %d, want 1", got)
@@ -234,7 +234,7 @@ func TestReconcileMixedRunningAndStopped(t *testing.T) {
 	}
 }
 
-// A failure to list leased containers must not adopt anything or panic — the
+// A failure to list leased containers must not adopt anything or panic - the
 // reconcile is best-effort and must never keep the daemon from starting.
 func TestReconcileToleratesListError(t *testing.T) {
 	store := contract.NewStore()
@@ -250,7 +250,7 @@ func TestReconcileToleratesListError(t *testing.T) {
 
 // End-to-end: a reconciled container already past its expiry is reaped (killed
 // and marked expired) on the reaper's first sweep, while a still-valid one stays
-// tracked. This is the whole point of the reconcile — no orphans survive a
+// tracked. This is the whole point of the reconcile - no orphans survive a
 // restart. It uses real fake containers (created with the contract labels) so
 // the reaper's Kill and the fake's liveness bookkeeping are exercised for real,
 // via the derive-from-tracked-containers path of ListLeased.

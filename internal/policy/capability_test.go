@@ -40,7 +40,7 @@ func TestSupportedIsolations(t *testing.T) {
 		{"runsc plus kata on linux", []string{"runc", "runsc", "kata-runtime"}, "linux", []string{"sandboxed", "shared", "vm"}},
 		{"runsc on windows", []string{"runc", "runsc"}, "windows", []string{"sandboxed", "shared", "vm"}},
 		// A Kata runtime registered on a windows daemon does not add vm via Kata,
-		// but the windows daemon still provides vm via Hyper-V — so vm is present.
+		// but the windows daemon still provides vm via Hyper-V - so vm is present.
 		{"kata on windows still vm via hyperv", []string{"runc", "kata-runtime"}, "windows", []string{"shared", "vm"}},
 	}
 	for _, tt := range tests {
@@ -54,7 +54,7 @@ func TestSupportedIsolations(t *testing.T) {
 }
 
 // TestSupportedIsolationsNeverConfidential verifies confidential is never in the
-// supported set regardless of runtimes/OS — it parses for forward-compatibility
+// supported set regardless of runtimes/OS - it parses for forward-compatibility
 // but has no runtime backing.
 func TestSupportedIsolationsNeverConfidential(t *testing.T) {
 	for _, os := range []string{"linux", "windows"} {
@@ -135,7 +135,7 @@ func TestEffectiveIsolationAllDropped(t *testing.T) {
 			DefaultIsolation: "vm",
 		},
 	}
-	// Host has no Kata runtime — vm is unavailable.
+	// Host has no Kata runtime - vm is unavailable.
 	supported := SupportedIsolations(HostCapabilities{Runtimes: []string{"runc"}, OS: "linux"})
 	ic, dropped := cfg.EffectiveIsolation(supported)
 
@@ -146,7 +146,7 @@ func TestEffectiveIsolationAllDropped(t *testing.T) {
 	if got := isoNames(ic.Levels()); len(got) != 0 {
 		t.Errorf("effective levels = %v, want empty (no silent downgrade to shared)", got)
 	}
-	// shared must NOT be injected — the operator excluded it.
+	// shared must NOT be injected - the operator excluded it.
 	if ic.Allows(IsolationShared) {
 		t.Error("Allows(shared) = true, want false (operator excluded shared from allow-list)")
 	}
@@ -158,8 +158,8 @@ func TestEffectiveIsolationAllDropped(t *testing.T) {
 
 // TestEffectiveIsolationDefaultDroppedOthersSurvive verifies that when the
 // operator's allow-list produces a non-empty intersection but the configured
-// default is not in it, the fallback uses the first remaining runnable level —
-// NOT shared — when shared was excluded from the allow-list.
+// default is not in it, the fallback uses the first remaining runnable level -
+// NOT shared - when shared was excluded from the allow-list.
 func TestEffectiveIsolationDefaultDroppedOthersSurvive(t *testing.T) {
 	cfg := &Config{
 		Limits: Limits{
@@ -196,7 +196,7 @@ func TestEffectiveIsolationDefaultDroppedOthersSurvive(t *testing.T) {
 func TestEffectiveIsolationSharedExplicitlyExcluded(t *testing.T) {
 	cfg := &Config{
 		Limits: Limits{
-			// Operator listed only sandboxed — shared is explicitly excluded.
+			// Operator listed only sandboxed - shared is explicitly excluded.
 			// DefaultIsolation is empty, which Config.DefaultIsolation() maps to
 			// shared, but shared is not in the allow-list.
 			Isolations:       []string{"sandboxed"},

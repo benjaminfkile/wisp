@@ -18,7 +18,7 @@ import (
 
 // A Wisp container must stay alive for the whole contract so exec/shell can
 // attach. createOptions must therefore always set a keep-alive command,
-// regardless of the launch spec — otherwise a bare base image's default command
+// regardless of the launch spec - otherwise a bare base image's default command
 // exits, the container stops, and provisioning/exec fails with "container is
 // not running". This guards against silently dropping the keep-alive.
 func TestCreateOptionsAlwaysSetsKeepAliveCmd(t *testing.T) {
@@ -64,7 +64,7 @@ func TestCreateOptionsKeepAliveByOS(t *testing.T) {
 // End-to-end guard: provisioning a contract against a Windows-mode runtime must
 // launch the container with the Windows keep-alive command, proving the broker
 // wires the daemon's detected ContainerOS through to create. Uses the fake
-// runtime with a stubbed OS — no real Windows Docker daemon.
+// runtime with a stubbed OS - no real Windows Docker daemon.
 func TestProvisionUsesRuntimeContainerOS(t *testing.T) {
 	store := contract.NewStore()
 	fake := runtime.NewFake()

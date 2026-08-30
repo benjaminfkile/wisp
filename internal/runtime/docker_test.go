@@ -338,9 +338,9 @@ func TestDockerRuntimeCreateIsolation(t *testing.T) {
 }
 
 // TestDockerRuntimeCreateGPUDeviceRequests verifies DockerRuntime.Create maps the
-// exclusively-assigned GPU device IDs onto HostConfig.Resources.DeviceRequests —
+// exclusively-assigned GPU device IDs onto HostConfig.Resources.DeviceRequests -
 // the nvidia driver, the explicit device IDs, and the "gpu" capability (the SDK
-// equivalent of `docker run --gpus device=...`) — for the shared/runc launch
+// equivalent of `docker run --gpus device=...`) - for the shared/runc launch
 // mechanism, and leaves DeviceRequests nil for a GPU-less lease.
 func TestDockerRuntimeCreateGPUDeviceRequests(t *testing.T) {
 	ctx := context.Background()
@@ -406,7 +406,7 @@ func (c *killStubClient) ContainerRemove(context.Context, string, container.Remo
 }
 
 // TestDockerRuntimeKillMapsNotFound verifies DockerRuntime.Kill maps the docker
-// client's not-found error to runtime.ErrNotFound, the same way Inspect does —
+// client's not-found error to runtime.ErrNotFound, the same way Inspect does -
 // so reaper.expire's errors.Is(err, ErrNotFound) suppression correctly covers
 // containers removed out of band (the LivenessGone case the container-death
 // detection was built for) rather than logging a spurious ERROR every time.

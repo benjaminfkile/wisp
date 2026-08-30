@@ -10,7 +10,7 @@ import (
 
 // TestGPUAttachmentShared verifies the shared/runc slot of the GPU-attach seam
 // builds the nvidia DeviceRequests exactly: the "nvidia" driver, the explicit
-// device IDs in order, and the single "gpu" capability — the SDK equivalent of
+// device IDs in order, and the single "gpu" capability - the SDK equivalent of
 // `docker run --gpus device=...`.
 func TestGPUAttachmentShared(t *testing.T) {
 	for _, iso := range []string{IsolationShared, ""} {
@@ -29,8 +29,8 @@ func TestGPUAttachmentShared(t *testing.T) {
 	}
 }
 
-// TestGPUAttachmentUnsupportedMechanisms verifies the vm/kata slot — and any other
-// launch mechanism with no GPU backend yet — returns the typed
+// TestGPUAttachmentUnsupportedMechanisms verifies the vm/kata slot - and any other
+// launch mechanism with no GPU backend yet - returns the typed
 // ErrGPUAttachUnsupported and no DeviceRequests. This is the load-bearing seam: a
 // future Kata + VFIO backend is added by implementing that slot, not by touching
 // the create path.

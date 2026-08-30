@@ -98,7 +98,7 @@ func TestAllocateInsufficientDevices(t *testing.T) {
 }
 
 // Free returns devices to the pool and is idempotent: freeing an already-free
-// device, or an unknown id, is a harmless no-op — a contract killed twice never
+// device, or an unknown id, is a harmless no-op - a contract killed twice never
 // corrupts occupancy.
 func TestFreeIsIdempotent(t *testing.T) {
 	a := NewAllocator([]string{"gpu-0", "gpu-1"})
@@ -210,7 +210,7 @@ func TestAllocateConcurrentExclusive(t *testing.T) {
 	if failures != goroutines-devices {
 		t.Fatalf("failures = %d, want %d", failures, goroutines-devices)
 	}
-	// Every granted device is distinct — no device handed to two goroutines.
+	// Every granted device is distinct - no device handed to two goroutines.
 	seen := map[string]bool{}
 	for _, id := range granted {
 		if seen[id] {

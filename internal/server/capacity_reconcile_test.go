@@ -17,7 +17,7 @@ import (
 // (when non-empty) the capacity labels, so a reconcile test can drive the parse
 // path directly without provisioning a real container. Running=true because
 // only running containers are adopted (a stopped one is removed and its
-// capacity is never reserved — see Reconcile).
+// capacity is never reserved - see Reconcile).
 func leasedCap(containerID, contractID, expiresAt, cpus, memoryMB string) runtime.LeasedContainer {
 	labels := map[string]string{contractLabel: contractID}
 	if expiresAt != "" {
@@ -34,8 +34,8 @@ func leasedCap(containerID, contractID, expiresAt, cpus, memoryMB string) runtim
 
 // A create writes the POST-CLAMP reserved cpus/memory on the container labels, and
 // a fresh wispd that reconciles those surviving containers rebuilds an IDENTICAL
-// aggregate allocator state — same contract count, same used cpus, same used
-// memory — so a restart never under-counts and oversubscribes the host.
+// aggregate allocator state - same contract count, same used cpus, same used
+// memory - so a restart never under-counts and oversubscribes the host.
 func TestCapacityLabelsRoundTripThroughReconcile(t *testing.T) {
 	pol := budgetPolicy(10, 8, 4096)
 	b, h, _, fake := capBroker(t, pol)
@@ -98,7 +98,7 @@ func TestReconcileCountsContractsWithMissingCapacityLabels(t *testing.T) {
 		t.Errorf("UsedMemoryMB() = %d, want 0 (missing label => 0)", got)
 	}
 	// Both slots are now held, so a further reservation is rejected on the contract
-	// budget — the reconciled leases really do count against max_contracts.
+	// budget - the reconciled leases really do count against max_contracts.
 	if cap.TryReserve(0, 0) {
 		t.Error("TryReserve succeeded after two reconciled leases filled max_contracts=2")
 	}
@@ -136,7 +136,7 @@ func TestReconcileToleratesMalformedCapacityLabels(t *testing.T) {
 }
 
 // After a restart, a create is correctly rejected with a 409 when the re-Reserved
-// capacity of surviving leases leaves no room — proof the reconcile's re-Reserve
+// capacity of surviving leases leaves no room - proof the reconcile's re-Reserve
 // really guards the budget, not just the in-memory count. A create that still fits
 // the rebuilt headroom is admitted.
 func TestPostRestartCreate409sWhenReReservedCapacityFull(t *testing.T) {

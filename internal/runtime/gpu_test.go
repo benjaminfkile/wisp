@@ -53,7 +53,7 @@ func TestEnumerateGPUsParsesDevices(t *testing.T) {
 }
 
 // TestEnumerateGPUsCommandFailure verifies that a runner error (nvidia-smi absent
-// or exiting non-zero — the GPU-less host) surfaces as an error the caller
+// or exiting non-zero - the GPU-less host) surfaces as an error the caller
 // degrades to "no GPU support", not a panic or empty success.
 func TestEnumerateGPUsCommandFailure(t *testing.T) {
 	sentinel := errors.New("exec: nvidia-smi: executable file not found in $PATH")
@@ -69,7 +69,7 @@ func TestEnumerateGPUsCommandFailure(t *testing.T) {
 }
 
 // TestEnumerateGPUsGarbage verifies malformed output is rejected as an error
-// (degrading to no GPU support) rather than being silently skipped — a host only
+// (degrading to no GPU support) rather than being silently skipped - a host only
 // advertises GPUs it could fully describe.
 func TestEnumerateGPUsGarbage(t *testing.T) {
 	cases := []struct {

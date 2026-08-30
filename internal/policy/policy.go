@@ -2,7 +2,7 @@
 // contracts (see docs/DESIGN.md §7): an image allow-list, a default image, and
 // optional TTL / resource / network limits.
 //
-// Wisp is domain-blind — it knows nothing about what runs inside a container
+// Wisp is domain-blind - it knows nothing about what runs inside a container
 // (docs/DESIGN.md §2, §3). The operator owns the allow-list and the caps; the
 // client picks an allowed image and shapes the network / resources on the create
 // request; userdata owns the container's contents. There are no opinionated,
@@ -80,7 +80,7 @@ type Limits struct {
 
 	// MaxContracts caps the number of concurrent (non-terminal) contracts the host
 	// admits, bounding contract count across the whole host rather than per lease.
-	// Zero means no cap — the default when unconfigured — mirroring how the other
+	// Zero means no cap - the default when unconfigured - mirroring how the other
 	// numeric limits treat zero as "no cap". Enforced at create time by the shared
 	// aggregate allocator (see internal/capacity), which rejects an over-budget
 	// create with a 409.
@@ -88,7 +88,7 @@ type Limits struct {
 
 	// TotalCPUs caps the aggregate CPU (as a fraction of host cores) reserved
 	// across all concurrent contracts, bounding total CPU load rather than per
-	// lease (which MaxCPUs already caps). Zero means no cap — the default when
+	// lease (which MaxCPUs already caps). Zero means no cap - the default when
 	// unconfigured. When both TotalCPUs and MaxCPUs are set, TotalCPUs must be >=
 	// MaxCPUs (a budget below one lease could never admit anything; see validate).
 	// Enforced at create time by the shared aggregate allocator (internal/capacity).
@@ -96,22 +96,22 @@ type Limits struct {
 
 	// TotalMemoryMB caps the aggregate memory (mebibytes) reserved across all
 	// concurrent contracts, bounding total memory rather than per lease (which
-	// MaxMemoryMB already caps). Zero means no cap — the default when unconfigured.
+	// MaxMemoryMB already caps). Zero means no cap - the default when unconfigured.
 	// When both TotalMemoryMB and MaxMemoryMB are set, TotalMemoryMB must be >=
 	// MaxMemoryMB (see validate). Enforced at create time by the shared aggregate
 	// allocator (internal/capacity).
 	TotalMemoryMB int
 
 	// MaxGPUs caps the number of GPUs a single lease may request. Zero means no
-	// operator cap — a lease may use up to all detected devices — which is also the
+	// operator cap - a lease may use up to all detected devices - which is also the
 	// default when unconfigured, mirroring how the other Max* limits treat zero as
 	// "no cap". The EFFECTIVE per-lease cap advertised on /images is
 	// min(MaxGPUs, detected device count); see EffectiveGPU.
 	MaxGPUs int
 
 	// GPUsDisabled turns GPU leasing off entirely regardless of detected hardware.
-	// The zero value (false) leaves GPU leasing ENABLED — the default when
-	// unconfigured — so an operator opts out explicitly, mirroring how a zero
+	// The zero value (false) leaves GPU leasing ENABLED - the default when
+	// unconfigured - so an operator opts out explicitly, mirroring how a zero
 	// numeric limit imposes no cap. When true the host advertises supported=false
 	// even with GPUs present (see EffectiveGPU).
 	GPUsDisabled bool
@@ -147,8 +147,8 @@ type Config struct {
 // Conservative built-in resource / TTL ceilings applied by Default when
 // WISP_CONFIG is unset. They are DEFAULTS, not hard limits: an operator config
 // (loaded via Load) can raise or lower any of them. Their purpose is to ensure a
-// lease created against the built-in defaults — including one requesting
-// resources:{} — inherits a bounded container rather than an uncapped one that
+// lease created against the built-in defaults - including one requesting
+// resources:{} - inherits a bounded container rather than an uncapped one that
 // could exhaust host CPU / RAM / PIDs or run forever.
 const (
 	// defaultMaxTTLSeconds caps a default lease at one hour.
@@ -194,7 +194,7 @@ func Default() *Config {
 // always on Linux) it returns the configured DefaultImage. The result is always
 // a member of the allow-list: a windows host without the Windows base image
 // allow-listed still falls back to DefaultImage. Wisp never switches the daemon's
-// mode — it only picks an OS-appropriate default to advertise and boot.
+// mode - it only picks an OS-appropriate default to advertise and boot.
 func (c *Config) DefaultImageFor(os string) string {
 	if os == osWindows && c.AllowsImage(windowsBaseImage) {
 		return windowsBaseImage
@@ -328,7 +328,7 @@ type fileLimits struct {
 	// MaxGPUs caps per-lease GPU count (0 = no operator cap → all detected);
 	// GPUsDisabled turns GPU leasing off entirely. Both are optional: an omitted
 	// max_gpus is uncapped and an omitted gpus_disabled leaves GPU leasing enabled
-	// — the default when unconfigured (see EffectiveGPU). They need no Load
+	// - the default when unconfigured (see EffectiveGPU). They need no Load
 	// fallback because their zero values already are the defaults.
 	MaxGPUs      int  `json:"max_gpus"`
 	GPUsDisabled bool `json:"gpus_disabled"`
@@ -427,7 +427,7 @@ func (c *Config) validate() error {
 	}
 	// Host capacity budgets: a negative budget is a config error; zero means
 	// unlimited. When both a total budget and its matching per-lease max are set,
-	// the total must be >= the per-lease max — a budget smaller than a single lease
+	// the total must be >= the per-lease max - a budget smaller than a single lease
 	// could never admit anything.
 	if c.Limits.MaxContracts < 0 {
 		return fmt.Errorf("limits.max_contracts must not be negative, got %d", c.Limits.MaxContracts)

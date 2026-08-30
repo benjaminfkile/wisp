@@ -196,7 +196,7 @@ func TestReaperExpiryFreesCapacity(t *testing.T) {
 // end: a contract's backing container dies out of band (docker kill / rm); on
 // the reaper's next tick the contract is moved to a terminal state, its cpu /
 // memory / contract-slot capacity is freed, GET /contracts/{id} reports the
-// terminal state, and GET /images shows the reclaimed usage — all before the
+// terminal state, and GET /images shows the reclaimed usage - all before the
 // TTL has any chance of firing.
 func TestReaperReapsDeadContainerFreesCapacityAndImagesReflects(t *testing.T) {
 	b, h, store, fake := capBroker(t, budgetPolicy(0, 4, 512))
@@ -212,7 +212,7 @@ func TestReaperReapsDeadContainerFreesCapacityAndImagesReflects(t *testing.T) {
 	}
 
 	// Simulate a docker rm / docker kill out of band: the container is gone from
-	// the runtime but the contract is still ready. The TTL is an hour away — the
+	// the runtime but the contract is still ready. The TTL is an hour away - the
 	// only signal that can reap it is the liveness check.
 	c, _ := store.Get(created.ContractID)
 	fake.InspectOverrides = map[string]runtime.LivenessState{c.ContainerID: runtime.LivenessGone}
@@ -226,8 +226,8 @@ func TestReaperReapsDeadContainerFreesCapacityAndImagesReflects(t *testing.T) {
 	})
 	// Multiple ticks: the second and third observe the same dead container. The
 	// state-machine gate on the winning expired transition must keep ReleaseCapacity
-	// firing EXACTLY ONCE across all three, so used cpus/memory land at zero — not
-	// underflow — and stay there.
+	// firing EXACTLY ONCE across all three, so used cpus/memory land at zero - not
+	// underflow - and stay there.
 	// Each tick launches the Kill off the sweep in its own goroutine; wait
 	// between them so the sweep sees the winning terminal transition rather
 	// than racing on the in-flight mark.
@@ -240,8 +240,8 @@ func TestReaperReapsDeadContainerFreesCapacityAndImagesReflects(t *testing.T) {
 
 	// After three ticks the contract has been expired (first tick) and then
 	// cleaned up (a terminal-at-start tick removes it), so a subsequent Get
-	// reports it missing. What matters here is exactly-once capacity release —
-	// asserted below via the aggregate usage — not that a terminal record lingers.
+	// reports it missing. What matters here is exactly-once capacity release -
+	// asserted below via the aggregate usage - not that a terminal record lingers.
 	if _, err := store.Get(created.ContractID); !errors.Is(err, contract.ErrNotFound) {
 		t.Fatalf("store.Get after 3 ticks err = %v, want ErrNotFound (terminal contract cleaned up)", err)
 	}
@@ -250,7 +250,7 @@ func TestReaperReapsDeadContainerFreesCapacityAndImagesReflects(t *testing.T) {
 			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
 	}
 
-	// GET /contracts/{id} for a cleaned-up contract is a 404 — the reaper's
+	// GET /contracts/{id} for a cleaned-up contract is a 404 - the reaper's
 	// cleanup sweep removed it after it went terminal.
 	rec := doAuth(t, h, http.MethodGet, "/contracts/"+created.ContractID, created.Token, "")
 	if rec.Code != http.StatusNotFound {
@@ -265,7 +265,7 @@ func TestReaperReapsDeadContainerFreesCapacityAndImagesReflects(t *testing.T) {
 }
 
 // A create rejected because the GPU allocator is exhausted frees the capacity it
-// reserved moments earlier — neither a GPU device nor host capacity is stranded.
+// reserved moments earlier - neither a GPU device nor host capacity is stranded.
 func TestRejectedGPUCreateStrandsNoCapacity(t *testing.T) {
 	store := contract.NewStore()
 	fake := gpuFake("GPU-0") // exactly one device
@@ -329,7 +329,7 @@ func TestImagesReflectsLiveCapacityUsage(t *testing.T) {
 
 // Concurrent creates against a fixed contract budget never oversubscribe it: exactly
 // the budget are admitted (201) and the rest are 409, with the allocator settling at
-// exactly the budget — the create-path mirror of the GPU allocator's race test.
+// exactly the budget - the create-path mirror of the GPU allocator's race test.
 func TestConcurrentCreatesCannotOversubscribe(t *testing.T) {
 	const budget = 8
 	const goroutines = 64

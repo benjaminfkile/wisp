@@ -1,5 +1,5 @@
 // Package capacity provides a concurrency-safe allocator over a host's AGGREGATE
-// capacity budgets — the number of concurrent contracts, the total reserved CPU,
+// capacity budgets - the number of concurrent contracts, the total reserved CPU,
 // and the total reserved memory across all live leases (see docs/DESIGN.md §7).
 //
 // It is the aggregate sibling of internal/gpu.Allocator: where the GPU allocator
@@ -10,8 +10,8 @@
 // threaded through create, release, provision-failure, and the reaper, exactly as
 // the GPU allocator is.
 //
-// The allocator deals in plain numbers only — a contract count, a CPU fraction,
-// and a memory figure in mebibytes — and carries no contract, runtime, or policy
+// The allocator deals in plain numbers only - a contract count, a CPU fraction,
+// and a memory figure in mebibytes - and carries no contract, runtime, or policy
 // assumptions. Each budget is independent: a budget of 0 for a dimension means it
 // is UNBUDGETED and never blocks a reservation, mirroring how a zero numeric limit
 // means "no cap" throughout the policy layer.
@@ -26,8 +26,8 @@ import "sync"
 type Allocator struct {
 	mu sync.Mutex
 
-	// Budgets. A zero budget leaves that dimension unbudgeted — TryReserve never
-	// rejects on it — matching how a zero numeric limit means "no cap" elsewhere.
+	// Budgets. A zero budget leaves that dimension unbudgeted - TryReserve never
+	// rejects on it - matching how a zero numeric limit means "no cap" elsewhere.
 	maxContracts  int
 	totalCPUs     float64
 	totalMemoryMB int
@@ -52,8 +52,8 @@ func NewAllocator(maxContracts int, totalCPUs float64, totalMemoryMB int) *Alloc
 	}
 }
 
-// TryReserve attempts to reserve one lease's worth of capacity — one contract slot
-// plus cpus and memoryMB — against all three budgets ATOMICALLY and all-or-nothing:
+// TryReserve attempts to reserve one lease's worth of capacity - one contract slot
+// plus cpus and memoryMB - against all three budgets ATOMICALLY and all-or-nothing:
 // it succeeds (returning true and adding to usage) only when every BUDGETED
 // dimension has room for the addition; if any budgeted dimension would be exceeded
 // it reserves nothing and returns false. A budget of 0 for a dimension is
@@ -84,13 +84,13 @@ func (a *Allocator) TryReserve(cpus float64, memoryMB int) bool {
 	return true
 }
 
-// Free returns one lease's reserved capacity — one contract slot plus cpus and
-// memoryMB — to the pool. It is designed to be called EXACTLY ONCE PER CONTRACT,
+// Free returns one lease's reserved capacity - one contract slot plus cpus and
+// memoryMB - to the pool. It is designed to be called EXACTLY ONCE PER CONTRACT,
 // with the same post-clamp amounts that were reserved: the create path frees on
 // the single path a create fails, and each terminal transition (release, reaper
 // expiry, provision failure) frees once, gated on the winning state-machine
-// transition so a released-then-reaped lease frees only once. As a safety net —
-// mirroring how gpu.Free can never corrupt occupancy — it clamps every dimension
+// transition so a released-then-reaped lease frees only once. As a safety net -
+// mirroring how gpu.Free can never corrupt occupancy - it clamps every dimension
 // at zero, so a redundant or mismatched free can never drive usage negative and
 // re-inflate apparent headroom.
 func (a *Allocator) Free(cpus float64, memoryMB int) {
@@ -110,7 +110,7 @@ func (a *Allocator) Free(cpus float64, memoryMB int) {
 
 // Reserve records capacity ALREADY HELD by a lease rediscovered at startup
 // reconcile, rebuilding aggregate usage from surviving containers before any new
-// create is admitted — the aggregate mirror of gpu.Allocator.Reserve. Unlike
+// create is admitted - the aggregate mirror of gpu.Allocator.Reserve. Unlike
 // TryReserve it does not check the budgets: a reconciled lease already holds its
 // capacity, so it is counted unconditionally (usage may legitimately sit at or
 // above a since-lowered budget until those leases drain). The startup reconcile

@@ -73,7 +73,7 @@ func parseShellControl(data []byte) (shellControl, bool) {
 
 // shell handles WS /contracts/:id/shell: it upgrades the connection to a
 // WebSocket and bridges it to an interactive shell (a TTY exec) inside the
-// contract's container — client bytes → shell stdin, shell output → client (see
+// contract's container - client bytes → shell stdin, shell output → client (see
 // docs/DESIGN.md "How the shell works").
 //
 // The handshake requires the contract's bearer token, supplied either as a
@@ -136,7 +136,7 @@ func (b *broker) shell(w http.ResponseWriter, r *http.Request) {
 //
 // Client binary messages are forwarded verbatim to the shell's stdin. A client
 // text message that decodes as a shell control frame (currently only "resize")
-// is handled out of band — a resize forwards the new dimensions to the TTY via
+// is handled out of band - a resize forwards the new dimensions to the TTY via
 // stream.Resize instead of being written to stdin. Any text message that is not
 // a recognized control frame is still written to stdin, so a client that never
 // sends a control frame behaves exactly as before. ctx scopes the resize calls.

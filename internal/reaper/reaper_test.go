@@ -337,7 +337,7 @@ func TestReaperSkipsTerminalAndUntimely(t *testing.T) {
 	// The released contract is a terminal-at-start-of-tick lease that the reaper's
 	// cleanup sweep removes so the store does not grow unboundedly. What matters
 	// for "skips terminal" is that no unexpected transition fired (asserted via
-	// the Notify hook above) and that the container was not touched — the removal
+	// the Notify hook above) and that the container was not touched - the removal
 	// itself is expected.
 	if _, err := store.Get(released.ID); !errors.Is(err, contract.ErrNotFound) {
 		t.Errorf("released contract lookup err = %v, want ErrNotFound after cleanup sweep", err)
@@ -427,7 +427,7 @@ func TestReaperReapsDeadContainerBeforeTTL(t *testing.T) {
 
 	// Simulate an out-of-band docker kill / rm: the container is gone but the
 	// contract is still ready with a well-in-the-future TTL. Wisp only learns via
-	// the liveness check on the next tick — well before the lead window.
+	// the liveness check on the next tick - well before the lead window.
 	fake.InspectOverrides = map[string]runtime.LivenessState{cid: runtime.LivenessGone}
 
 	var eventsMu sync.Mutex
@@ -492,7 +492,7 @@ func TestReaperReapsStoppedContainerBeforeTTL(t *testing.T) {
 // TestReaperDeadContainerFreesCapacityExactlyOnce covers AC 151: ReleaseCapacity
 // fires EXACTLY ONCE for a contract whose container died out of band, even when
 // the reaper observes the dead container on multiple ticks. The
-// state-machine gate on the winning expired transition is what enforces this —
+// state-machine gate on the winning expired transition is what enforces this -
 // second and subsequent ticks see a terminal contract and skip early.
 func TestReaperDeadContainerFreesCapacityExactlyOnce(t *testing.T) {
 	store := contract.NewStore()
@@ -587,7 +587,7 @@ func TestReaperDeadContainerFreesGPUs(t *testing.T) {
 }
 
 // TestReaperInspectTransportErrorDoesNotReap: a transient error from Inspect
-// (e.g. daemon unreachable) is inconclusive — the reaper leaves the contract
+// (e.g. daemon unreachable) is inconclusive - the reaper leaves the contract
 // alone rather than reaping a live lease on a blip.
 func TestReaperInspectTransportErrorDoesNotReap(t *testing.T) {
 	store := contract.NewStore()
@@ -613,7 +613,7 @@ func TestReaperInspectTransportErrorDoesNotReap(t *testing.T) {
 
 // TestReaperInspectSkipsProvisioning: a container mid-provision (created but not
 // yet Started) reports LivenessStopped from the runtime, but the reaper must
-// leave a provisioning contract alone — it is expected to not be running yet.
+// leave a provisioning contract alone - it is expected to not be running yet.
 // Only ready and expiring contracts are candidates for the liveness reap.
 func TestReaperInspectSkipsProvisioning(t *testing.T) {
 	store := contract.NewStore()
@@ -634,7 +634,7 @@ func TestReaperInspectSkipsProvisioning(t *testing.T) {
 	if _, err := store.SetContainerID(c.ID, cid); err != nil {
 		t.Fatalf("SetContainerID: %v", err)
 	}
-	// Deliberately do NOT Start the container — mirror the mid-provision moment
+	// Deliberately do NOT Start the container - mirror the mid-provision moment
 	// between Create and Start when Inspect would report LivenessStopped.
 
 	rp := New(store, fake, Options{
@@ -653,7 +653,7 @@ func TestReaperInspectSkipsProvisioning(t *testing.T) {
 // dockerNotFoundStubClient embeds the full Docker APIClient (left nil) and
 // overrides Info (for construction) plus ContainerInspect and ContainerRemove
 // so the reaper can drive a DockerRuntime whose backing daemon reports both the
-// inspect and the remove as docker-style not-found — the exact shape produced
+// inspect and the remove as docker-style not-found - the exact shape produced
 // by a live daemon after a container is removed out of band (docker rm, an
 // auto-remove after exit, etc.). Anything else would panic, which is fine: the
 // reaper's expire path only calls Inspect and Kill on the runtime.
@@ -912,7 +912,7 @@ func TestReaperDefaultReleaseGraceSkipsFreshReleasing(t *testing.T) {
 // reaped through the LivenessGone path without an ERROR log. The regression it
 // pins is a Kill implementation that wrapped the docker not-found error and
 // never returned runtime.ErrNotFound, so reaper.expire logged
-// "reaper: kill container" on every out-of-band removal — the exact scenario
+// "reaper: kill container" on every out-of-band removal - the exact scenario
 // the container-death detection was built for. The test uses a real
 // DockerRuntime backed by a stub client returning docker-style not-found (NOT
 // the fake runtime, whose Kill already returns the pre-mapped ErrNotFound and
@@ -921,7 +921,7 @@ func TestReaperNoErrorLogOnDockerNotFoundKill(t *testing.T) {
 	store := contract.NewStore()
 	rt := runtime.NewDockerRuntimeWithClient(dockerNotFoundStubClient{})
 
-	// A ready contract with a container id the daemon does not know about — the
+	// A ready contract with a container id the daemon does not know about - the
 	// LivenessGone shape. Adopt sets the fields directly so we do not need to
 	// drive a Fake through create/start.
 	future := time.Unix(2_000_000_000, 0)
@@ -1234,5 +1234,157 @@ func TestReaperAsyncExpiryFreesCapacityExactlyOnce(t *testing.T) {
 
 	if got := freed.Load(); got != 1 {
 		t.Fatalf("ReleaseCapacity fired %d times across three ticks; want exactly 1", got)
+	}
+}
+
+// TestReaperShutdownAbandonsInFlightKill pins the shutdown-safety fix for
+// killAndFinish: when the outer ctx is cancelled while a Kill is in flight,
+// the Kill returns context.Canceled but the container has NOT actually been
+// removed. The completion path must not apply the terminal transition and
+// must not free capacity in that case, otherwise a subsequent wispd process
+// would see an "expired" contract while its container is still alive on the
+// daemon; the log must be Info-level ("shutdown, kill abandoned"), not the
+// ERROR "reaper: kill container" that the old code emitted.
+func TestReaperShutdownAbandonsInFlightKill(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	c, cid := readyContract(t, store, fake, time.Hour)
+
+	rt := &hangingKillRuntime{Fake: fake, hangID: cid, started: make(chan struct{})}
+
+	var freed atomic.Int64
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rp := New(store, rt, Options{
+		Lead:            time.Minute,
+		KillTimeout:     time.Hour,
+		Logger:          logger,
+		Now:             func() time.Time { return c.ExpiresAt.Add(time.Second) },
+		ReleaseCapacity: func(contract.Contract) { freed.Add(1) },
+		Notify: func(e Event) {
+			if e.To == contract.StateExpired {
+				t.Errorf("expired transition fired for a shutdown-abandoned kill: %+v", e)
+			}
+		},
+	})
+
+	rp.Tick(ctx)
+
+	// Wait for the Kill goroutine to actually be inside Kill (blocked on
+	// killCtx.Done) before cancelling the outer ctx, so the abandonment path
+	// is exercised deterministically.
+	select {
+	case <-rt.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hung Kill goroutine did not start")
+	}
+
+	cancel()
+	rp.WaitForKills()
+
+	got, err := store.Get(c.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State == contract.StateExpired {
+		t.Errorf("state = %q; a shutdown-abandoned Kill must NOT apply the terminal transition", got.State)
+	}
+	if n := freed.Load(); n != 0 {
+		t.Errorf("ReleaseCapacity fired %d times; want 0 on a shutdown-abandoned kill (container was not actually removed)", n)
+	}
+	if _, ok := fake.Container(cid); !ok {
+		t.Error("container removed despite Kill being abandoned by shutdown")
+	}
+	if rp.isKilling(c.ID) {
+		t.Error("in-flight mark still held after WaitForKills; endKill must clear it on the abandonment path too")
+	}
+	out := logs.String()
+	if strings.Contains(out, "level=ERROR") {
+		t.Errorf("shutdown-abandoned kill logged ERROR; the abandonment must be Info-level. logs:\n%s", out)
+	}
+	if strings.Contains(out, "reaper: kill container") {
+		t.Errorf("shutdown-abandoned kill logged the ordinary Kill-error message; want the Info abandonment message. logs:\n%s", out)
+	}
+	if !strings.Contains(out, "shutdown, kill abandoned") {
+		t.Errorf("expected the 'shutdown, kill abandoned' Info log; logs:\n%s", out)
+	}
+}
+
+// TestReaperRunWaitsForInFlightKill pins that Run does not return until every
+// in-flight Kill goroutine has drained (bounded by KillTimeout so a Kill that
+// ignores its context cannot hang shutdown forever). Without this, wispd's
+// shutdown path could return while a Kill goroutine was still holding a
+// reference to the runtime and the store, racing later teardown.
+func TestReaperRunWaitsForInFlightKill(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	c, cid := readyContract(t, store, fake, time.Hour)
+
+	rt := &hangingKillRuntime{Fake: fake, hangID: cid, started: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	rp := New(store, rt, Options{
+		Lead: time.Minute,
+		// Long interval so only the startup reconcile fires under the test.
+		Interval:    time.Hour,
+		KillTimeout: 2 * time.Second,
+		Logger:      discardLogger(),
+		Now:         func() time.Time { return c.ExpiresAt.Add(time.Second) },
+	})
+
+	done := make(chan struct{})
+	go func() {
+		rp.Run(ctx)
+		close(done)
+	}()
+
+	// The startup reconcile launches the hung Kill goroutine; wait for it to
+	// actually be inside Kill before triggering shutdown.
+	select {
+	case <-rt.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hung Kill goroutine did not start during startup reconcile")
+	}
+
+	// Run must still be blocked inside its select loop.
+	select {
+	case <-done:
+		t.Fatal("Run returned before ctx was cancelled")
+	default:
+	}
+
+	// Cancel the outer ctx: shutdown begins. The hung Kill unblocks via
+	// killCtx.Done (killCtx is a child of ctx) and returns context.Canceled,
+	// so the WaitGroup drains promptly - well under KillTimeout - and Run
+	// returns. If Run did NOT wait for the drain, done would close before the
+	// goroutine had a chance to clear the in-flight mark.
+	shutdownStart := time.Now()
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return within 3s of ctx cancellation; the drain must not hang past KillTimeout")
+	}
+	elapsed := time.Since(shutdownStart)
+	if elapsed > 2500*time.Millisecond {
+		t.Errorf("Run drain took %v; want under KillTimeout+slack. A Kill that honors ctx cancellation should drain promptly", elapsed)
+	}
+
+	// The goroutine must have run to completion, clearing the in-flight
+	// mark. Without Run waiting on WaitForKills, this assertion would race.
+	if rp.isKilling(c.ID) {
+		t.Error("in-flight mark still held after Run returned; Run must WaitForKills before returning")
+	}
+	// The abandoned-kill path does NOT expire the contract (see
+	// TestReaperShutdownAbandonsInFlightKill); the container is left in
+	// place so a follow-up reconcile can find it by its wisp label.
+	if _, ok := fake.Container(cid); !ok {
+		t.Error("container removed despite shutdown having cancelled the Kill")
 	}
 }

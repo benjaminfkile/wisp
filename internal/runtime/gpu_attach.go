@@ -6,7 +6,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 )
 
-// GPU device attachment — the KATA SEAM.
+// GPU device attachment - the KATA SEAM.
 //
 // Attaching a GPU to a leased container is done DIFFERENTLY by each launch
 // mechanism, exactly like launchMechanism selects the container runtime from the
@@ -21,19 +21,19 @@ import (
 // ErrGPUAttachUnsupported. That slot is the FUTURE Kata + VFIO passthrough
 // insertion point: adding VM-backed GPU passthrough is implementing that strategy
 // HERE and flipping the policy attach map's vm entry to true (see
-// policy.gpuAttachByIsolation) — with no create-path change. GPU attachment is
+// policy.gpuAttachByIsolation) - with no create-path change. GPU attachment is
 // therefore never gated on isolation == "shared" inline anywhere; the selection
 // lives only in this seam.
 //
 // In v1 the create path already rejects a GPU request at any non-shared isolation
 // level (the policy attach map advertises only shared), so the vm slot's error is
-// unreachable in practice — but it is the honest, typed answer for a mechanism
+// unreachable in practice - but it is the honest, typed answer for a mechanism
 // that cannot attach a GPU, and it is exercised directly by unit tests.
 
 // nvidiaGPUDriver is the device-driver name the NVIDIA Container Runtime
 // registers for Docker DeviceRequests. A request naming this driver, with
 // explicit DeviceIDs and the "gpu" capability, is the SDK equivalent of
-// `docker run --gpus device=<id>` — an EXCLUSIVE attach of exactly those devices,
+// `docker run --gpus device=<id>` - an EXCLUSIVE attach of exactly those devices,
 // not a count.
 const nvidiaGPUDriver = "nvidia"
 
@@ -76,7 +76,7 @@ func gpuAttachment(isolation string, deviceIDs []string) ([]container.DeviceRequ
 
 // sharedDeviceRequests builds the Docker DeviceRequests that attach exactly the
 // given devices to a shared/runc container: the nvidia driver, the explicit
-// device IDs, and the "gpu" capability — the SDK equivalent of
+// device IDs, and the "gpu" capability - the SDK equivalent of
 // `docker run --gpus device=<id>,<id>`. Naming explicit DeviceIDs (rather than a
 // Count) is what makes the attach exclusive to the allocator-chosen devices.
 func sharedDeviceRequests(deviceIDs []string) []container.DeviceRequest {

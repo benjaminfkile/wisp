@@ -125,7 +125,7 @@ type Options struct {
 	// ReleaseGPUs, when set, is called with a contract's assigned GPU device IDs
 	// as the reaper expires it, so the exclusive device allocator reclaims them
 	// (see gpu.Allocator.Free). It runs on the reaper's own goroutine and must be
-	// idempotent — the allocator's Free is — so a contract already released and
+	// idempotent - the allocator's Free is - so a contract already released and
 	// freed elsewhere is never double-freed into a re-assignable state. Nil on a
 	// host with no GPU allocator wired.
 	ReleaseGPUs func(ids []string)
@@ -175,8 +175,9 @@ type Reaper struct {
 	killMu  sync.Mutex
 	killing map[string]struct{}
 
-	// killWG counts every off-tick Kill goroutine so tests can synchronize on
-	// the async completion path via waitForKills.
+	// killWG counts every off-tick Kill goroutine so tests (and, on shutdown,
+	// Run itself) can synchronize on the async completion path via
+	// WaitForKills.
 	killWG sync.WaitGroup
 }
 
@@ -225,10 +226,16 @@ func (r *Reaper) SetNotify(fn func(Event)) {
 	r.notify = fn
 }
 
-// Run performs a startup reconcile — reaping any contract already past its TTL,
-// which matters after a restart — and then scans the store every Interval until
+// Run performs a startup reconcile - reaping any contract already past its TTL,
+// which matters after a restart - and then scans the store every Interval until
 // ctx is cancelled. It blocks until ctx is done, so callers typically launch it
 // in a goroutine.
+//
+// On shutdown Run drains any Kill goroutines still in flight before returning,
+// bounded by the configured KillTimeout so a Kill that does not honor its
+// context cancellation (a wedged Docker daemon) cannot hang shutdown forever.
+// Callers that want the drain to complete before releasing shutdown resources
+// (see cmd/wispd/main.go) should wait for Run to return.
 func (r *Reaper) Run(ctx context.Context) {
 	r.Tick(ctx) // startup reconcile
 	t := time.NewTicker(r.interval)
@@ -236,10 +243,29 @@ func (r *Reaper) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			r.waitForKillsBounded(r.killTimeout)
 			return
 		case <-t.C:
 			r.Tick(ctx)
 		}
+	}
+}
+
+// waitForKillsBounded blocks until every in-flight Kill goroutine has returned
+// or the timeout elapses, whichever comes first. On a graceful shutdown the
+// outer ctx is already cancelled, so each Kill's killCtx is cancelled too and
+// the goroutines finish promptly via the abandoned-kill path in killAndFinish;
+// the bound covers only the pathological case of a Kill that ignores its
+// context so wispd does not hang past the daemon's shutdown budget.
+func (r *Reaper) waitForKillsBounded(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		r.killWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
 	}
 }
 
@@ -254,7 +280,7 @@ func (r *Reaper) Run(ctx context.Context) {
 func (r *Reaper) Tick(ctx context.Context) {
 	contracts := r.store.List()
 	// Snapshot which contracts were already terminal before reap runs, so a lease
-	// this tick moves to terminal does not get deleted in the same tick — polling
+	// this tick moves to terminal does not get deleted in the same tick - polling
 	// callers can still observe the transition once.
 	terminalBefore := make([]string, 0)
 	for _, c := range contracts {
@@ -334,8 +360,8 @@ func (r *Reaper) reap(ctx context.Context, c contract.Contract) {
 
 // containerDied reports whether the contract's backing container has died out
 // of band and the contract should be reaped. It only inspects contracts in
-// StateReady or StateExpiring — the states where a running container is
-// EXPECTED — so a container mid-provision (created but not yet Started) is not
+// StateReady or StateExpiring - the states where a running container is
+// EXPECTED - so a container mid-provision (created but not yet Started) is not
 // mistaken for a dead one, and a contract with no ContainerID yet is skipped.
 // A transport error from Inspect is treated as inconclusive: the reaper does
 // NOT reap the lease on a transient daemon blip and retries on the next tick.
@@ -403,14 +429,24 @@ func (r *Reaper) WaitForKills() {
 // transition still runs so capacity is freed. A killCtx deadline that fired
 // means the daemon has not answered within killTimeout: the contract is left
 // in place for a later kill attempt and no terminal transition is applied.
+// If the outer ctx has been cancelled (shutdown), the Kill was abandoned
+// before the container was actually removed: log at Info and return without
+// applying the terminal transition or freeing capacity, so a subsequent
+// wispd process can reconcile the surviving container from its labels rather
+// than seeing an "expired" contract whose container is in fact still alive.
 func (r *Reaper) killAndFinish(ctx context.Context, c contract.Contract, now time.Time, reason string) {
 	defer r.endKill(c.ID)
 
 	killCtx, cancel := context.WithTimeout(ctx, r.killTimeout)
 	err := r.rt.Kill(killCtx, c.ContainerID)
 	cancel()
+	if ctx.Err() != nil {
+		r.logger.Info("reaper: shutdown, kill abandoned",
+			"contract_id", c.ID, "container_id", c.ContainerID)
+		return
+	}
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		if errors.Is(err, context.DeadlineExceeded) {
 			r.logger.Error("reaper: kill container timed out; leaving for later attempt",
 				"contract_id", c.ID, "container_id", c.ContainerID, "timeout", r.killTimeout)
 			return

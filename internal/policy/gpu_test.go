@@ -90,8 +90,8 @@ func TestEffectiveGPUDisabled(t *testing.T) {
 	}
 }
 
-// TestEffectiveGPUUnsupported verifies the two ways a host lacks GPU support —
-// no NVIDIA runtime, or the runtime present but no device enumerated — both yield
+// TestEffectiveGPUUnsupported verifies the two ways a host lacks GPU support -
+// no NVIDIA runtime, or the runtime present but no device enumerated - both yield
 // the wire-contract empty shape and no drop (nothing was withheld, there was
 // nothing to withhold).
 func TestEffectiveGPUUnsupported(t *testing.T) {
@@ -125,7 +125,7 @@ func TestEffectiveGPUUnsupported(t *testing.T) {
 // TestGPUAttachIsDataWithVMSlot verifies the KATA-INTENT rule: GPU-attach per
 // isolation level is a computed map with the vm/kata slot PRESENT and false in
 // v1, not a hard-coded shared-only check. Flipping the vm entry to true later is
-// the only change needed to advertise vm — the Isolations() list and Attach()
+// the only change needed to advertise vm - the Isolations() list and Attach()
 // read straight from the map.
 func TestGPUAttachIsDataWithVMSlot(t *testing.T) {
 	// The map itself carries the vm slot regardless of host support.

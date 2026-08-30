@@ -112,7 +112,7 @@ func TestExecReturnsResult(t *testing.T) {
 // A sync exec against a Windows-mode runtime must wrap the command with the
 // Windows command processor (`cmd /c <cmd>`) rather than the POSIX `/bin/sh -c`,
 // since a Windows container has no /bin/sh. Uses the fake runtime with a stubbed
-// OS — no real Windows Docker daemon.
+// OS - no real Windows Docker daemon.
 func TestExecWrapsCommandForWindows(t *testing.T) {
 	h, store, fake := testServer(t)
 	fake.OS = runtime.OSWindows
@@ -766,7 +766,7 @@ func TestDeleteExpiredContractIsIdempotentNoop(t *testing.T) {
 	}
 
 	// DELETE of the already-expired contract must succeed with a normal status
-	// response — never 500.
+	// response - never 500.
 	rec := do(t, h, http.MethodDelete, "/contracts/"+created.ContractID, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("DELETE status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
@@ -787,7 +787,7 @@ func TestDeleteExpiredContractIsIdempotentNoop(t *testing.T) {
 }
 
 // A DELETE against an ALREADY-released contract is also an idempotent success
-// with no capacity double-free — the released-then-released case, distinct from
+// with no capacity double-free - the released-then-released case, distinct from
 // the expired-then-released case above.
 func TestDeleteReleasedContractIsIdempotentNoop(t *testing.T) {
 	b, h, _, _ := capBroker(t, budgetPolicy(0, 4, 512))
@@ -1082,7 +1082,7 @@ func TestDeleteFenceBlocksReaperTick(t *testing.T) {
 	}
 }
 
-// DELETE against a contract id no wispd process ever knew still returns 404 —
+// DELETE against a contract id no wispd process ever knew still returns 404 -
 // the idempotent no-op only covers ids that ARE tracked.
 func TestDeleteUnknownContractStillReturns404(t *testing.T) {
 	h, _, _ := testServer(t)
@@ -1095,7 +1095,7 @@ func TestDeleteUnknownContractStillReturns404(t *testing.T) {
 
 // killHookRuntime wraps a runtime.Runtime and fires onKill just before delegating
 // to the wrapped runtime's Kill, letting a test inject a state transition
-// between the release handler's Kill and its UpdateState — the reaper-race seam
+// between the release handler's Kill and its UpdateState - the reaper-race seam
 // (see TestDeleteRaceWithReaperExpirySucceeds).
 type killHookRuntime struct {
 	runtime.Runtime
@@ -1398,7 +1398,7 @@ func TestCreateUnknownIsolationRejected(t *testing.T) {
 
 func TestCreateConfidentialIsolationRejected(t *testing.T) {
 	// confidential is a known level, so it parses, but it is not supported yet and
-	// is rejected with a clear error before any contract is recorded — even if an
+	// is rejected with a clear error before any contract is recorded - even if an
 	// operator has (mistakenly) allow-listed it.
 	pol := &policy.Config{
 		Allow:        []string{"wisp-base"},
@@ -1681,7 +1681,7 @@ func TestCreateVMAvailableOnWindowsDaemon(t *testing.T) {
 	store := contract.NewStore()
 	fake := runtime.NewFake()
 	fake.OS = runtime.OSWindows
-	// Only runc registered — vm comes from the windows daemon (Hyper-V), not Kata.
+	// Only runc registered - vm comes from the windows daemon (Hyper-V), not Kata.
 	fake.Runtimes = []string{"runc"}
 	h := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, fake, pol, bus.New(nil), "")
 
@@ -1867,7 +1867,7 @@ func TestImagesAdvertisesOS(t *testing.T) {
 
 // On a windows-mode host, GET /images reports os "windows" and advertises the
 // Windows base image as the default (the built-in policy allow-lists both).
-// Uses the fake runtime with a stubbed OS — no real Windows Docker daemon.
+// Uses the fake runtime with a stubbed OS - no real Windows Docker daemon.
 func TestImagesAdvertisesWindowsDefault(t *testing.T) {
 	store := contract.NewStore()
 	fake := runtime.NewFake()
@@ -1894,7 +1894,7 @@ func TestImagesAdvertisesWindowsDefault(t *testing.T) {
 // runtimes and enumerated GPUs, so the GPU-block advertising can be exercised
 // without a real daemon or NVIDIA tooling. The GPU posture is computed once at
 // broker construction (inside New), so the fake must be configured before the
-// call — hence a dedicated helper rather than the shared testServer.
+// call - hence a dedicated helper rather than the shared testServer.
 func gpuServer(t *testing.T, pol *policy.Config, runtimes []string, devices []runtime.GPUDevice) http.Handler {
 	t.Helper()
 	store := contract.NewStore()
@@ -2148,7 +2148,7 @@ func TestCreateImageOSMismatch(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
 	}
-	// The error is the clear, OS-aware message — not an opaque "provisioning failed".
+	// The error is the clear, OS-aware message - not an opaque "provisioning failed".
 	body := rec.Body.String()
 	if !strings.Contains(body, "this host is in linux container mode") || !strings.Contains(body, "not compatible") {
 		t.Errorf("error body = %q, want the clear OS-mismatch message", body)
@@ -2289,8 +2289,8 @@ func TestListContractsReturnsNonTerminalShape(t *testing.T) {
 	}
 }
 
-// GET /contracts's raw JSON matches the cross-repo wire contract exactly —
-// wisp-agent scrapes these snake_case names — and the "contracts" array is
+// GET /contracts's raw JSON matches the cross-repo wire contract exactly -
+// wisp-agent scrapes these snake_case names - and the "contracts" array is
 // always present (empty when no non-terminal contracts exist).
 func TestListContractsRawJSONShape(t *testing.T) {
 	h, _, _ := testServer(t)
@@ -2443,7 +2443,7 @@ func TestListContractsRequiresAppToken(t *testing.T) {
 }
 
 // GET/DELETE /contracts/{id} require either the app token OR the per-contract
-// token — a random local process without either credential cannot read or
+// token - a random local process without either credential cannot read or
 // destroy the lease. Covers acceptance criterion 159 (per-contract side).
 func TestContractByIDRequiresAppOrContractToken(t *testing.T) {
 	store := contract.NewStore()
@@ -2544,7 +2544,7 @@ func TestCreateExternalIDRoundTrip(t *testing.T) {
 	}
 }
 
-// A create without external_id writes no wisp.external_id label — the presence
+// A create without external_id writes no wisp.external_id label - the presence
 // of that label distinguishes a caller-supplied identifier from an absent one.
 func TestCreateWithoutExternalIDWritesNoLabel(t *testing.T) {
 	h, store, fake := testServer(t)
@@ -2561,7 +2561,7 @@ func TestCreateWithoutExternalIDWritesNoLabel(t *testing.T) {
 	}
 }
 
-// A create with an external_id longer than the cap is rejected up front — no
+// A create with an external_id longer than the cap is rejected up front - no
 // contract is recorded, no container is booted.
 func TestCreateExternalIDTooLongRejected(t *testing.T) {
 	h, store, _ := testServer(t)
@@ -2579,7 +2579,7 @@ func TestCreateExternalIDTooLongRejected(t *testing.T) {
 
 // After a wispd restart's reconcile, an adopted contract's external_id is
 // recovered from the container label and appears on both GET /contracts and
-// GET /contracts/{id} — the mapping the local wisp-agent needs to re-associate
+// GET /contracts/{id} - the mapping the local wisp-agent needs to re-associate
 // its leases. Covers acceptance criterion 160 (reconcile side).
 func TestReconcileRestoresExternalIDFromLabel(t *testing.T) {
 	ctx := context.Background()
@@ -2660,7 +2660,7 @@ func TestReconciledContractGetsFreshWorkingToken(t *testing.T) {
 		t.Errorf("list token = %q, want %q (matches stored)", list.Contracts[0].Token, c.Token)
 	}
 
-	// Exec against the adopted contract with the fresh token succeeds — the whole
+	// Exec against the adopted contract with the fresh token succeeds - the whole
 	// point of re-issuing on Adopt.
 	rec = doAuth(t, h, http.MethodPost, "/contracts/adopted/exec", list.Contracts[0].Token, `{"command":"echo hi"}`)
 	if rec.Code != http.StatusOK {
@@ -2695,7 +2695,7 @@ func TestListExcludesTerminalAndReaperSweepDeletes(t *testing.T) {
 	}
 
 	// One reaper tick is enough to remove a contract that was terminal at start of
-	// tick — it drops from the store, so a subsequent Get returns not-found.
+	// tick - it drops from the store, so a subsequent Get returns not-found.
 	rp := reaper.New(store, runtime.NewFake(), reaper.Options{
 		Logger: discardLogger(),
 		Now:    func() time.Time { return time.Unix(1_000_000_000, 0) },

@@ -43,7 +43,7 @@ type HostCapabilities struct {
 //   - vm iff a Kata runtime ("kata-runtime" or "kata") is registered on a Linux
 //     daemon, OR the daemon runs Windows containers (Hyper-V isolation).
 //
-// confidential is never supported here — it parses for forward-compatibility but
+// confidential is never supported here - it parses for forward-compatibility but
 // has no runtime backing yet. The returned map contains only the supported
 // levels (each mapped to true).
 func SupportedIsolations(h HostCapabilities) map[Isolation]bool {
@@ -70,8 +70,8 @@ func SupportedIsolations(h HostCapabilities) map[Isolation]bool {
 }
 
 // IsolationCapabilities is a host's effective isolation posture: the levels it
-// will actually accept — the operator allow-list intersected with what the daemon
-// can run — and the default level applied when a create omits one. It is computed
+// will actually accept - the operator allow-list intersected with what the daemon
+// can run - and the default level applied when a create omits one. It is computed
 // once at startup (see Config.EffectiveIsolation), then consulted by the create
 // path (Allows / Default) and advertised on the read surface (Levels / Default).
 type IsolationCapabilities struct {
@@ -89,7 +89,7 @@ func (ic IsolationCapabilities) Levels() []Isolation {
 	return out
 }
 
-// Allows reports whether level is in the effective allowed set — i.e. both
+// Allows reports whether level is in the effective allowed set - i.e. both
 // permitted by the operator and runnable on this host.
 func (ic IsolationCapabilities) Allows(level Isolation) bool {
 	return ic.allowed[level]
@@ -136,14 +136,14 @@ func (c *Config) EffectiveIsolation(supported map[Isolation]bool) (IsolationCapa
 	}
 	def := c.DefaultIsolation()
 	if ic.allowed[def] {
-		// Configured default survived the intersection — keep it.
+		// Configured default survived the intersection - keep it.
 		ic.def = def
 		return ic, dropped
 	}
 	// The configured default did not survive. The path depends on whether the
 	// operator configured an explicit allow-list.
 	if allowListEmpty {
-		// No allow-list: legacy behaviour — always offer and default to shared.
+		// No allow-list: legacy behaviour - always offer and default to shared.
 		def = IsolationShared
 		if !ic.allowed[IsolationShared] {
 			ic.allowed[IsolationShared] = true
@@ -154,7 +154,7 @@ func (c *Config) EffectiveIsolation(supported map[Isolation]bool) (IsolationCapa
 	}
 	if len(ic.order) == 0 {
 		// All-dropped: every configured isolation level is unavailable on this host.
-		// Return empty capabilities — the caller must log an ERROR and advertise no
+		// Return empty capabilities - the caller must log an ERROR and advertise no
 		// isolation rather than silently downgrading to the weakest tier the operator
 		// did not authorise. ic.def remains the zero value (empty Isolation).
 		return ic, dropped

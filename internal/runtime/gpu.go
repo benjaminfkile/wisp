@@ -10,7 +10,7 @@ import (
 
 // GPU discovery. Wisp advertises GPU capability the same data-driven way it
 // advertises isolation capability (see policy.SupportedIsolations): the daemon
-// query reports the registered runtimes (DaemonInfo.Runtimes — the "nvidia"
+// query reports the registered runtimes (DaemonInfo.Runtimes - the "nvidia"
 // runtime gates GPU support) and this file enumerates the physical devices via
 // nvidia-smi. Both are plain facts the policy layer intersects with the
 // operator's config to get the effective posture the read surface advertises
@@ -18,7 +18,7 @@ import (
 //
 // nvidia-smi is the only vendor tool wired in v1; it sits behind CommandRunner
 // so the enumeration+parse logic is unit-testable with canned output and nothing
-// shells out for real in tests — the CI/runner container has no GPU and no NVIDIA
+// shells out for real in tests - the CI/runner container has no GPU and no NVIDIA
 // tooling.
 
 // NVIDIARuntimeName is the OCI runtime name the NVIDIA Container Runtime
@@ -31,7 +31,7 @@ const NVIDIARuntimeName = "nvidia"
 
 // The nvidia-smi invocation used to enumerate GPUs. The machine-readable query
 // flags emit one CSV line per device with no header and no unit suffixes, so
-// memory.total is a bare integer count of mebibytes — see enumerateGPUs for the
+// memory.total is a bare integer count of mebibytes - see enumerateGPUs for the
 // parse. Keeping the binary and flags as constants documents the exact contract
 // the fake stands in for.
 const (
@@ -52,7 +52,7 @@ type GPUDevice struct {
 
 	// Class is the normalized product name: lowercased with whitespace runs
 	// collapsed to single hyphens (e.g. "nvidia-geforce-rtx-4090"). It is an
-	// opaque string to consumers — a coarse "what kind of GPU" label, not a spec.
+	// opaque string to consumers - a coarse "what kind of GPU" label, not a spec.
 	Class string
 
 	// VRAMMB is the device's total video memory in mebibytes.
@@ -83,8 +83,8 @@ func (execRunner) Output(ctx context.Context, name string, args ...string) ([]by
 // the enumerated devices. A runner error (nvidia-smi absent or exiting non-zero)
 // or an unparseable line is returned as an error so the caller degrades to
 // supported=false; enumeration succeeding with zero devices returns an empty,
-// non-nil slice and no error. The parse is deliberately strict — garbage lines
-// are an error rather than being silently skipped — so a host only advertises
+// non-nil slice and no error. The parse is deliberately strict - garbage lines
+// are an error rather than being silently skipped - so a host only advertises
 // GPUs it could actually describe. See normalizeGPUClass for the class rule.
 func enumerateGPUs(ctx context.Context, runner CommandRunner) ([]GPUDevice, error) {
 	out, err := runner.Output(ctx, nvidiaSMIBinary, nvidiaSMIQueryGPU, nvidiaSMIFormat)

@@ -123,7 +123,7 @@ func TestCreateGPUsRejectedOverMax(t *testing.T) {
 }
 
 // A GPU request at an isolation level whose attach map entry is false is REJECTED
-// (400) even though the level itself is allowed on the host — v1 attaches GPUs
+// (400) even though the level itself is allowed on the host - v1 attaches GPUs
 // only at shared. Nothing is reserved.
 func TestCreateGPUsRejectedWrongIsolation(t *testing.T) {
 	// Allow vm in policy and advertise the Kata runtime so vm passes the isolation
@@ -295,7 +295,7 @@ func TestProvisionFailureFreesGPUs(t *testing.T) {
 
 // createOptions writes the assigned device IDs as the comma-joined wisp.gpus
 // label, and the reconcile reads them back to rebuild allocator occupancy after
-// a simulated restart — the full label round-trip that keeps exclusivity across
+// a simulated restart - the full label round-trip that keeps exclusivity across
 // a restart. A GPU-less lease writes no label.
 func TestGPUsLabelRoundTripThroughReconcile(t *testing.T) {
 	ctx := context.Background()

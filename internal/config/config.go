@@ -60,7 +60,7 @@ type Config struct {
 
 	// AppToken is the app-level bearer credential gating contract creation (and
 	// the event bus). When empty, the app-level gate is disabled: any caller may
-	// create contracts — the localhost-friendly default, since the OS user
+	// create contracts - the localhost-friendly default, since the OS user
 	// boundary is the outer defense (see docs/DESIGN.md §8). Set it to require an
 	// Authorization: Bearer <token> on POST /contracts.
 	AppToken string

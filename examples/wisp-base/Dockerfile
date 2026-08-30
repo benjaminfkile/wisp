@@ -1,9 +1,9 @@
-# Example `wisp-base` image — the default entry in wisp's built-in image
+# Example `wisp-base` image - the default entry in wisp's built-in image
 # allow-list (see ../wisp.config.json and ../../README.md §"Contracts, images & limits").
 #
 # wisp runs a contract's main process as `tail -f /dev/null` (a keep-alive) and
 # drives ALL real work through exec/shell, so the image only needs a POSIX shell
-# at /bin/sh — which Alpine provides. Bring your own tools per lease via userdata,
+# at /bin/sh - which Alpine provides. Bring your own tools per lease via userdata,
 # or bake them in here.
 #
 # Build:

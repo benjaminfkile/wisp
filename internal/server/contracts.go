@@ -1290,6 +1290,9 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 
 	if c.ContainerID != "" {
 		killErr, timedOut := b.killForRelease(r.Context(), c.ContainerID)
+		if errors.Is(killErr, context.DeadlineExceeded) {
+			timedOut = true
+		}
 		if timedOut || (killErr != nil && !errors.Is(killErr, runtime.ErrNotFound)) {
 			// Do NOT transition. Leave the contract in StateReleasing so the reaper's
 			// release-grace escape hatch owns the terminal transition (freeing capacity

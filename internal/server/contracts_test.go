@@ -1094,18 +1094,12 @@ func TestDeleteUnknownContractStillReturns404(t *testing.T) {
 	}
 }
 
-// TestDeleteClientCancelledMidKillLeavesReleasing pins the 225 fix: if the
-// client disconnects (or the request context is cancelled) while the release
-// handler's kill is in flight, the kill must continue under a DETACHED context
-// and NOT falsely resolve as a successful release. Before the fix, Kill ran
-// under r.Context() and returned context.Canceled on cancellation, which the
-// old code silently treated as success: the contract transitioned to released
-// and its capacity + GPUs were freed while the container kept running (and
-// then got adopted as a fresh contract by the next restart's reconcile). With
-// the detach in place the container is still killed (the goroutine's own
-// killCtx is what bounds it), the contract completes its terminal transition,
-// and the caller's cancellation does nothing to the underlying tear down.
-func TestDeleteClientCancelledMidKillLeavesReleasing(t *testing.T) {
+// TestDeleteClientCancelledMidKillStillReleases: when the client disconnects
+// while the release handler's kill is in flight, the kill continues under its
+// own detached, bounded context; a kill that completes still finishes the
+// terminal transition, and the caller's cancellation does nothing to the tear
+// down.
+func TestDeleteClientCancelledMidKillStillReleases(t *testing.T) {
 	store := contract.NewStore()
 	fake := runtime.NewFake()
 	rt := &killHookRuntime{Runtime: fake}

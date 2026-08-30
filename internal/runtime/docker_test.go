@@ -1,12 +1,17 @@
 package runtime
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/system"
@@ -460,4 +465,66 @@ func TestDockerRuntimeKillMapsNotFound(t *testing.T) {
 			t.Fatalf("Kill = %v, want nil when the daemon reports removal already in progress", err)
 		}
 	})
+}
+
+// copyToStubClient embeds the full Docker APIClient (left nil) and overrides
+// only Info (for construction) and CopyToContainer (what CopyFilesToContainer
+// calls), buffering the archive body so a test can crack the tar entries
+// back open and assert on the headers.
+type copyToStubClient struct {
+	client.APIClient
+	gotArchive bytes.Buffer
+}
+
+func (c *copyToStubClient) Info(context.Context) (system.Info, error) {
+	return system.Info{OSType: "linux"}, nil
+}
+
+func (c *copyToStubClient) CopyToContainer(_ context.Context, _, _ string, content io.Reader, _ types.CopyToContainerOptions) error {
+	_, err := io.Copy(&c.gotArchive, content)
+	return err
+}
+
+// TestDockerRuntimeCopyFilesToContainerStampsModTime verifies each tar entry
+// carries a current, non-zero ModTime so ingested files show a real mtime in
+// the container instead of Jan 1 1970 (the tar epoch), the exact regression
+// task 231 was raised for. All entries in one archive share the same instant
+// so a batch reads with a consistent timestamp.
+func TestDockerRuntimeCopyFilesToContainerStampsModTime(t *testing.T) {
+	stub := &copyToStubClient{}
+	d := NewDockerRuntimeWithClient(stub)
+
+	before := time.Now().Add(-time.Second) // clock skew guard on either side
+	if err := d.CopyFilesToContainer(context.Background(), "cid", []FileEntry{
+		{Path: "/one", Content: []byte("a")},
+		{Path: "/two", Content: []byte("bb")},
+	}); err != nil {
+		t.Fatalf("CopyFilesToContainer: %v", err)
+	}
+	after := time.Now().Add(time.Second)
+
+	tr := tar.NewReader(&stub.gotArchive)
+	var stamps []time.Time
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read tar: %v", err)
+		}
+		if hdr.ModTime.IsZero() {
+			t.Errorf("entry %q ModTime is zero (would surface as Jan 1 1970 in the container)", hdr.Name)
+		}
+		if hdr.ModTime.Before(before) || hdr.ModTime.After(after) {
+			t.Errorf("entry %q ModTime = %v, want within [%v, %v]", hdr.Name, hdr.ModTime, before, after)
+		}
+		stamps = append(stamps, hdr.ModTime)
+	}
+	if len(stamps) != 2 {
+		t.Fatalf("tar entries = %d, want 2", len(stamps))
+	}
+	if !stamps[0].Equal(stamps[1]) {
+		t.Errorf("entries carry different ModTimes (%v vs %v); one archive should share one instant", stamps[0], stamps[1])
+	}
 }

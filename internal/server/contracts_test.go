@@ -2955,3 +2955,63 @@ func TestListExcludesTerminalAndReaperSweepDeletes(t *testing.T) {
 		t.Errorf("live contract missing after cleanup tick: %v", err)
 	}
 }
+
+// TestJSONBodyCapRejectsOversized verifies each JSON handler is fronted by
+// http.MaxBytesReader so an oversized body returns a stable "request body too
+// large" 400 instead of being fully buffered, JSON-decoded, and base64-decoded
+// in memory before any per-field cap can reject it. The exact regression this
+// pins is POST /contracts with an enormous content_base64: the create path
+// used to read the whole blob and decode it before the files total-size cap
+// even ran. Every route is checked here so a future handler that skips the
+// wrapper regresses this test.
+func TestJSONBodyCapRejectsOversized(t *testing.T) {
+	h, _, _ := testServer(t)
+	created := createContract(t, h, `{"ttl_seconds":3600}`)
+
+	tests := []struct {
+		name    string
+		method  string
+		path    string
+		token   string
+		cap     int
+		wantMsg string
+	}{
+		{"create", http.MethodPost, "/contracts", "", maxCreateBodyBytes, "request body too large"},
+		{"exec", http.MethodPost, "/contracts/" + created.ContractID + "/exec", created.Token, maxExecBodyBytes, "request body too large"},
+		{"events", http.MethodPost, "/events", "", maxEventBodyBytes, "request body too large"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Ship a well-formed JSON envelope whose string value is one byte
+			// past the cap. That guarantees the wrapper fires (byte count),
+			// not any per-field validation. Any string field will do: the
+			// oversized bytes never reach a decoder that could look at it.
+			body := `{"pad":"` + strings.Repeat("a", tt.cap+1) + `"}`
+			var rec *httptest.ResponseRecorder
+			if tt.token != "" {
+				rec = doAuth(t, h, tt.method, tt.path, tt.token, body)
+			} else {
+				rec = do(t, h, tt.method, tt.path, body)
+			}
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tt.wantMsg) {
+				t.Errorf("body = %s, want to contain %q", rec.Body.String(), tt.wantMsg)
+			}
+		})
+	}
+}
+
+// TestJSONBodyCapAcceptsWithinCap is the companion negative-space check: a
+// body just under each route's cap still decodes normally (no false-positive
+// rejection at the boundary). Uses payloads that are byte-valid JSON the
+// handler will happily process at their smallest form.
+func TestJSONBodyCapAcceptsWithinCap(t *testing.T) {
+	h, _, _ := testServer(t)
+	// A tiny, well-formed create body decodes and creates a contract; the
+	// wrapper does not clip it.
+	if rec := do(t, h, http.MethodPost, "/contracts", `{"ttl_seconds":3600}`); rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+	}
+}

@@ -147,8 +147,7 @@ type publishRequest struct {
 // and fanned out to matching subscribers.
 func (b *broker) publishEvent(w http.ResponseWriter, r *http.Request) {
 	var req publishRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSONBody(w, r, maxEventBodyBytes, &req) {
 		return
 	}
 	if req.Type == "" {

@@ -82,9 +82,10 @@ returns `400` (§7). Over-budget requests are `409` (§7).
 ### Lifecycle (state machine)
 
 ```
-requested → provisioning → ready → (in use) → expiring → released | expired → destroyed
-                 │                                              ▲
-          (userdata runs)                                (DELETE or TTL)
+requested → provisioning → ready → (in use) → expiring → releasing → released
+                 │                                              ↘
+          (userdata runs)                                     expired → destroyed
+                                                     (DELETE or TTL / death)
 ```
 
 - **requested**: the contract exists but no container has been provisioned yet. A transient state a
@@ -98,19 +99,27 @@ requested → provisioning → ready → (in use) → expiring → released | ex
   POST results out) before the hard kill. Exec and shell stay usable through the lead window
   (accepted in both `ready` and `expiring`) so a client can actually use the grace period; only
   once the contract reaches a terminal state do they return `409`.
+- **releasing**: the transient fence a `DELETE /contracts/:id` installs BEFORE killing the
+  container so the reaper's TTL / container-died sweeps cannot race the release. The reaper skips
+  `releasing` contracts, so during this window the DELETE handler is the sole owner of the
+  container kill and the terminal transition. Only `released` is a legal successor. The state is
+  internal to the release handler (it lives at most for one container-kill call) and is excluded
+  from `GET /contracts` the same way `requested` is.
 - **released**: client called `DELETE /contracts/:id`. A `DELETE` against a contract that is
   already `released` or `expired` is an idempotent success (200 echoing the terminal status) and
-  never frees capacity or GPUs a second time.
+  never frees capacity or GPUs a second time. A `DELETE` whose fence-installing transition finds
+  the contract already purged, or whose final `mark released` finds the store has since purged it,
+  also returns 200 with a `released` status rather than 500.
 - **expired**: TTL elapsed, provisioning failed, or the container died out of band (`docker kill` /
   `docker rm` / OOM, detected by the reaper's liveness sweep); Wisp destroys the container.
 
-Legal transitions: `requested` may go to `provisioning`, `released`, or `expired`; `provisioning`
-to `ready`, `released`, or `expired`; `ready` to `expiring`, `released`, or `expired`; `expiring`
-to `released` or `expired`. The terminal states have no outgoing transitions, and the store rejects
-anything else, which is what makes every terminal side effect (freeing capacity and GPUs,
-publishing the lifecycle event) happen exactly once even when a `DELETE` races the reaper. A
-terminal contract stays readable for one reaper sweep and is then purged from the store, after
-which its id is `404`.
+Legal transitions: `requested` may go to `provisioning`, `releasing`, or `expired`; `provisioning`
+to `ready`, `releasing`, or `expired`; `ready` to `expiring`, `releasing`, or `expired`;
+`expiring` to `releasing` or `expired`; `releasing` to `released` only. The terminal states have
+no outgoing transitions, and the store rejects anything else, which is what makes every terminal
+side effect (freeing capacity and GPUs, publishing the lifecycle event) happen exactly once even
+when a `DELETE` races the reaper. A terminal contract stays readable for one reaper sweep and is
+then purged from the store, after which its id is `404`.
 
 Clients are responsible for getting artifacts **out** before the container dies (git push, upload,
 POST to a satellite). Wisp returns command output but does not persist the filesystem.

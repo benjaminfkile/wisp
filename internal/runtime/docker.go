@@ -12,6 +12,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
 )
 
@@ -380,11 +381,22 @@ func (d *DockerRuntime) Start(ctx context.Context, id string) error {
 // the daemon maps to ErrNotFound so the reaper's expire path (which suppresses
 // only that sentinel via errors.Is) does not log a spurious ERROR every time it
 // reaps a container that was removed out of band — the exact LivenessGone case
-// the container-death detection was built for. Any other error is wrapped.
+// the container-death detection was built for. A "removal already in progress"
+// response (409 conflict, the shape the daemon returns when two Kill calls race
+// on the same container, e.g. the release handler and the reaper's
+// container-died sweep firing at once) is treated as success: the container IS
+// being torn down, which is what Kill wanted. Any other error is wrapped.
 func (d *DockerRuntime) Kill(ctx context.Context, id string) error {
 	if err := d.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}); err != nil {
 		if client.IsErrNotFound(err) {
 			return ErrNotFound
+		}
+		if errdefs.IsConflict(err) {
+			// Concurrent removal already in progress (typically the release
+			// handler and the reaper both hitting Kill on the same container).
+			// The container is being torn down either way, so from Kill's point
+			// of view this is a successful teardown, not an error.
+			return nil
 		}
 		return fmt.Errorf("runtime: kill container %s: %w", id, err)
 	}

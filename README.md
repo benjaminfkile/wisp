@@ -269,15 +269,21 @@ WS     /events                        subscribe, optional ?type=a,b filter      
 - `GET /contracts` returns `{"contracts":[{id, external_id, token, status,
   expires_at, ttl_seconds_remaining, reserved_cpus, reserved_memory_mb, gpus}]}`
   for every contract in `provisioning`, `ready`, or `expiring` (terminal
-  contracts and the transient `requested` state are excluded; `gpus` is always
-  an array). It includes each contract's current bearer token so a restarted
-  local agent can rebuild its lease map, which is why it is app-token gated.
+  contracts and the transient `requested` / `releasing` states are excluded;
+  `gpus` is always an array). It includes each contract's current bearer token
+  so a restarted local agent can rebuild its lease map, which is why it is
+  app-token gated.
 - `GET /contracts/:id` and `DELETE /contracts/:id` return
   `{contract_id, status, ttl_seconds_remaining, gpus?, meta?, external_id}`.
-  `DELETE` of an already `released` or `expired` contract is an **idempotent
-  success** (200 echoing the terminal status; nothing is freed twice). Unknown
-  ids are `404`. Terminal contracts are purged from the store one reaper sweep
-  after they become terminal, after which their id is `404`.
+  `DELETE` first transitions the contract to `releasing` to fence the reaper
+  off it, then kills the container, then completes the transition to
+  `released`. `DELETE` of an already `released` or `expired` contract is an
+  **idempotent success** (200 echoing the terminal status; nothing is freed
+  twice). A `DELETE` whose fence-installing transition finds the contract
+  already purged, or whose final mark-released finds the store has since
+  purged it, also returns 200 with a `released` status. Unknown ids are `404`.
+  Terminal contracts are purged from the store one reaper sweep after they
+  become terminal, after which their id is `404`.
 - `POST /contracts/:id/exec` runs the command through `/bin/sh -c` (or `cmd /c`
   on a Windows daemon) as a fresh process and returns
   `{stdout, stderr, exit_code}` (a non-zero exit is still `200`). It is `409`
@@ -298,16 +304,23 @@ Every response body other than the SSE stream is JSON; errors are
 
 ## Lifecycle, reaper & restart reconcile
 
-A contract moves `requested -> provisioning -> ready -> expiring -> released | expired`.
-`released` (client `DELETE`) and `expired` (TTL elapsed, provisioning failure,
-or container death) are terminal and destroy the container. The reaper sweeps
-every `WISP_REAP_INTERVAL_SECONDS`: a `ready` contract inside the
+A contract moves `requested -> provisioning -> ready -> expiring -> releasing -> released`,
+or exits to `expired` from any active state. `released` (client `DELETE`) and
+`expired` (TTL elapsed, provisioning failure, or container death) are terminal
+and destroy the container. The `releasing` state is the transient fence a
+`DELETE` installs BEFORE killing the container so the reaper cannot expire (and
+then purge) the contract from under the handler: the reaper skips `releasing`
+contracts, so the DELETE handler is the sole owner of the container kill and
+the terminal transition to `released`. The reaper sweeps every
+`WISP_REAP_INTERVAL_SECONDS`: a `ready` contract inside the
 `WISP_EXPIRING_LEAD_SECONDS` window becomes `expiring`; a contract past its TTL
 is killed and `expired`; and a `ready`/`expiring` contract whose container has
 stopped or been removed out of band (`docker kill` / `docker rm` / OOM) is
 expired on the same path within a sweep or two, so its capacity and GPUs return
 to the allocators immediately instead of at TTL. A transport error from the
-daemon is treated as inconclusive and retried next sweep.
+daemon is treated as inconclusive and retried next sweep. A `Kill` that races
+another concurrent tear down (the daemon returns "removal already in progress")
+is treated as success (the container is being torn down either way).
 
 Every leased container carries labels so a `wispd` restart can rebuild state
 from Docker alone: `wisp.contract` (id), `wisp.expires_at` (Unix seconds),

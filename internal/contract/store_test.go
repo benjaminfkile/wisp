@@ -136,7 +136,7 @@ func TestStoreUpdateStateLegal(t *testing.T) {
 	s := NewStore()
 	c, _ := s.Create(CreateParams{TTL: time.Hour})
 
-	for _, next := range []State{StateProvisioning, StateReady, StateExpiring, StateReleased} {
+	for _, next := range []State{StateProvisioning, StateReady, StateExpiring, StateReleasing, StateReleased} {
 		got, err := s.UpdateState(c.ID, next)
 		if err != nil {
 			t.Fatalf("UpdateState(%s): %v", next, err)

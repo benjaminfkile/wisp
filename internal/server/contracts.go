@@ -924,18 +924,36 @@ type gpuDeviceResponse struct {
 // provision boots the container for c, runs its userdata, and drives the
 // contract from requested through provisioning to ready. On any failure it
 // destroys the container and marks the contract expired, returning the error.
+//
+// On success it emits a single structured "contract provisioned" log line with
+// per-phase durations (image ensure, container create, start, userdata) plus a
+// total, so an operator can pin a slow create to the specific phase that
+// stalled (the 224 s POST /contracts observed in the 2026-08-29 wisp log
+// carried no per-phase breakdown, which is what this log fixes). Every duration
+// is in milliseconds; a phase that did not run (e.g. empty userdata) reports 0.
 func (b *broker) provision(ctx context.Context, c contract.Contract, spec launchSpec, userdata string) (contract.Contract, error) {
 	if _, err := b.store.UpdateState(c.ID, contract.StateProvisioning); err != nil {
 		return c, err
 	}
 
+	start := b.now()
+	var (
+		imageMS    int64
+		createMS   int64
+		startMS    int64
+		userdataMS int64
+	)
+
 	// Pull the resolved image on demand so a contract is never blocked from using
 	// an allowed image just because it is not in `docker images` yet.
+	imageStart := b.now()
 	if err := b.rt.EnsureImage(ctx, spec.image); err != nil {
 		b.fail(ctx, c.ID, "")
 		return c, b.mapOSMismatch(err)
 	}
+	imageMS = b.now().Sub(imageStart).Milliseconds()
 
+	createStart := b.now()
 	cid, err := b.rt.Create(ctx, spec.image, createOptions(spec, c, b.rt.ContainerOS()))
 	if err != nil {
 		b.fail(ctx, c.ID, "")
@@ -944,16 +962,20 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, spec launch
 		// OS-aware contract error (see mapOSMismatch). It never switches modes.
 		return c, b.mapOSMismatch(err)
 	}
+	createMS = b.now().Sub(createStart).Milliseconds()
 	if _, err := b.store.SetContainerID(c.ID, cid); err != nil {
 		b.fail(ctx, c.ID, cid)
 		return c, err
 	}
+	startAt := b.now()
 	if err := b.rt.Start(ctx, cid); err != nil {
 		b.fail(ctx, c.ID, cid)
 		return c, err
 	}
+	startMS = b.now().Sub(startAt).Milliseconds()
 
 	if userdata != "" {
+		udStart := b.now()
 		res, err := b.rt.ExecSync(ctx, cid, runtime.ShellCommand(b.rt.ContainerOS(), userdata))
 		if err != nil {
 			b.fail(ctx, c.ID, cid)
@@ -963,6 +985,7 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, spec launch
 			b.fail(ctx, c.ID, cid)
 			return c, &userdataError{ExitCode: res.ExitCode, Stderr: res.Stderr}
 		}
+		userdataMS = b.now().Sub(udStart).Milliseconds()
 	}
 
 	c, err = b.store.UpdateState(c.ID, contract.StateReady)
@@ -970,6 +993,18 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, spec launch
 		b.fail(ctx, c.ID, cid)
 		return c, err
 	}
+
+	b.logger.Info("contract provisioned",
+		"contract_id", c.ID,
+		"image", spec.image,
+		"isolation", string(spec.isolation),
+		"total_ms", b.now().Sub(start).Milliseconds(),
+		"image_ms", imageMS,
+		"create_ms", createMS,
+		"start_ms", startMS,
+		"userdata_ms", userdataMS,
+	)
+
 	// contract.ready tells clients the container is provisioned and they may
 	// exec / open shells freely (see docs/DESIGN.md §4, §6).
 	b.publishLifecycle(eventContractReady, c)
@@ -1098,8 +1133,12 @@ func (b *broker) list(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		// Skip the transient pre-provision state so the list never emits a
-		// "requested" status the wire contract does not document.
-		if c.State == contract.StateRequested {
+		// "requested" status the wire contract does not document. Skip the
+		// transient pre-terminal fence for the same reason: StateReleasing is
+		// internal to the DELETE handler (see release), lives at most for one
+		// container-kill call, and consumers pin the list enum to
+		// provisioning|ready|expiring.
+		if c.State == contract.StateRequested || c.State == contract.StateReleasing {
 			continue
 		}
 		remaining := 0
@@ -1127,15 +1166,27 @@ func (b *broker) list(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// release handles DELETE /contracts/:id: it kills the container and marks the
-// contract released. Releasing an already-terminal contract is an IDEMPOTENT
-// success — the contract IS released in every sense the caller cares about — so
-// a DELETE against an already expired or released lease returns the normal
-// success response, and a reaper that wins the terminal transition between our
-// Get and our UpdateState (the tiny race window live-repro'd on 2026-08-15)
-// resolves the same way rather than 500'ing. It requires either the app token
-// or the contract's own bearer token so a local process without either
-// credential cannot destroy a lease (see authorizedForContract).
+// release handles DELETE /contracts/:id. It fences the reaper off the contract
+// by transitioning it to StateReleasing BEFORE killing the container, then
+// kills the container, then completes the terminal transition to
+// StateReleased. Fencing first is what stops the release from racing the
+// reaper's TTL / container-died sweep: without it the reaper could see the
+// container die (as the release handler's Kill is stopping it), expire the
+// contract, log a spurious "removal already in progress" from its own Kill,
+// and then purge the contract from the store, leaving the release handler's
+// final UpdateState to fail "contract not found" and return 500 (the exact
+// 2026-08-29 wisp-log failure the fence was added for). With the fence in
+// place, the reaper's reap() skips StateReleasing and cannot win.
+//
+// Releasing an already-terminal contract is an IDEMPOTENT success (the
+// contract IS released in every sense the caller cares about) so a DELETE
+// against an already expired or released lease returns the normal success
+// response. So does a DELETE whose fence-installing transition finds the
+// contract has already been purged (ErrNotFound) or the reaper won the
+// terminal transition between our Get and our UpdateState (illegal
+// transition): both resolve as 200 rather than 500. It requires either the
+// app token or the contract's own bearer token so a local process without
+// either credential cannot destroy a lease (see authorizedForContract).
 func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 	c, err := b.store.Get(r.PathValue("id"))
 	if errors.Is(err, contract.ErrNotFound) {
@@ -1155,9 +1206,37 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 	// contract IS released in every sense the caller cares about, and the terminal
 	// transition that took it here already freed capacity and GPUs (the reaper and
 	// the release path both gate their frees on winning the state-machine transition),
-	// so this path must NOT free again.
-	if c.State.Terminal() {
+	// so this path must NOT free again. A concurrent DELETE that already installed
+	// the StateReleasing fence resolves the same way: we let it finish the
+	// terminal transition and echo back its winning state.
+	if c.State.Terminal() || c.State == contract.StateReleasing {
 		writeJSON(w, http.StatusOK, b.statusOf(c))
+		return
+	}
+
+	// Install the release fence BEFORE killing the container so the reaper's
+	// tick cannot expire this contract while we are tearing it down (see
+	// reaper.reap: StateReleasing short-circuits every sweep). A transition
+	// failure here maps to an idempotent-success path: the reaper already won
+	// the terminal transition (illegal transition, echo its authoritative
+	// state), or the contract was purged out of band (ErrNotFound, synthesize
+	// a released status for the caller).
+	if _, err := b.store.UpdateState(c.ID, contract.StateReleasing); err != nil {
+		if errors.Is(err, contract.ErrNotFound) {
+			writeJSON(w, http.StatusOK, b.releasedStatusFor(c))
+			return
+		}
+		var illegal *contract.IllegalTransitionError
+		if errors.As(err, &illegal) {
+			if cur, gerr := b.store.Get(c.ID); gerr == nil {
+				writeJSON(w, http.StatusOK, b.statusOf(cur))
+				return
+			}
+			writeJSON(w, http.StatusOK, b.releasedStatusFor(c))
+			return
+		}
+		b.logger.Error("mark contract releasing", "contract_id", c.ID, "error", err)
+		writeError(w, http.StatusInternalServerError, "could not release contract")
 		return
 	}
 
@@ -1169,14 +1248,15 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 
 	updated, err := b.store.UpdateState(c.ID, contract.StateReleased)
 	if err != nil {
-		// The reaper raced us to a terminal transition between our Get above and
-		// this UpdateState (the tiny window observed in the 2026-08-15 failure
-		// drill). Treat it as an idempotent success — the contract IS released as
-		// far as the caller is concerned — and DO NOT double-free capacity or
-		// GPUs: the reaper's winning transition already freed both (its expire
-		// path gates ReleaseCapacity on the winning transition and Free-releases
-		// GPUs idempotently). Mirror the response back from the store so the
-		// caller sees the authoritative terminal state, not our stale copy.
+		// The fence should have prevented a concurrent reaper from touching this
+		// contract, so an error here means it was purged out of band. Treat it as
+		// an idempotent success (the caller wanted the contract gone and it IS
+		// gone) and DO NOT double-free capacity or GPUs (the winning terminal
+		// transition, wherever it happened, already accounted for both).
+		if errors.Is(err, contract.ErrNotFound) {
+			writeJSON(w, http.StatusOK, b.releasedStatusFor(c))
+			return
+		}
 		var illegal *contract.IllegalTransitionError
 		if errors.As(err, &illegal) {
 			if cur, gerr := b.store.Get(c.ID); gerr == nil && cur.State.Terminal() {
@@ -1201,6 +1281,23 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 	// docs/DESIGN.md §6). The reaper announces contract.expiring / contract.expired.
 	b.publishLifecycle(eventContractReleased, updated)
 	writeJSON(w, http.StatusOK, b.statusOf(updated))
+}
+
+// releasedStatusFor synthesizes a released-status response for a contract that
+// has been purged from the store between the release handler's Get and its
+// UpdateState. The pre-fence snapshot carries the id, gpus, meta, and
+// external_id the caller expects; the status is forced to StateReleased so
+// the response wire shape stays inside the documented terminal set even when
+// the store no longer has a row to read back.
+func (b *broker) releasedStatusFor(c contract.Contract) statusResponse {
+	return statusResponse{
+		ContractID:          c.ID,
+		Status:              string(contract.StateReleased),
+		TTLSecondsRemaining: 0,
+		Gpus:                c.GPUDeviceIDs,
+		Meta:                c.Meta,
+		ExternalID:          c.ExternalID,
+	}
 }
 
 // execRequest is the POST /contracts/:id/exec body (see docs/DESIGN.md §5). The

@@ -360,7 +360,7 @@ func TestExecStreamClientDisconnect(t *testing.T) {
 func TestExecStreamNotReady(t *testing.T) {
 	h, store, _ := testServer(t)
 	created := createContract(t, h, `{"ttl_seconds":3600}`)
-	if _, err := store.UpdateState(created.ContractID, contract.StateReleased); err != nil {
+	if _, err := store.UpdateState(created.ContractID, contract.StateExpired); err != nil {
 		t.Fatalf("UpdateState: %v", err)
 	}
 	rec := doAuth(t, h, http.MethodPost, "/contracts/"+created.ContractID+"/exec?stream=1",
@@ -404,8 +404,8 @@ func TestExecNotReady(t *testing.T) {
 	h, store, _ := testServer(t)
 	created := createContract(t, h, `{"ttl_seconds":3600}`)
 
-	// Release the contract so it is no longer ready.
-	if _, err := store.UpdateState(created.ContractID, contract.StateReleased); err != nil {
+	// Move the contract to a terminal state so it is no longer ready.
+	if _, err := store.UpdateState(created.ContractID, contract.StateExpired); err != nil {
 		t.Fatalf("UpdateState: %v", err)
 	}
 
@@ -819,13 +819,14 @@ func TestDeleteReleasedContractIsIdempotentNoop(t *testing.T) {
 	}
 }
 
-// The reaper-race scenario: the reaper wins the terminal transition BETWEEN the
-// release handler's Kill and its UpdateState — the tiny window
-// live-repro'd in the 2026-08-16 failure drill. Modeled by wrapping the fake
-// runtime with a hook that expires the contract (and frees its capacity, as the
-// reaper's expire path does gated on the winning transition) during the Kill
-// call. The DELETE must return success rather than 500, and capacity must not
-// be double-freed.
+// TestDeleteRaceWithReaperExpirySucceeds pins the fence behaviour that
+// motivated the 2026-08-29 wisp-log fix: while DELETE is killing the
+// container, a concurrent reaper attempt to expire this contract must not
+// win, because the release handler has installed the StateReleasing fence so the
+// reaper's transition to StateExpired is illegal from StateReleasing and its
+// capacity-free is gated on winning that transition, so it never runs. The
+// DELETE finishes as StateReleased, the caller sees 200, and capacity is
+// freed exactly once (by the release path).
 func TestDeleteRaceWithReaperExpirySucceeds(t *testing.T) {
 	store := contract.NewStore()
 	fake := runtime.NewFake()
@@ -840,11 +841,15 @@ func TestDeleteRaceWithReaperExpirySucceeds(t *testing.T) {
 			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
 	}
 
-	// During Kill, force the reaper's expire to win: transition the contract to
-	// expired and free its capacity (exactly as reaper.expire does gated on the
-	// winning transition). Only fire once so a second, unrelated Kill call
-	// (e.g. from a subsequent test action) does not re-run the hook.
-	var raced bool
+	// During Kill, model a concurrent reaper tick that tries to expire this
+	// contract (kill + transition + gated capacity free). The state-machine
+	// gate must reject the reaper's transition because StateReleasing was
+	// already installed by the release handler above, so no capacity is freed
+	// from this side and the reaper's contract-purge does not run either.
+	var (
+		raced             bool
+		reaperTransitionErr error
+	)
 	rt.onKill = func(id string) {
 		if raced {
 			return
@@ -855,35 +860,229 @@ func TestDeleteRaceWithReaperExpirySucceeds(t *testing.T) {
 			t.Errorf("simulated reaper: get contract: %v", err)
 			return
 		}
+		// The reaper's expire path would call UpdateState(StateExpired) here,
+		// gated on winning the transition. With the release fence in place,
+		// this must fail as an illegal transition (StateReleasing has only
+		// StateReleased as a legal successor).
 		if _, err := store.UpdateState(c.ID, contract.StateExpired); err != nil {
-			t.Errorf("simulated reaper: update state to expired: %v", err)
+			reaperTransitionErr = err
 			return
 		}
+		// If we reach here the fence failed; free capacity so the assertions
+		// below catch the double-free.
 		b.cap.Free(c.ReservedCPUs, c.ReservedMemoryMB)
 	}
 
 	rec := do(t, mux, http.MethodDelete, "/contracts/"+created.ContractID, "")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("DELETE status = %d, want 200 (reaper race must resolve as idempotent success) (body: %s)",
-			rec.Code, rec.Body.String())
+		t.Fatalf("DELETE status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
 	}
 	if !raced {
 		t.Fatal("Kill hook did not fire; the race scenario was not exercised")
+	}
+	if reaperTransitionErr == nil {
+		t.Fatal("simulated reaper transition to expired succeeded; the release fence did not block it")
+	}
+	var illegal *contract.IllegalTransitionError
+	if !errors.As(reaperTransitionErr, &illegal) {
+		t.Fatalf("simulated reaper transition error = %v, want IllegalTransitionError from the release fence", reaperTransitionErr)
+	}
+	if illegal.From != contract.StateReleasing || illegal.To != contract.StateExpired {
+		t.Fatalf("illegal transition = %s → %s, want releasing → expired", illegal.From, illegal.To)
 	}
 	var got statusResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got.Status != string(contract.StateExpired) {
-		t.Errorf("status = %q, want expired (release path echoes the reaper's winning state)", got.Status)
+	if got.Status != string(contract.StateReleased) {
+		t.Errorf("status = %q, want released (release wins under the fence)", got.Status)
 	}
 	if b.cap.ActiveContracts() != 0 || b.cap.UsedCPUs() != 0 || b.cap.UsedMemoryMB() != 0 {
-		t.Errorf("usage after raced DELETE = {%d, %v, %d}, want all zero (no double free by loser)",
+		t.Errorf("usage after DELETE = {%d, %v, %d}, want all zero (release freed capacity exactly once)",
 			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
 	}
 	final, _ := store.Get(created.ContractID)
-	if final.State != contract.StateExpired {
-		t.Errorf("stored state = %q, want expired (reaper won the transition)", final.State)
+	if final.State != contract.StateReleased {
+		t.Errorf("stored state = %q, want released (release wins under the fence)", final.State)
+	}
+}
+
+// TestDeleteRaceWithReaperPurgeSucceeds pins the exact 2026-08-29 wisp-log
+// failure: the DELETE handler's Kill is running, the reaper tick sees the
+// container dead before its TTL, expires the contract, and then purges it
+// on the next sweep, leaving the DELETE handler's final mark-released to
+// return ErrNotFound and 500. The fence prevents this from happening under
+// normal conditions (the reaper skips StateReleasing), but for robustness
+// the release handler must ALSO tolerate a purged contract as an
+// idempotent success. This test drives that path by simulating the purge
+// during Kill (the fence would normally stop it, but here we simulate the
+// purge to prove the ErrNotFound branch responds with 200).
+func TestDeleteHandlesContractPurgedDuringKillAsSuccess(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	rt := &killHookRuntime{Runtime: fake}
+	b := newBroker(store, rt, budgetPolicy(0, 4, 512), bus.New(nil), discardLogger(), "")
+	mux := http.NewServeMux()
+	b.routes(mux)
+
+	created := createContract(t, mux, `{"ttl_seconds":600,"resources":{"cpus":2,"memory_mb":256}}`)
+
+	// While Kill runs, simulate the reaper's cleanup sweep purging the
+	// contract from the store (as it does one tick after a terminal
+	// transition). This is a defence-in-depth path: the release fence
+	// stops the reaper from transitioning in the first place, but if for
+	// any reason the contract is missing when the release handler's
+	// mark-released fires, the caller must still see 200, not 500.
+	var purged bool
+	rt.onKill = func(id string) {
+		if purged {
+			return
+		}
+		purged = true
+		if err := store.Delete(created.ContractID); err != nil {
+			t.Errorf("simulated purge: delete contract: %v", err)
+		}
+	}
+
+	rec := do(t, mux, http.MethodDelete, "/contracts/"+created.ContractID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE status = %d, want 200 (purged-during-kill must resolve as idempotent success) (body: %s)",
+			rec.Code, rec.Body.String())
+	}
+	if !purged {
+		t.Fatal("Kill hook did not fire; the purge-during-kill scenario was not exercised")
+	}
+	var got statusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Status != string(contract.StateReleased) {
+		t.Errorf("status = %q, want released (synthesized after purge)", got.Status)
+	}
+	if got.ContractID != created.ContractID {
+		t.Errorf("contract_id = %q, want %q (synthesized status carries the id)", got.ContractID, created.ContractID)
+	}
+}
+
+// TestDeleteReaperFiresBetweenKillAndMarkReleased reproduces the exact
+// 2026-08-29 wisp-log failure end to end using a real reaper.Tick fired
+// during the DELETE handler's Kill call. The Kill hook drives one full
+// reaper tick against the SAME store and runtime the DELETE is using; with
+// the release fence in place the reaper's transition to StateExpired must
+// be rejected (illegal from StateReleasing) and its Kill of the same
+// container is safe (the runtime's remove-in-progress conflict maps to
+// success on the DockerRuntime; the fake tolerates a repeated Kill), so
+// the DELETE finishes 200 released rather than 500 "mark contract released:
+// contract not found".
+func TestDeleteReaperFiresBetweenKillAndMarkReleased(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	rt := &killHookRuntime{Runtime: fake}
+	b := newBroker(store, rt, budgetPolicy(0, 4, 512), bus.New(nil), discardLogger(), "")
+	mux := http.NewServeMux()
+	b.routes(mux)
+
+	created := createContract(t, mux, `{"ttl_seconds":600,"resources":{"cpus":2,"memory_mb":256}}`)
+	c, _ := store.Get(created.ContractID)
+
+	// The reaper is wired to see the container as gone the moment the DELETE's
+	// Kill fires (matching the "container dead before TTL" signal from the
+	// bug log). One real reaper tick runs during the Kill hook, against the
+	// same store the DELETE is using, so all serialization is real. Only
+	// fire once so subsequent Kill calls (e.g. from a follow-up release path)
+	// do not re-enter the hook.
+	fake.InspectOverrides = map[string]runtime.LivenessState{c.ContainerID: runtime.LivenessGone}
+	rp := reaper.New(store, rt, reaper.Options{
+		Logger: discardLogger(),
+		Now:    func() time.Time { return c.ExpiresAt.Add(-time.Hour) }, // before TTL
+		ReleaseCapacity: func(contract.Contract) {
+			t.Errorf("reaper freed capacity while the release fence was held")
+		},
+	})
+	var ticked bool
+	rt.onKill = func(id string) {
+		if ticked {
+			return
+		}
+		ticked = true
+		rp.Tick(context.Background())
+	}
+
+	rec := do(t, mux, http.MethodDelete, "/contracts/"+created.ContractID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE status = %d, want 200 (the 2026-08-29 500 regression must stay fixed) (body: %s)",
+			rec.Code, rec.Body.String())
+	}
+	if !ticked {
+		t.Fatal("reaper tick did not fire during the DELETE's Kill; the race scenario was not exercised")
+	}
+	var got statusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Status != string(contract.StateReleased) {
+		t.Errorf("status = %q, want released (release wins under the fence)", got.Status)
+	}
+	final, _ := store.Get(created.ContractID)
+	if final.State != contract.StateReleased {
+		t.Errorf("stored state = %q, want released", final.State)
+	}
+	if b.cap.ActiveContracts() != 0 || b.cap.UsedCPUs() != 0 || b.cap.UsedMemoryMB() != 0 {
+		t.Errorf("usage after DELETE = {%d, %v, %d}, want all zero (capacity freed exactly once)",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+}
+
+// TestDeleteFenceBlocksReaperTick pins the fence behaviour end to end: a
+// real reaper.Tick against a contract in StateReleasing must be a no-op
+// (no Kill, no transition), so a DELETE in progress against the same
+// contract completes cleanly.
+func TestDeleteFenceBlocksReaperTick(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+
+	// Adopt a ready contract with a live container and a TTL in the past, so
+	// the reaper would ordinarily expire it on the very next tick.
+	past := time.Unix(1_000_000_000, 0)
+	cid, err := fake.Create(context.Background(), "wisp-base", runtime.CreateOptions{})
+	if err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+	if err := fake.Start(context.Background(), cid); err != nil {
+		t.Fatalf("fake.Start: %v", err)
+	}
+	adopted, err := store.Adopt(contract.AdoptParams{
+		ID:          "fenced-contract",
+		ContainerID: cid,
+		ExpiresAt:   past,
+	})
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	// Install the release fence directly, as the DELETE handler would.
+	if _, err := store.UpdateState(adopted.ID, contract.StateReleasing); err != nil {
+		t.Fatalf("UpdateState releasing: %v", err)
+	}
+
+	rp := reaper.New(store, fake, reaper.Options{
+		Logger: discardLogger(),
+		Now:    func() time.Time { return past.Add(time.Hour) },
+		Notify: func(e reaper.Event) {
+			t.Errorf("reaper transitioned a releasing contract: %+v", e)
+		},
+	})
+	rp.Tick(context.Background())
+
+	got, err := store.Get(adopted.ID)
+	if err != nil {
+		t.Fatalf("Get after tick: %v", err)
+	}
+	if got.State != contract.StateReleasing {
+		t.Errorf("state after reaper tick = %q, want releasing (fence must hold)", got.State)
+	}
+	if _, ok := fake.Container(cid); !ok {
+		t.Error("container killed by reaper despite the release fence; want alive")
 	}
 }
 
@@ -953,6 +1152,54 @@ func TestCreateUserdataFailure(t *testing.T) {
 	}
 	if all[0].State != contract.StateExpired {
 		t.Errorf("state = %q, want expired after failed userdata", all[0].State)
+	}
+}
+
+// TestCreateEmitsStructuredProvisionLog verifies a successful create emits a
+// single structured "contract provisioned" log line with per-phase durations
+// (image ensure, container create, start, userdata) plus a total, so an
+// operator can pin a slow create to the specific phase that stalled. Motivated
+// by the 224 s POST /contracts in the 2026-08-29 wisp log, which carried no
+// per-phase breakdown.
+func TestCreateEmitsStructuredProvisionLog(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	h := New(logger, store, fake, policy.Default(), bus.New(nil), "")
+
+	created := createContract(t, h, `{"ttl_seconds":3600,"userdata":"echo hi"}`)
+
+	out := logs.String()
+	if !strings.Contains(out, "contract provisioned") {
+		t.Fatalf("missing structured provision log; logs:\n%s", out)
+	}
+	if !strings.Contains(out, "contract_id="+created.ContractID) {
+		t.Errorf("missing contract_id in provision log; logs:\n%s", out)
+	}
+	for _, key := range []string{"image_ms=", "create_ms=", "start_ms=", "userdata_ms=", "total_ms="} {
+		if !strings.Contains(out, key) {
+			t.Errorf("missing %q phase-duration key in provision log; logs:\n%s", key, out)
+		}
+	}
+}
+
+// TestCreateProvisionLogUserdataMSZeroWhenAbsent verifies the per-phase log's
+// userdata_ms is 0 (not omitted, not the total) when the create carried no
+// userdata script, so a caller looking at the field never confuses "phase
+// skipped" with "phase took a long time".
+func TestCreateProvisionLogUserdataMSZeroWhenAbsent(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	h := New(logger, store, fake, policy.Default(), bus.New(nil), "")
+
+	createContract(t, h, `{"ttl_seconds":3600}`)
+
+	out := logs.String()
+	if !strings.Contains(out, "userdata_ms=0") {
+		t.Errorf("userdata_ms should be 0 when no userdata was run; logs:\n%s", out)
 	}
 }
 
@@ -1839,7 +2086,7 @@ func TestImagesCapacityActiveContracts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if _, err := store.UpdateState(term.ID, contract.StateReleased); err != nil {
+	if _, err := store.UpdateState(term.ID, contract.StateExpired); err != nil {
 		t.Fatalf("UpdateState: %v", err)
 	}
 
@@ -1990,8 +2237,8 @@ func TestListContractsReturnsNonTerminalShape(t *testing.T) {
 
 	// A terminal contract must never appear.
 	terminal := createContract(t, h, `{"ttl_seconds":3600}`)
-	if _, err := store.UpdateState(terminal.ContractID, contract.StateReleased); err != nil {
-		t.Fatalf("UpdateState released: %v", err)
+	if _, err := store.UpdateState(terminal.ContractID, contract.StateExpired); err != nil {
+		t.Fatalf("UpdateState expired: %v", err)
 	}
 
 	rec := do(t, h, http.MethodGet, "/contracts", "")
@@ -2435,8 +2682,8 @@ func TestListExcludesTerminalAndReaperSweepDeletes(t *testing.T) {
 
 	// Drive the second one to a terminal state directly. GET /contracts must
 	// filter it out even though it is still in the store.
-	if _, err := store.UpdateState(terminal.ContractID, contract.StateReleased); err != nil {
-		t.Fatalf("UpdateState released: %v", err)
+	if _, err := store.UpdateState(terminal.ContractID, contract.StateExpired); err != nil {
+		t.Fatalf("UpdateState expired: %v", err)
 	}
 
 	rec := do(t, h, http.MethodGet, "/contracts", "")

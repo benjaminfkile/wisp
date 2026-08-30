@@ -222,8 +222,17 @@ func (r *Reaper) Tick(ctx context.Context) {
 // on the same path, so its capacity and GPUs return to the allocators within a
 // few ticks rather than at TTL expiry. The two expire paths tag their
 // transition with distinct Reason values so the bus can tell them apart.
+//
+// A contract in StateReleasing is skipped entirely: the DELETE handler owns
+// that fence and is in the middle of killing the container, so touching it
+// here would double-kill the container ("removal already in progress"),
+// expire-and-purge it from under the handler, and turn the DELETE into a 500
+// (the 2026-08-29 wisp-log failure the fence was added for).
 func (r *Reaper) reap(ctx context.Context, c contract.Contract) {
 	if c.State.Terminal() {
+		return
+	}
+	if c.State == contract.StateReleasing {
 		return
 	}
 	now := r.now()

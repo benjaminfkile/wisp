@@ -17,11 +17,16 @@ import (
 // State is a point in a contract's lifecycle. The legal progression (see
 // docs/DESIGN.md §4) is:
 //
-//	requested → provisioning → ready → expiring → released | expired
+//	requested → provisioning → ready → expiring → releasing → released
+//	                                                        ↘ expired
 //
-// released and expired are terminal (the container is destroyed). A DELETE may
-// release the contract early from any active state; the TTL reaper may expire
-// it from any state where a container exists.
+// released and expired are terminal (the container is destroyed). A DELETE
+// first fences the reaper off the contract by transitioning it to
+// StateReleasing before killing the container, and only after the container
+// is torn down does it complete the terminal transition to StateReleased.
+// The TTL reaper may expire an active contract from any state where a
+// container exists, but skips StateReleasing so it cannot race the release
+// handler.
 type State string
 
 const (
@@ -40,6 +45,17 @@ const (
 	// TTL, giving the client a chance to exfiltrate work before the hard kill.
 	StateExpiring State = "expiring"
 
+	// StateReleasing is the transient fence the DELETE handler installs BEFORE
+	// killing the container: taking it holds a per-contract lock over the tear
+	// down window so the reaper's TTL / container-died sweeps cannot race the
+	// release, double-kill the container ("removal already in progress"), and
+	// then expire-and-purge the contract from under the handler (the exact
+	// 2026-08-29 wisp-log 500 the state was added for). Only StateReleased is
+	// a legal successor, which is what serializes the terminal side effects
+	// (freeing capacity and GPUs, publishing contract.released) to exactly
+	// one caller.
+	StateReleasing State = "releasing"
+
 	// StateReleased is terminal: the client called DELETE and the container
 	// was destroyed.
 	StateReleased State = "released"
@@ -54,22 +70,27 @@ const (
 var legalTransitions = map[State]map[State]bool{
 	StateRequested: {
 		StateProvisioning: true,
-		StateReleased:     true, // DELETE before a container is booted
+		StateReleasing:    true, // DELETE before a container is booted
 		StateExpired:      true, // provisioning never got off the ground
 	},
 	StateProvisioning: {
-		StateReady:    true,
-		StateReleased: true, // DELETE mid-provision
-		StateExpired:  true, // userdata failed, or TTL elapsed
+		StateReady:     true,
+		StateReleasing: true, // DELETE mid-provision
+		StateExpired:   true, // userdata failed, or TTL elapsed
 	},
 	StateReady: {
-		StateExpiring: true,
-		StateReleased: true, // DELETE while in use
-		StateExpired:  true, // TTL elapsed with no lead-time warning
+		StateExpiring:  true,
+		StateReleasing: true, // DELETE while in use
+		StateExpired:   true, // TTL elapsed with no lead-time warning
 	},
 	StateExpiring: {
-		StateReleased: true, // client released after the warning
-		StateExpired:  true, // TTL elapsed
+		StateReleasing: true, // client released after the warning
+		StateExpired:   true, // TTL elapsed
+	},
+	StateReleasing: {
+		// Only the DELETE handler's final "mark released" can leave the fence;
+		// the reaper skips StateReleasing so it cannot expire this contract.
+		StateReleased: true,
 	},
 	// StateReleased and StateExpired are terminal: no outgoing transitions.
 	StateReleased: {},

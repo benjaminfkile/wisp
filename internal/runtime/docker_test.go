@@ -445,4 +445,19 @@ func TestDockerRuntimeKillMapsNotFound(t *testing.T) {
 			t.Fatalf("Kill = %v, want nil on a successful remove", err)
 		}
 	})
+
+	// A "removal already in progress" 409 from the daemon (the shape produced
+	// when the release handler and the reaper's container-died sweep both call
+	// Kill on the same container) is treated as success: the container is being
+	// torn down either way. The regression it pins is a Kill implementation that
+	// wrapped the conflict error and returned it, so the reaper logged a
+	// spurious "reaper: kill container" ERROR every time the release path won
+	// the race.
+	t.Run("docker conflict maps to success", func(t *testing.T) {
+		stub := &killStubClient{removeErr: errdefs.Conflict(errors.New("removal of container abc is already in progress"))}
+		d := NewDockerRuntimeWithClient(stub)
+		if err := d.Kill(ctx, "abc"); err != nil {
+			t.Fatalf("Kill = %v, want nil when the daemon reports removal already in progress", err)
+		}
+	})
 }

@@ -281,8 +281,13 @@ func TestReaperSkipsTerminalAndUntimely(t *testing.T) {
 	store := contract.NewStore()
 	fake := runtime.NewFake()
 
-	// Released (terminal) contract past its TTL: must be left alone.
+	// Released (terminal) contract past its TTL: must be left alone. The
+	// contract lifecycle routes releases through StateReleasing before
+	// StateReleased, so the test walks the same fence.
 	released, releasedCID := readyContract(t, store, fake, time.Hour)
+	if _, err := store.UpdateState(released.ID, contract.StateReleasing); err != nil {
+		t.Fatalf("UpdateState releasing: %v", err)
+	}
 	if _, err := store.UpdateState(released.ID, contract.StateReleased); err != nil {
 		t.Fatalf("UpdateState released: %v", err)
 	}
@@ -605,6 +610,137 @@ func (dockerNotFoundStubClient) ContainerInspect(context.Context, string) (docke
 
 func (dockerNotFoundStubClient) ContainerRemove(context.Context, string, dockercontainer.RemoveOptions) error {
 	return errdefs.NotFound(errors.New("No such container"))
+}
+
+// dockerConflictStubClient is the "removal already in progress" shape a live
+// daemon returns when two Kill calls race on the same container (typically the
+// release handler and the reaper's container-died sweep). Reaper's Kill must
+// tolerate the conflict as success (the container IS being torn down, which is
+// what Kill wanted) so it does not log a spurious ERROR every time the release
+// path wins the race.
+type dockerConflictStubClient struct {
+	dockerclient.APIClient
+}
+
+func (dockerConflictStubClient) Info(context.Context) (system.Info, error) {
+	return system.Info{OSType: "linux"}, nil
+}
+
+func (dockerConflictStubClient) ContainerInspect(context.Context, string) (dockertypes.ContainerJSON, error) {
+	// Report the container as stopped so the reaper's containerDied check picks
+	// it up and drives the expire path (which calls Kill).
+	return dockertypes.ContainerJSON{ContainerJSONBase: &dockertypes.ContainerJSONBase{State: &dockertypes.ContainerState{Running: false}}}, nil
+}
+
+func (dockerConflictStubClient) ContainerRemove(context.Context, string, dockercontainer.RemoveOptions) error {
+	return errdefs.Conflict(errors.New("removal of container abc is already in progress"))
+}
+
+// TestReaperNoErrorLogOnDockerConflictKill: when the release handler and the
+// reaper's container-died sweep race on the same container, the daemon replies
+// to the second Kill with a 409 conflict ("removal already in progress"). Kill
+// treats that as success so the reaper never logs a spurious ERROR on the
+// race. Uses a real DockerRuntime backed by a stub client so the mapping is
+// exercised end to end (the fake runtime never returns conflicts).
+func TestReaperNoErrorLogOnDockerConflictKill(t *testing.T) {
+	store := contract.NewStore()
+	rt := runtime.NewDockerRuntimeWithClient(dockerConflictStubClient{})
+
+	future := time.Unix(2_000_000_000, 0)
+	adopted, err := store.Adopt(contract.AdoptParams{
+		ID:          "conflicting-contract",
+		ContainerID: "abc",
+		ExpiresAt:   future,
+	})
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	rp := New(store, rt, Options{
+		Lead:   time.Minute,
+		Logger: logger,
+		// Well before the TTL: only the container-died signal (via Inspect) can
+		// trigger the reap.
+		Now: func() time.Time { return future.Add(-time.Hour) },
+	})
+
+	rp.Tick(context.Background())
+
+	if got, _ := store.Get(adopted.ID); got.State != contract.StateExpired {
+		t.Fatalf("state = %q, want expired after container-died reap", got.State)
+	}
+	out := logs.String()
+	if strings.Contains(out, "level=ERROR") {
+		t.Errorf("reaper logged an ERROR on a racing Kill; the docker conflict must map to success. logs:\n%s", out)
+	}
+	if strings.Contains(out, "reaper: kill container") {
+		t.Errorf("reaper logged a kill-container error message; want silent tolerance on a conflict race. logs:\n%s", out)
+	}
+}
+
+// TestReaperSkipsReleasingContract pins the release-fence contract from the
+// reaper side: a contract in StateReleasing must never be reaped (no Kill,
+// no transition) because the DELETE handler owns that fence and is in the
+// middle of tearing the container down. Without this skip the reaper would
+// double-kill the container and then purge the contract from under the
+// DELETE handler, turning it into a 500 (the 2026-08-29 wisp-log failure).
+func TestReaperSkipsReleasingContract(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	ctx := context.Background()
+
+	// A live container behind a contract now in StateReleasing whose TTL has
+	// already elapsed. Both reap-triggering signals (TTL past + container
+	// stopped) are simulated below so the test can catch either path if the
+	// skip fails.
+	past := time.Unix(1_000_000_000, 0)
+	cid, err := fake.Create(ctx, "wisp-base", runtime.CreateOptions{})
+	if err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+	if err := fake.Start(ctx, cid); err != nil {
+		t.Fatalf("fake.Start: %v", err)
+	}
+	c, err := store.Adopt(contract.AdoptParams{
+		ID:          "releasing-contract",
+		ContainerID: cid,
+		ExpiresAt:   past,
+	})
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if _, err := store.UpdateState(c.ID, contract.StateReleasing); err != nil {
+		t.Fatalf("UpdateState releasing: %v", err)
+	}
+	// Also force the container into a stopped shape via the fake, so the reap
+	// path would fire on either signal (TTL past OR container died).
+	fake.InspectOverrides = map[string]runtime.LivenessState{cid: runtime.LivenessStopped}
+
+	rp := New(store, fake, Options{
+		Lead:   time.Minute,
+		Logger: discardLogger(),
+		Now:    func() time.Time { return past.Add(time.Hour) },
+		Notify: func(e Event) {
+			t.Errorf("reaper transitioned a releasing contract: %+v", e)
+		},
+		ReleaseCapacity: func(contract.Contract) {
+			t.Errorf("reaper freed capacity for a releasing contract")
+		},
+	})
+	rp.Tick(ctx)
+
+	got, err := store.Get(c.ID)
+	if err != nil {
+		t.Fatalf("Get after tick: %v", err)
+	}
+	if got.State != contract.StateReleasing {
+		t.Errorf("state = %q, want releasing (fence must hold across a tick)", got.State)
+	}
+	if _, ok := fake.Container(cid); !ok {
+		t.Error("reaper killed the container of a releasing contract; the fence must forbid it")
+	}
 }
 
 // TestReaperNoErrorLogOnDockerNotFoundKill covers AC 215: a container the

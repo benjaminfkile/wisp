@@ -7,14 +7,15 @@ import "testing"
 func TestStateTransitions(t *testing.T) {
 	all := []State{
 		StateRequested, StateProvisioning, StateReady,
-		StateExpiring, StateReleased, StateExpired,
+		StateExpiring, StateReleasing, StateReleased, StateExpired,
 	}
 
 	legal := map[State]map[State]bool{
-		StateRequested:    {StateProvisioning: true, StateReleased: true, StateExpired: true},
-		StateProvisioning: {StateReady: true, StateReleased: true, StateExpired: true},
-		StateReady:        {StateExpiring: true, StateReleased: true, StateExpired: true},
-		StateExpiring:     {StateReleased: true, StateExpired: true},
+		StateRequested:    {StateProvisioning: true, StateReleasing: true, StateExpired: true},
+		StateProvisioning: {StateReady: true, StateReleasing: true, StateExpired: true},
+		StateReady:        {StateExpiring: true, StateReleasing: true, StateExpired: true},
+		StateExpiring:     {StateReleasing: true, StateExpired: true},
+		StateReleasing:    {StateReleased: true},
 		StateReleased:     {},
 		StateExpired:      {},
 	}
@@ -32,7 +33,7 @@ func TestStateTransitions(t *testing.T) {
 // TestHappyPath walks the canonical lifecycle end to end.
 func TestHappyPath(t *testing.T) {
 	path := []State{
-		StateRequested, StateProvisioning, StateReady, StateExpiring, StateReleased,
+		StateRequested, StateProvisioning, StateReady, StateExpiring, StateReleasing, StateReleased,
 	}
 	for i := 0; i+1 < len(path); i++ {
 		if !path[i].CanTransition(path[i+1]) {
@@ -51,9 +52,12 @@ func TestTerminalStates(t *testing.T) {
 	if StateReady.Terminal() {
 		t.Error("ready should not be terminal")
 	}
+	if StateReleasing.Terminal() {
+		t.Error("releasing should not be terminal (the transient fence before released)")
+	}
 
 	// No transitions out of a terminal state.
-	for _, to := range []State{StateRequested, StateProvisioning, StateReady, StateExpiring, StateReleased, StateExpired} {
+	for _, to := range []State{StateRequested, StateProvisioning, StateReady, StateExpiring, StateReleasing, StateReleased, StateExpired} {
 		if StateReleased.CanTransition(to) {
 			t.Errorf("released → %s should be illegal", to)
 		}
@@ -64,9 +68,23 @@ func TestTerminalStates(t *testing.T) {
 }
 
 func TestNoSelfTransition(t *testing.T) {
-	for _, s := range []State{StateRequested, StateProvisioning, StateReady, StateExpiring} {
+	for _, s := range []State{StateRequested, StateProvisioning, StateReady, StateExpiring, StateReleasing} {
 		if s.CanTransition(s) {
 			t.Errorf("self-transition %s → %s should be illegal", s, s)
 		}
+	}
+}
+
+// StateReleasing may only leave to StateReleased: the reaper's expired
+// transition, or any other move, is illegal so the fence guarantees the
+// DELETE handler is the sole owner of the terminal transition.
+func TestReleasingOnlyGoesToReleased(t *testing.T) {
+	for _, to := range []State{StateRequested, StateProvisioning, StateReady, StateExpiring, StateReleasing, StateExpired} {
+		if StateReleasing.CanTransition(to) {
+			t.Errorf("releasing → %s should be illegal", to)
+		}
+	}
+	if !StateReleasing.CanTransition(StateReleased) {
+		t.Error("releasing → released should be legal")
 	}
 }

@@ -153,6 +153,56 @@ func TestStoreUpdateStateLegal(t *testing.T) {
 	}
 }
 
+// TestStoreUpdateStateStampsReleasingSince: a winning transition into
+// StateReleasing stamps ReleasingSince from the store's clock so the reaper's
+// release-grace check has an authoritative timestamp for the fence going up.
+// Other transitions do not touch the field.
+func TestStoreUpdateStateStampsReleasingSince(t *testing.T) {
+	s := NewStore()
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var n int
+	s.now = func() time.Time { d := base.Add(time.Duration(n) * time.Second); n++; return d }
+
+	c, err := s.Create(CreateParams{TTL: time.Hour})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !c.ReleasingSince.IsZero() {
+		t.Errorf("fresh contract ReleasingSince = %v, want zero", c.ReleasingSince)
+	}
+
+	if _, err := s.UpdateState(c.ID, StateProvisioning); err != nil {
+		t.Fatalf("UpdateState provisioning: %v", err)
+	}
+	got, _ := s.Get(c.ID)
+	if !got.ReleasingSince.IsZero() {
+		t.Errorf("ReleasingSince = %v after provisioning, want zero", got.ReleasingSince)
+	}
+
+	if _, err := s.UpdateState(c.ID, StateReady); err != nil {
+		t.Fatalf("UpdateState ready: %v", err)
+	}
+	if _, err := s.UpdateState(c.ID, StateReleasing); err != nil {
+		t.Fatalf("UpdateState releasing: %v", err)
+	}
+	got, _ = s.Get(c.ID)
+	if got.ReleasingSince.IsZero() {
+		t.Fatal("ReleasingSince = zero after releasing, want the store's now at transition")
+	}
+	stamped := got.ReleasingSince
+
+	// A subsequent transition off the fence must not clobber the stamp: the
+	// reaper reads it after the terminal transition too when logging why it
+	// expired a stuck release.
+	if _, err := s.UpdateState(c.ID, StateReleased); err != nil {
+		t.Fatalf("UpdateState released: %v", err)
+	}
+	got, _ = s.Get(c.ID)
+	if !got.ReleasingSince.Equal(stamped) {
+		t.Errorf("ReleasingSince = %v after released, want unchanged from %v", got.ReleasingSince, stamped)
+	}
+}
+
 func TestStoreUpdateStateIllegal(t *testing.T) {
 	s := NewStore()
 	c, _ := s.Create(CreateParams{TTL: time.Hour})

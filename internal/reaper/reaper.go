@@ -32,6 +32,14 @@ const (
 	// defaultLead is how long before the TTL a ready contract is warned by
 	// moving it to expiring.
 	defaultLead = time.Minute
+
+	// defaultReleaseGrace is how long a contract may sit in StateReleasing
+	// before the reaper stops skipping it. Inside the window the DELETE handler
+	// owns the tear down (see reap); past it the release is presumed stuck (the
+	// handler crashed mid-release, or its Kill hung) and the reaper expires the
+	// contract so its capacity and GPUs return to the allocators instead of
+	// leaking until restart.
+	defaultReleaseGrace = 30 * time.Second
 )
 
 // Reason categorises WHY the reaper drove a contract into a particular state,
@@ -81,6 +89,13 @@ type Options struct {
 	// once per call. Defaults to defaultInterval.
 	Interval time.Duration
 
+	// ReleaseGrace bounds how long a contract may sit in StateReleasing before
+	// the reaper stops skipping it. Inside the window the DELETE handler owns
+	// the tear down; past it the release is presumed stuck and the reaper
+	// expires the contract like any other non-terminal one so its capacity and
+	// GPUs return to the allocators. Defaults to defaultReleaseGrace.
+	ReleaseGrace time.Duration
+
 	// Now is the injectable clock. Defaults to time.Now. Tests set this to make
 	// transitions deterministic without real sleeping.
 	Now func() time.Time
@@ -113,12 +128,13 @@ type Options struct {
 // containers through the Runtime as contracts expire. It is safe for concurrent
 // use.
 type Reaper struct {
-	store    *contract.Store
-	rt       runtime.Runtime
-	lead     time.Duration
-	interval time.Duration
-	now      func() time.Time
-	logger   *slog.Logger
+	store        *contract.Store
+	rt           runtime.Runtime
+	lead         time.Duration
+	interval     time.Duration
+	releaseGrace time.Duration
+	now          func() time.Time
+	logger       *slog.Logger
 
 	// releaseGPUs reclaims an expired contract's GPU devices back to the
 	// allocator; nil when no GPU allocator is wired. See Options.ReleaseGPUs.
@@ -140,6 +156,9 @@ func New(store *contract.Store, rt runtime.Runtime, opts Options) *Reaper {
 	if opts.Interval <= 0 {
 		opts.Interval = defaultInterval
 	}
+	if opts.ReleaseGrace <= 0 {
+		opts.ReleaseGrace = defaultReleaseGrace
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
@@ -151,6 +170,7 @@ func New(store *contract.Store, rt runtime.Runtime, opts Options) *Reaper {
 		rt:              rt,
 		lead:            opts.Lead,
 		interval:        opts.Interval,
+		releaseGrace:    opts.ReleaseGrace,
 		now:             opts.Now,
 		logger:          opts.Logger,
 		notify:          opts.Notify,
@@ -223,19 +243,32 @@ func (r *Reaper) Tick(ctx context.Context) {
 // few ticks rather than at TTL expiry. The two expire paths tag their
 // transition with distinct Reason values so the bus can tell them apart.
 //
-// A contract in StateReleasing is skipped entirely: the DELETE handler owns
-// that fence and is in the middle of killing the container, so touching it
-// here would double-kill the container ("removal already in progress"),
-// expire-and-purge it from under the handler, and turn the DELETE into a 500
-// (the 2026-08-29 wisp-log failure the fence was added for).
+// A contract in StateReleasing is skipped for the reaper's release-grace window:
+// the DELETE handler owns that fence and is in the middle of killing the
+// container, so touching it here would double-kill the container ("removal
+// already in progress"), expire-and-purge it from under the handler, and turn
+// the DELETE into a 500 (the 2026-08-29 wisp-log failure the fence was added
+// for). Past the grace the release is presumed stuck (the handler crashed
+// mid-release, or its Kill hung), and the reaper expires the contract like any
+// other non-terminal one so its capacity and GPUs return to the allocators
+// rather than leaking until restart.
 func (r *Reaper) reap(ctx context.Context, c contract.Contract) {
 	if c.State.Terminal() {
 		return
 	}
+	now := r.now()
 	if c.State == contract.StateReleasing {
+		if !c.ReleasingSince.IsZero() && now.Sub(c.ReleasingSince) < r.releaseGrace {
+			return
+		}
+		r.logger.Info("reaper: releasing contract past grace; expiring",
+			"contract_id", c.ID,
+			"container_id", c.ContainerID,
+			"grace", r.releaseGrace,
+			"releasing_since", c.ReleasingSince)
+		r.expire(ctx, c, now, ReasonTTLExpired)
 		return
 	}
-	now := r.now()
 	switch {
 	case !now.Before(c.ExpiresAt):
 		r.expire(ctx, c, now, ReasonTTLExpired)

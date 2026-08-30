@@ -15,7 +15,7 @@ func TestStateTransitions(t *testing.T) {
 		StateProvisioning: {StateReady: true, StateReleasing: true, StateExpired: true},
 		StateReady:        {StateExpiring: true, StateReleasing: true, StateExpired: true},
 		StateExpiring:     {StateReleasing: true, StateExpired: true},
-		StateReleasing:    {StateReleased: true},
+		StateReleasing:    {StateReleased: true, StateExpired: true},
 		StateReleased:     {},
 		StateExpired:      {},
 	}
@@ -75,16 +75,22 @@ func TestNoSelfTransition(t *testing.T) {
 	}
 }
 
-// StateReleasing may only leave to StateReleased: the reaper's expired
-// transition, or any other move, is illegal so the fence guarantees the
-// DELETE handler is the sole owner of the terminal transition.
-func TestReleasingOnlyGoesToReleased(t *testing.T) {
-	for _, to := range []State{StateRequested, StateProvisioning, StateReady, StateExpiring, StateReleasing, StateExpired} {
+// StateReleasing has two legal successors: StateReleased (the DELETE handler's
+// success path, serializing the terminal side effects to one caller) and
+// StateExpired (the reaper's release-grace escape hatch: past the grace the
+// release is presumed stuck and the reaper reclaims capacity by expiring the
+// contract). Every other move is illegal so the state machine still admits at
+// most one terminal transition per contract.
+func TestReleasingOnlyGoesToReleasedOrExpired(t *testing.T) {
+	for _, to := range []State{StateRequested, StateProvisioning, StateReady, StateExpiring, StateReleasing} {
 		if StateReleasing.CanTransition(to) {
 			t.Errorf("releasing → %s should be illegal", to)
 		}
 	}
 	if !StateReleasing.CanTransition(StateReleased) {
-		t.Error("releasing → released should be legal")
+		t.Error("releasing → released should be legal (the DELETE handler's success path)")
+	}
+	if !StateReleasing.CanTransition(StateExpired) {
+		t.Error("releasing → expired should be legal (the reaper's stuck-release escape hatch)")
 	}
 }

@@ -69,7 +69,7 @@ POST /contracts
   "env": { "KEY": "value" },      // optional, opaque, write-only container environment (§8)
   "external_id": "...",           // optional opaque caller id (<= 128 bytes), persisted on the container, echoed on reads
   "meta": { ... },                // opaque client tags, echoed back on status reads
-  "files": [ { "path": "/abs/p", "content_base64": "..." } ]  // optional; written into the container AFTER start and BEFORE userdata runs so scripts can read them
+  "files": [ { "path": "/abs/p", "content_base64": "..." } ]  // optional; written into the created container BEFORE start and BEFORE userdata runs so scripts can read them
 }
 → 201 { "contract_id": "...", "token": "...", "status": "ready" }
 ```
@@ -83,7 +83,9 @@ returns `400` (§7). Over-budget requests are `409` (§7).
 ### File ingress / egress (pinned wire contract)
 
 The optional `files` array on create carries `{path, content_base64}` entries wisp writes into the
-container AFTER start and BEFORE userdata runs, so a userdata script can read them. The caps are
+created container BEFORE it starts (a running Hyper-V isolated Windows container rejects
+filesystem operations), so they exist for the container entire lifetime and BEFORE userdata
+runs; a userdata script can read them. The caps are
 pinned across repos and every breach is a validation error (`400`), never a silent clamp: at most
 16 files, 1 MiB total decoded bytes across all files, each `path` is an absolute unix-style path
 (starts with `/`) at most 256 bytes with no backslash and no `..` segment, paths are unique per

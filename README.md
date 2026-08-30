@@ -144,7 +144,9 @@ on the container and echoed on reads. `meta` is opaque and echoed back on status
 reads.
 
 `files` is an optional list of `{path, content_base64}` entries wisp writes
-into the container AFTER start and BEFORE userdata runs, so a userdata script
+into the created container BEFORE it starts (running Hyper-V isolated Windows
+containers reject filesystem writes), so the files exist for the container
+entire lifetime and a userdata script
 can read them. The caps are pinned across repos and every breach is a
 `400 validation_error` (never a silent clamp): at most 16 files, 1 MiB total
 decoded bytes across all entries, each `path` is an absolute unix-style path

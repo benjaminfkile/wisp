@@ -490,10 +490,21 @@ func TestFakeCopyFilesToContainer(t *testing.T) {
 	if err := f.CopyFilesToContainer(ctx, "nope", files); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unknown container err = %v, want ErrNotFound", err)
 	}
-	// Stopped container is ErrNotRunning.
+	// A created container that has not started yet accepts the copy, like the
+	// daemon does (the broker relies on this to stage files before Start).
 	stoppedID, _ := f.Create(ctx, "img", CreateOptions{})
-	if err := f.CopyFilesToContainer(ctx, stoppedID, files); !errors.Is(err, ErrNotRunning) {
-		t.Errorf("stopped container err = %v, want ErrNotRunning", err)
+	if err := f.CopyFilesToContainer(ctx, stoppedID, files); err != nil {
+		t.Errorf("created-not-started container err = %v, want nil", err)
+	}
+	if sc, _ := f.Container(stoppedID); sc == nil || sc.CopiedWhileStarted {
+		t.Errorf("copy into a not-started container must not be flagged as after-start")
+	}
+	// A killed container refuses the copy.
+	if err := f.Kill(ctx, stoppedID); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	if err := f.CopyFilesToContainer(ctx, stoppedID, files); err == nil {
+		t.Errorf("killed container err = nil, want an error")
 	}
 	// Empty file list is a no-op that returns nil.
 	if err := f.CopyFilesToContainer(ctx, id, nil); err != nil {

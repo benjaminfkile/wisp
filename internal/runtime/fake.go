@@ -41,6 +41,12 @@ type FakeContainer struct {
 	// CopyFilesToContainer, so a test can assert ordering relative to Execs
 	// (e.g. "files were written before the userdata exec ran").
 	CopyCalls [][]string
+
+	// CopiedWhileStarted records that a CopyFilesToContainer call arrived after
+	// Start. The real daemon rejects that on a Hyper-V isolated Windows
+	// container, so the broker must always copy before Start; a test asserts
+	// this stays false.
+	CopiedWhileStarted bool
 }
 
 // FakeFileEntry is one file the fake has stored, capturing the write's bytes
@@ -320,7 +326,8 @@ func (f *Fake) Inspect(ctx context.Context, id string) (LivenessState, error) {
 // CopyFilesToContainer implements Runtime. It stores each entry in the
 // container's in-memory Files map keyed by absolute path, and appends the batch
 // (in call order) to CopyCalls so a test can assert that files were written
-// before the userdata exec ran.
+// before the userdata exec ran. Like the daemon, it accepts a created container
+// that has not started yet; only a killed container is refused.
 func (f *Fake) CopyFilesToContainer(ctx context.Context, id string, files []FileEntry) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -328,7 +335,7 @@ func (f *Fake) CopyFilesToContainer(ctx context.Context, id string, files []File
 	if !ok {
 		return ErrNotFound
 	}
-	if !c.Started || c.Killed {
+	if c.Killed {
 		return ErrNotRunning
 	}
 	if len(files) == 0 {
@@ -348,6 +355,9 @@ func (f *Fake) CopyFilesToContainer(ctx context.Context, id string, files []File
 		paths = append(paths, fe.Path)
 	}
 	c.CopyCalls = append(c.CopyCalls, paths)
+	if c.Started {
+		c.CopiedWhileStarted = true
+	}
 	return nil
 }
 

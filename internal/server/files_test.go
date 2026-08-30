@@ -30,6 +30,28 @@ func createBody(ttl int, path string, content []byte) string {
 		ttl, path, base64.StdEncoding.EncodeToString(content))
 }
 
+// TestCreateCopiesFilesBeforeStart pins the copy-before-start order: the
+// archive copy must target the created, not-yet-started container, because a
+// running Hyper-V isolated Windows container rejects filesystem operations.
+func TestCreateCopiesFilesBeforeStart(t *testing.T) {
+	h, store, fake := testServer(t)
+	created := createContract(t, h, createBody(3600, "/work/prompt.txt", []byte("before start")))
+	c, _ := store.Get(created.ContractID)
+	fc, ok := fake.Container(c.ContainerID)
+	if !ok {
+		t.Fatalf("container not tracked")
+	}
+	if len(fc.CopyCalls) != 1 {
+		t.Fatalf("CopyCalls = %v, want exactly one batch", fc.CopyCalls)
+	}
+	if fc.CopiedWhileStarted {
+		t.Fatalf("files were copied after Start; the copy must happen before the container starts")
+	}
+	if !fc.Started {
+		t.Fatalf("container never started")
+	}
+}
+
 // TestCreateAcceptsFilesAndWritesBeforeUserdata pins the pinned file-contract
 // ordering: the ingress files must land in the container BEFORE the userdata
 // exec runs, so a userdata script can read them. Uses a StreamHandler-free

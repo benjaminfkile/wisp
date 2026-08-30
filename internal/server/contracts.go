@@ -1040,18 +1040,14 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, spec launch
 		b.fail(ctx, c.ID, cid)
 		return c, err
 	}
-	startAt := b.now()
-	if err := b.rt.Start(ctx, cid); err != nil {
-		b.fail(ctx, c.ID, cid)
-		return c, err
-	}
-	startMS = b.now().Sub(startAt).Milliseconds()
-
-	// Write the caller-supplied files AFTER the container is running but BEFORE
-	// userdata runs, so a userdata script can read them. The caller has already
-	// validated shape and caps in the create handler, so any error here is a
-	// runtime failure (e.g. the daemon refused the archive PUT), which is
-	// terminal for this create just like a failed image ensure or start.
+	// Write the caller-supplied files BEFORE the container starts: the archive
+	// copy targets the created container filesystem, which every isolation mode
+	// permits (a RUNNING Hyper-V isolated Windows container rejects filesystem
+	// operations outright), and the files then exist for the container entire
+	// lifetime, including userdata. The caller has already validated shape and
+	// caps in the create handler, so any error here is a runtime failure
+	// (e.g. the daemon refused the archive PUT), which is terminal for this
+	// create just like a failed image ensure or start.
 	if len(files) > 0 {
 		filesStart := b.now()
 		if err := b.rt.CopyFilesToContainer(ctx, cid, files); err != nil {
@@ -1060,6 +1056,13 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, spec launch
 		}
 		filesMS = b.now().Sub(filesStart).Milliseconds()
 	}
+
+	startAt := b.now()
+	if err := b.rt.Start(ctx, cid); err != nil {
+		b.fail(ctx, c.ID, cid)
+		return c, err
+	}
+	startMS = b.now().Sub(startAt).Milliseconds()
 
 	if userdata != "" {
 		udStart := b.now()

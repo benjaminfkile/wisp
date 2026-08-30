@@ -55,6 +55,7 @@ type Daemon struct {
 
 	store  *contract.Store
 	rt     runtime.Runtime
+	br     *broker
 	alloc  *gpu.Allocator
 	cap    *capacity.Allocator
 	logger *slog.Logger
@@ -73,9 +74,21 @@ func NewDaemon(logger *slog.Logger, store *contract.Store, rt runtime.Runtime, p
 		Handler: requestLogger(logger, mux),
 		store:   store,
 		rt:      rt,
+		br:      br,
 		alloc:   br.alloc,
 		cap:     br.cap,
 		logger:  logger,
+	}
+}
+
+// SetKillTimeout configures the bound the DELETE handler applies to a single
+// container kill run under its detached kill context. A non-positive value is
+// ignored so the broker keeps its constructor default. Wired from
+// WISP_KILL_TIMEOUT_SECONDS by cmd/wispd so the release handler and the
+// reaper's release-grace expiry share the same kill bound end to end.
+func (d *Daemon) SetKillTimeout(timeout time.Duration) {
+	if timeout > 0 && d.br != nil {
+		d.br.killTimeout = timeout
 	}
 }
 

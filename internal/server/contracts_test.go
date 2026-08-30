@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1090,6 +1091,256 @@ func TestDeleteUnknownContractStillReturns404(t *testing.T) {
 	rec := do(t, h, http.MethodDelete, "/contracts/does-not-exist", "")
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404 for unknown id (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestDeleteClientCancelledMidKillLeavesReleasing pins the 225 fix: if the
+// client disconnects (or the request context is cancelled) while the release
+// handler's kill is in flight, the kill must continue under a DETACHED context
+// and NOT falsely resolve as a successful release. Before the fix, Kill ran
+// under r.Context() and returned context.Canceled on cancellation, which the
+// old code silently treated as success: the contract transitioned to released
+// and its capacity + GPUs were freed while the container kept running (and
+// then got adopted as a fresh contract by the next restart's reconcile). With
+// the detach in place the container is still killed (the goroutine's own
+// killCtx is what bounds it), the contract completes its terminal transition,
+// and the caller's cancellation does nothing to the underlying tear down.
+func TestDeleteClientCancelledMidKillLeavesReleasing(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	rt := &killHookRuntime{Runtime: fake}
+	b := newBroker(store, rt, budgetPolicy(0, 4, 512), bus.New(nil), discardLogger(), "")
+	// Short killTimeout so the test doesn't hang on the goroutine drain.
+	b.killTimeout = 200 * time.Millisecond
+	mux := http.NewServeMux()
+	b.routes(mux)
+
+	created := createContract(t, mux, `{"ttl_seconds":600,"resources":{"cpus":2,"memory_mb":256}}`)
+	c, _ := store.Get(created.ContractID)
+
+	// Cancel the request context the moment the kill starts, then verify the kill
+	// under the DETACHED context ran to completion anyway. The onKill hook blocks
+	// briefly so the request-side goroutine can observe the cancellation before
+	// the delegating Kill actually removes the container.
+	killStarted := make(chan struct{})
+	rt.onKill = func(id string) {
+		close(killStarted)
+		// Small nap so the handler can see the cancelled request context: the
+		// point of the test is that this cancellation does not derail the kill.
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/contracts/"+created.ContractID, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		mux.ServeHTTP(rec, req)
+		close(done)
+	}()
+	<-killStarted
+	cancel()
+	<-done
+
+	// The DELETE completes normally (200) even though the client disconnected: the
+	// detached kill under its own bounded context ran the container tear down and
+	// the release path completed the terminal transition to released.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE status = %d, want 200 (client cancellation must not turn the release into a failure) (body: %s)",
+			rec.Code, rec.Body.String())
+	}
+	var got statusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Status != string(contract.StateReleased) {
+		t.Errorf("status = %q, want released (kill under detached ctx succeeded)", got.Status)
+	}
+
+	final, _ := store.Get(created.ContractID)
+	if final.State != contract.StateReleased {
+		t.Errorf("stored state = %q, want released (detached kill completed under bounded ctx)", final.State)
+	}
+	if _, ok := fake.Container(c.ContainerID); ok {
+		t.Error("container still tracked after cancelled DELETE; the detached kill must have torn it down")
+	}
+	if b.cap.ActiveContracts() != 0 || b.cap.UsedCPUs() != 0 || b.cap.UsedMemoryMB() != 0 {
+		t.Errorf("usage after DELETE = {%d, %v, %d}, want all zero (release freed capacity once)",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+}
+
+// TestDeleteClientCancelledMidStuckKillLeavesReleasingAndReaperFinishesIt
+// pins the pathological end of the same bug: the client disconnects AND the
+// docker daemon is slow enough that the detached kill has not returned within
+// killTimeout. The handler must NOT transition to released - a released
+// status with the container still running would leak the lease's capacity
+// and GPUs and get re-adopted as a fresh contract on the next restart. The
+// contract is left in StateReleasing with capacity intact, and the reaper's
+// release-grace escape hatch later expires it (freeing capacity exactly
+// once) once the grace elapses.
+func TestDeleteClientCancelledMidStuckKillLeavesReleasingAndReaperFinishesIt(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	rt := &killHookRuntime{Runtime: fake}
+	b := newBroker(store, rt, budgetPolicy(0, 4, 512), bus.New(nil), discardLogger(), "")
+	b.killTimeout = 100 * time.Millisecond
+	mux := http.NewServeMux()
+	b.routes(mux)
+
+	created := createContract(t, mux, `{"ttl_seconds":600,"resources":{"cpus":2,"memory_mb":256}}`)
+	c, _ := store.Get(created.ContractID)
+	if b.cap.ActiveContracts() != 1 || b.cap.UsedCPUs() != 2 || b.cap.UsedMemoryMB() != 256 {
+		t.Fatalf("usage after create = {%d, %v, %d}, want {1, 2, 256}",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+
+	// Stall the FIRST kill (the release handler's) until the caller (this test)
+	// releases it, well beyond killTimeout. Subsequent kills (e.g. the reaper's
+	// past-grace expiry) fall through unblocked so the reaper can finish. This
+	// models a docker daemon that stops responding only for the release call.
+	stall := make(chan struct{})
+	killStarted := make(chan struct{})
+	var killOnce sync.Once
+	rt.onKill = func(id string) {
+		first := false
+		killOnce.Do(func() { first = true })
+		if !first {
+			return
+		}
+		close(killStarted)
+		<-stall
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/contracts/"+created.ContractID, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		mux.ServeHTTP(rec, req)
+		close(done)
+	}()
+	<-killStarted
+	cancel() // client disconnects
+	<-done
+
+	// The handler must NOT transition to released while the kill is still
+	// blocked. Respond 200 releasing so the caller knows the release is
+	// non-final; the contract stays in StateReleasing so the reaper's escape
+	// hatch can finish it later.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE status = %d, want 200 (releasing echo) (body: %s)",
+			rec.Code, rec.Body.String())
+	}
+	var got statusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Status != string(contract.StateReleasing) {
+		t.Errorf("status = %q, want releasing (kill did not complete under bounded ctx)", got.Status)
+	}
+	if got.ContractID != created.ContractID {
+		t.Errorf("contract_id = %q, want %q", got.ContractID, created.ContractID)
+	}
+
+	stalled, _ := store.Get(created.ContractID)
+	if stalled.State != contract.StateReleasing {
+		t.Errorf("stored state after stalled kill = %q, want releasing (release must not transition on timeout)",
+			stalled.State)
+	}
+	// Capacity must NOT be freed by the release path on the stalled kill: the
+	// container is still (potentially) running.
+	if b.cap.ActiveContracts() != 1 || b.cap.UsedCPUs() != 2 || b.cap.UsedMemoryMB() != 256 {
+		t.Errorf("usage after stalled release = {%d, %v, %d}, want {1, 2, 256} (release must not free on timeout)",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+
+	// Simulate the wedged docker finally answering so the goroutine can exit
+	// (also lets the container be torn down for the reaper's later check).
+	close(stall)
+
+	// Now drive the reaper past the release-grace window: it MUST expire the
+	// stuck-releasing contract, kill the container (already gone), and free the
+	// capacity exactly once via its ReleaseCapacity hook.
+	//
+	// Use a tiny release grace so the test does not have to wait 30 s.
+	past := stalled.ReleasingSince.Add(2 * time.Second)
+	freed := false
+	rp := reaper.New(store, rt, reaper.Options{
+		Logger:       discardLogger(),
+		Now:          func() time.Time { return past },
+		ReleaseGrace: time.Second, // grace already elapsed at 2 s
+		KillTimeout:  time.Second,
+		ReleaseCapacity: func(rc contract.Contract) {
+			b.cap.Free(rc.ReservedCPUs, rc.ReservedMemoryMB)
+			freed = true
+		},
+	})
+	rp.Tick(context.Background())
+	rp.WaitForKills()
+
+	if !freed {
+		t.Fatal("reaper did not free capacity for the stuck-releasing contract past its grace")
+	}
+	reaped, err := store.Get(c.ID)
+	if err != nil {
+		t.Fatalf("store.Get after reaper tick: %v", err)
+	}
+	if reaped.State != contract.StateExpired {
+		t.Errorf("stored state after reaper past-grace tick = %q, want expired", reaped.State)
+	}
+	if b.cap.ActiveContracts() != 0 || b.cap.UsedCPUs() != 0 || b.cap.UsedMemoryMB() != 0 {
+		t.Errorf("usage after reaper expiry = {%d, %v, %d}, want all zero (freed exactly once)",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
+	}
+}
+
+// TestDeleteKillTimeoutLeavesReleasing pins the timeout branch directly: even
+// without client cancellation, a docker daemon that stalls past killTimeout
+// leaves the contract in StateReleasing with capacity intact, and the handler
+// responds 200 with a releasing status so the caller knows the release is not
+// final. Distinct from the client-cancellation variant above because the
+// request context is never cancelled here.
+func TestDeleteKillTimeoutLeavesReleasing(t *testing.T) {
+	store := contract.NewStore()
+	fake := runtime.NewFake()
+	rt := &killHookRuntime{Runtime: fake}
+	b := newBroker(store, rt, budgetPolicy(0, 4, 512), bus.New(nil), discardLogger(), "")
+	b.killTimeout = 100 * time.Millisecond
+	mux := http.NewServeMux()
+	b.routes(mux)
+
+	created := createContract(t, mux, `{"ttl_seconds":600,"resources":{"cpus":2,"memory_mb":256}}`)
+
+	stall := make(chan struct{})
+	rt.onKill = func(id string) {
+		<-stall
+	}
+	defer close(stall)
+
+	rec := do(t, mux, http.MethodDelete, "/contracts/"+created.ContractID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got statusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Status != string(contract.StateReleasing) {
+		t.Errorf("status = %q, want releasing on kill timeout", got.Status)
+	}
+
+	final, _ := store.Get(created.ContractID)
+	if final.State != contract.StateReleasing {
+		t.Errorf("stored state = %q, want releasing (timeout must not transition)", final.State)
+	}
+	if b.cap.ActiveContracts() != 1 || b.cap.UsedCPUs() != 2 || b.cap.UsedMemoryMB() != 256 {
+		t.Errorf("usage after timed-out release = {%d, %v, %d}, want {1, 2, 256} (must not free on timeout)",
+			b.cap.ActiveContracts(), b.cap.UsedCPUs(), b.cap.UsedMemoryMB())
 	}
 }
 

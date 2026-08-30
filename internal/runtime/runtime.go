@@ -326,6 +326,54 @@ type DaemonInfo struct {
 	OS ContainerOS
 }
 
+// FileEntry is one regular file to write into a container by CopyToContainer.
+// Path is an absolute unix-style path; Content is the raw file bytes. Mode
+// is the octal permission bits to set on the tar entry (0 means the default
+// used by CopyToContainer, currently 0644). Regular files only.
+type FileEntry struct {
+	// Path is the absolute unix-style destination inside the container. The
+	// tar entry is written with this exact name; parent directories are
+	// materialised by the archive extraction the Docker daemon performs.
+	Path string
+
+	// Content is the raw file bytes.
+	Content []byte
+
+	// Mode is the file permission bits to record on the tar entry; when zero
+	// the runtime picks a sensible default (0644).
+	Mode int64
+}
+
+// FileReadResult is one file's bytes streamed back by CopyFileFromContainer.
+// Size is the tar entry's declared size (used to set Content-Length on the
+// download response); Body is the file bytes stream. It is the caller's
+// responsibility to Close Body.
+type FileReadResult struct {
+	// Size is the file's byte length as reported by the tar header.
+	Size int64
+
+	// Body is the file's raw bytes stream. It ends at Size bytes and never
+	// carries tar framing; callers stream it verbatim to the client.
+	Body io.ReadCloser
+}
+
+// ErrFileIsDirectory is returned by CopyFileFromContainer when the requested
+// path resolves to a directory rather than a regular file. It is a normal
+// observation (the endpoint maps it to 404), not a transport error.
+var ErrFileIsDirectory = errors.New("runtime: file is a directory")
+
+// ErrFileIsSymlink is returned by CopyFileFromContainer when the requested
+// path resolves to a symbolic link. Wisp refuses to follow container-side
+// symlinks because their targets are attacker-controlled (userdata runs as
+// root inside the container). It is a normal observation, not a transport
+// error, and the endpoint maps it to 404.
+var ErrFileIsSymlink = errors.New("runtime: file is a symlink")
+
+// ErrFileNotRegular is returned by CopyFileFromContainer when the tar entry
+// for the requested path is a special file (device, fifo, etc.) rather than a
+// regular file, directory, or symlink. The endpoint maps it to 404.
+var ErrFileNotRegular = errors.New("runtime: file is not a regular file")
+
 // Runtime abstracts the container backend. Implementations must be safe for
 // concurrent use by multiple goroutines.
 type Runtime interface {
@@ -349,6 +397,25 @@ type Runtime interface {
 	// Kill forcibly stops and removes the container. After Kill the id is no
 	// longer valid.
 	Kill(ctx context.Context, id string) error
+
+	// CopyFilesToContainer writes each entry as a regular file into the
+	// container's filesystem, creating parent directories as needed. The
+	// runtime frames the entries as a single tar archive and hands it to the
+	// container backend's copy-archive API, so the writes land in one round
+	// trip and share the same "regular files only" typeflag on every entry.
+	// Entries with an empty Path are rejected; the caller is expected to have
+	// already validated path shape (absolute unix-style, no traversal, unique).
+	CopyFilesToContainer(ctx context.Context, id string, files []FileEntry) error
+
+	// CopyFileFromContainer reads a single regular file from the container's
+	// filesystem and returns a stream of its raw bytes plus its declared size.
+	// The runtime speaks the container backend's copy-archive API and unpacks
+	// the tar wrapper before returning, so the caller streams plain file bytes
+	// (never tar framing). A path resolving to a directory returns
+	// ErrFileIsDirectory; a symlink returns ErrFileIsSymlink; a non-regular
+	// file (device, fifo, etc.) returns ErrFileNotRegular; an unknown path
+	// returns ErrNotFound. The caller MUST Close the returned Body.
+	CopyFileFromContainer(ctx context.Context, id, path string) (FileReadResult, error)
 
 	// Inspect reports whether the container is currently running, in the
 	// LivenessState terms above. A container that has stopped (exited, OOM,

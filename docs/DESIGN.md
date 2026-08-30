@@ -68,7 +68,8 @@ POST /contracts
   "userdata": "#!/bin/sh\napt-get install -y git ...",   // provisioning, runs at boot
   "env": { "KEY": "value" },      // optional, opaque, write-only container environment (§8)
   "external_id": "...",           // optional opaque caller id (<= 128 bytes), persisted on the container, echoed on reads
-  "meta": { ... }                 // opaque client tags, echoed back on status reads
+  "meta": { ... },                // opaque client tags, echoed back on status reads
+  "files": [ { "path": "/abs/p", "content_base64": "..." } ]  // optional; written into the container AFTER start and BEFORE userdata runs so scripts can read them
 }
 → 201 { "contract_id": "...", "token": "...", "status": "ready" }
 ```
@@ -78,6 +79,29 @@ then returns, so a successful response always carries `status: "ready"`. A provi
 (userdata exiting non-zero, image pull/create/start failing) destroys the container, marks the
 contract `expired`, and returns `500`; an image the daemon rejects for this host's OS/platform
 returns `400` (§7). Over-budget requests are `409` (§7).
+
+### File ingress / egress (pinned wire contract)
+
+The optional `files` array on create carries `{path, content_base64}` entries wisp writes into the
+container AFTER start and BEFORE userdata runs, so a userdata script can read them. The caps are
+pinned across repos and every breach is a validation error (`400`), never a silent clamp: at most
+16 files, 1 MiB total decoded bytes across all files, each `path` is an absolute unix-style path
+(starts with `/`) at most 256 bytes with no backslash and no `..` segment, paths are unique per
+request, and every `content_base64` must decode cleanly (invalid base64 is a validation error).
+Wisp turns the batch into a single tar archive and writes it via the Docker copy-archive API in
+one round trip. The bytes count against the lease's disk usage like any other container write.
+Windows leases use the same unix-style request paths; wisp maps them onto the container filesystem
+the same way exec working directories already resolve.
+
+A live lease's files come back single-file via `GET /contracts/:id/files?path=/abs/path`, which
+streams the raw file bytes as `application/octet-stream` (`Content-Length` set when known). Auth
+mirrors `GET /contracts/:id`: the app token OR the contract's own bearer token authorizes it. The
+handler asks the runtime for a copy-from-container tar and reads exactly one entry: a tar typeflag
+other than a regular file (directory, symlink, hard link, device, fifo) is rejected as
+`404 not_found` so directory listings and symlink targets never leak. Other errors are
+`400 validation_error` (bad path shape), `409 lease_not_ready` (not `ready`/`expiring`), and
+`413 file_too_large` when the file exceeds `WISP_MAX_FILE_READ_BYTES` (default 16 MiB,
+configurable). Single file only, no directory listing, no glob.
 
 ### Lifecycle (state machine)
 
@@ -533,13 +557,14 @@ Single Go binary (daemon). As built:
 ## 10. API surface (v0 sketch)
 
 ```
-POST   /contracts                     create + boot + run userdata (optional env, external_id); 201 {contract_id, token, status}
+POST   /contracts                     create + boot + run userdata (optional env, external_id, files); 201 {contract_id, token, status}
 GET    /contracts                     list every live contract: {"contracts":[{id, external_id, token, status, expires_at, ttl_seconds_remaining, reserved_cpus, reserved_memory_mb, gpus}]}
                                       status is one of provisioning|ready|expiring (terminal contracts and the transient `requested` / `releasing` states are excluded; gpus is always an array)
 GET    /contracts/:id                 {contract_id, status, ttl_seconds_remaining, gpus?, meta?, external_id}; status is provisioning|ready|expiring|releasing|released|expired (releasing is non-terminal); 404 once purged
 DELETE /contracts/:id                 release now (destroy container); same body as GET; idempotent 200 on an already-terminal contract, and 200 echoing status=releasing when a concurrent release is already in flight
 POST   /contracts/:id/exec            run a command (sync)         { command } -> {stdout, stderr, exit_code}; 409 unless ready
 POST   /contracts/:id/exec?stream=1   run a command (Server-Sent Events: chunk / exit / error)
+GET    /contracts/:id/files?path=/p   stream one regular file's raw bytes as application/octet-stream; 400 bad path, 404 missing/dir/symlink, 409 not ready, 413 file_too_large (WISP_MAX_FILE_READ_BYTES, default 16 MiB)
 WS     /contracts/:id/shell           interactive PTY console (binary frames; text {"type":"resize","rows","cols"} control frame)
 
 POST   /events                        publish an event to the bus; 202

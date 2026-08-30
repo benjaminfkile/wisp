@@ -157,3 +157,36 @@ func TestLoadInvalidReaperEnv(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadMaxFileReadBytesDefault(t *testing.T) {
+	t.Setenv("WISP_MAX_FILE_READ_BYTES", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.MaxFileReadBytes != defaultMaxFileReadBytes {
+		t.Errorf("MaxFileReadBytes = %d, want %d", cfg.MaxFileReadBytes, defaultMaxFileReadBytes)
+	}
+}
+
+func TestLoadMaxFileReadBytesOverride(t *testing.T) {
+	t.Setenv("WISP_MAX_FILE_READ_BYTES", "4194304")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.MaxFileReadBytes != 4_194_304 {
+		t.Errorf("MaxFileReadBytes = %d, want 4194304", cfg.MaxFileReadBytes)
+	}
+}
+
+func TestLoadInvalidMaxFileReadBytes(t *testing.T) {
+	for _, val := range []string{"notanint", "0", "-1"} {
+		t.Run(val, func(t *testing.T) {
+			t.Setenv("WISP_MAX_FILE_READ_BYTES", val)
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() error = nil, want error for WISP_MAX_FILE_READ_BYTES=%q", val)
+			}
+		})
+	}
+}

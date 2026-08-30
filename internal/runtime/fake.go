@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -28,6 +30,34 @@ type FakeContainer struct {
 	// the interactive shell via ShellStream.Resize, so tests can assert that a
 	// client's resize control reached the runtime.
 	Resizes [][2]uint16
+
+	// Files is the in-memory filesystem the fake maintains for CopyFilesToContainer
+	// and CopyFileFromContainer: absolute unix-style path -> file entry. Ordering
+	// of Copy calls is preserved by CopyCalls so a test can assert that ingress
+	// happened before userdata.
+	Files map[string]FakeFileEntry
+
+	// CopyCalls is the ordered list of file batches written via
+	// CopyFilesToContainer, so a test can assert ordering relative to Execs
+	// (e.g. "files were written before the userdata exec ran").
+	CopyCalls [][]string
+}
+
+// FakeFileEntry is one file the fake has stored, capturing the write's bytes
+// and any per-entry attributes. TypeOverride lets a test simulate a
+// container-side symlink or directory that the fake would otherwise not
+// produce (files written via CopyFilesToContainer are always regular files);
+// set it before calling CopyFileFromContainer.
+type FakeFileEntry struct {
+	// Content is the file's raw bytes.
+	Content []byte
+
+	// TypeOverride, when non-zero, forces CopyFileFromContainer to report this
+	// entry as a directory, symlink, or other non-regular tar typeflag so tests
+	// can drive the rejection paths without writing a real tar with those
+	// entries. Use tar.TypeDir, tar.TypeSymlink, etc. Zero means the fake
+	// reports it as a regular file (tar.TypeReg).
+	TypeOverride byte
 }
 
 // ExecFunc lets a test define how the Fake responds to an exec. It receives the
@@ -285,6 +315,77 @@ func (f *Fake) Inspect(ctx context.Context, id string) (LivenessState, error) {
 		return LivenessRunning, nil
 	}
 	return LivenessStopped, nil
+}
+
+// CopyFilesToContainer implements Runtime. It stores each entry in the
+// container's in-memory Files map keyed by absolute path, and appends the batch
+// (in call order) to CopyCalls so a test can assert that files were written
+// before the userdata exec ran.
+func (f *Fake) CopyFilesToContainer(ctx context.Context, id string, files []FileEntry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.containers[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if !c.Started || c.Killed {
+		return ErrNotRunning
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	if c.Files == nil {
+		c.Files = make(map[string]FakeFileEntry)
+	}
+	paths := make([]string, 0, len(files))
+	for _, fe := range files {
+		if fe.Path == "" {
+			return fmt.Errorf("runtime: copy files: empty path")
+		}
+		content := make([]byte, len(fe.Content))
+		copy(content, fe.Content)
+		c.Files[fe.Path] = FakeFileEntry{Content: content}
+		paths = append(paths, fe.Path)
+	}
+	c.CopyCalls = append(c.CopyCalls, paths)
+	return nil
+}
+
+// CopyFileFromContainer implements Runtime. It looks up path in the
+// container's in-memory Files map and returns its bytes as a FileReadResult.
+// An unknown path is ErrNotFound; an entry marked as a directory / symlink /
+// non-regular via TypeOverride surfaces the matching typed error so the
+// server-side handler exercises its rejection paths without a real daemon.
+func (f *Fake) CopyFileFromContainer(ctx context.Context, id, srcPath string) (FileReadResult, error) {
+	f.mu.Lock()
+	c, ok := f.containers[id]
+	if !ok {
+		f.mu.Unlock()
+		return FileReadResult{}, ErrNotFound
+	}
+	if !c.Started || c.Killed {
+		f.mu.Unlock()
+		return FileReadResult{}, ErrNotRunning
+	}
+	entry, ok := c.Files[srcPath]
+	f.mu.Unlock()
+	if !ok {
+		return FileReadResult{}, ErrNotFound
+	}
+	switch entry.TypeOverride {
+	case 0, tar.TypeReg:
+		// regular file: fall through
+	case tar.TypeDir:
+		return FileReadResult{}, ErrFileIsDirectory
+	case tar.TypeSymlink, tar.TypeLink:
+		return FileReadResult{}, ErrFileIsSymlink
+	default:
+		return FileReadResult{}, ErrFileNotRegular
+	}
+	return FileReadResult{
+		Size: int64(len(entry.Content)),
+		Body: io.NopCloser(bytes.NewReader(entry.Content)),
+	}, nil
 }
 
 // Kill implements Runtime. After Kill the id is removed and no longer valid.

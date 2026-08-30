@@ -47,6 +47,7 @@ Configuration (environment):
 | `WISP_EXPIRING_LEAD_SECONDS`  | `60`             | How long before the TTL a ready contract moves to `expiring` (positive integer). |
 | `WISP_RELEASE_GRACE_SECONDS`  | `30`             | How long the reaper skips a contract sitting in `releasing` before expiring it as a stuck release (positive integer). |
 | `WISP_KILL_TIMEOUT_SECONDS`   | `30`             | How long a single reaper `Kill` may run before it is bounded out so the sweep can move on (positive integer). |
+| `WISP_MAX_FILE_READ_BYTES`    | `16777216`       | Per-file download cap for `GET /contracts/{id}/files` in bytes. A file larger than this is rejected with `413 file_too_large` (positive integer). |
 
 `wispd` needs a reachable Docker daemon (ambient `DOCKER_HOST` etc.) and exits at
 startup if the client cannot be built or the config fails to load or validate.
@@ -121,7 +122,8 @@ provisioning failure, and it survives a `wispd` restart (it is rebuilt from the
   "userdata": "#!/bin/sh\n...",
   "env": { "KEY": "value" },
   "external_id": "upstream-lease-id",
-  "meta": { "job": "build-42" }
+  "meta": { "job": "build-42" },
+  "files": [ { "path": "/etc/wisp/setup.sh", "content_base64": "..." } ]
 }
 ```
 
@@ -140,6 +142,18 @@ most 128 entries and 256 KiB total; keys must be non-empty and free of `=` /
 NUL). `external_id` is an opaque caller identifier (at most 128 bytes) persisted
 on the container and echoed on reads. `meta` is opaque and echoed back on status
 reads.
+
+`files` is an optional list of `{path, content_base64}` entries wisp writes
+into the container AFTER start and BEFORE userdata runs, so a userdata script
+can read them. The caps are pinned across repos and every breach is a
+`400 validation_error` (never a silent clamp): at most 16 files, 1 MiB total
+decoded bytes across all entries, each `path` is an absolute unix-style path
+(starts with `/`) at most 256 bytes with no backslash and no `..` segment,
+paths are unique per request, and every `content_base64` must decode cleanly
+(invalid base64 is a validation error). The bytes count against the lease's
+disk usage like any other write. Windows leases use the same unix-style
+request paths; wisp maps them onto the container filesystem the same way exec
+working directories already resolve.
 
 The call is synchronous: it boots the container, runs `userdata` to completion,
 and returns `201 {"contract_id","token","status":"ready"}`. A userdata script
@@ -263,6 +277,7 @@ GET    /contracts/:id                 status                                    
 DELETE /contracts/:id                 release now (destroy container); 200           (app or contract token)
 POST   /contracts/:id/exec            run a command, sync    {"command":"..."}       (contract token)
 POST   /contracts/:id/exec?stream=1   run a command, streamed as Server-Sent Events  (contract token)
+GET    /contracts/:id/files?path=/p   stream one file's bytes from the container     (app or contract token)
 WS     /contracts/:id/shell           interactive PTY                                (contract token)
 POST   /events                        publish an opaque event; 202                   (app token)
 WS     /events                        subscribe, optional ?type=a,b filter           (app token)
@@ -316,6 +331,16 @@ WS     /events                        subscribe, optional ?type=a,b filter      
   `text/event-stream`: `chunk` events carrying
   `{"stream":"stdout"|"stderr","data":"..."}`, then one `exit` event with
   `{"exit_code":n}` (or an `error` event if the exec fails mid-stream).
+- `GET /contracts/:id/files?path=/abs/path` streams a single regular file's
+  raw bytes from the container's filesystem as `application/octet-stream` with
+  `Content-Length` set when known. Auth mirrors `GET /contracts/:id`: the app
+  token OR the contract's own bearer token authorizes it. It is `409
+  lease_not_ready` unless the contract is `ready` or `expiring`, `400` on a
+  bad path shape (relative path, `..` segment, backslash, empty, or over
+  256 bytes), `404 not_found` when the path does not exist OR resolves to a
+  directory or symlink (both rejected before any bytes leave the daemon), and
+  `413 file_too_large` when the file exceeds `WISP_MAX_FILE_READ_BYTES`
+  (default 16 MiB). Single file only, no directory listing, no glob.
 - `WS /contracts/:id/shell` bridges a TTY exec of `/bin/sh` (`cmd.exe` on
   Windows). Raw bytes ride binary messages both ways; a text message
   `{"type":"resize","rows":n,"cols":n}` resizes the TTY and any other text is

@@ -1,8 +1,10 @@
 package runtime
 
 import (
+	"archive/tar"
 	"context"
 	"errors"
+	"io"
 	"reflect"
 	"testing"
 )
@@ -451,6 +453,112 @@ func TestFakeDaemonInfo(t *testing.T) {
 			t.Errorf("DaemonInfo err = %v, want sentinel", err)
 		}
 	})
+}
+
+// TestFakeCopyFilesToContainer verifies the fake stores each entry keyed by
+// absolute path, records the batch in CopyCalls (so tests can assert ordering
+// against Execs), and rejects operations against unknown or stopped
+// containers with the same ErrNotFound / ErrNotRunning sentinels the exec
+// paths use.
+func TestFakeCopyFilesToContainer(t *testing.T) {
+	ctx := context.Background()
+	f := NewFake()
+	id, _ := f.Create(ctx, "img", CreateOptions{})
+	if err := f.Start(ctx, id); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	files := []FileEntry{
+		{Path: "/etc/hi", Content: []byte("hello")},
+		{Path: "/etc/there", Content: []byte("world")},
+	}
+	if err := f.CopyFilesToContainer(ctx, id, files); err != nil {
+		t.Fatalf("CopyFilesToContainer: %v", err)
+	}
+	c, _ := f.Container(id)
+	if got := string(c.Files["/etc/hi"].Content); got != "hello" {
+		t.Errorf("Files[/etc/hi] = %q, want hello", got)
+	}
+	if got := string(c.Files["/etc/there"].Content); got != "world" {
+		t.Errorf("Files[/etc/there] = %q, want world", got)
+	}
+	if len(c.CopyCalls) != 1 || !reflect.DeepEqual(c.CopyCalls[0], []string{"/etc/hi", "/etc/there"}) {
+		t.Errorf("CopyCalls = %v, want single batch [/etc/hi /etc/there]", c.CopyCalls)
+	}
+
+	// Unknown container is ErrNotFound.
+	if err := f.CopyFilesToContainer(ctx, "nope", files); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown container err = %v, want ErrNotFound", err)
+	}
+	// Stopped container is ErrNotRunning.
+	stoppedID, _ := f.Create(ctx, "img", CreateOptions{})
+	if err := f.CopyFilesToContainer(ctx, stoppedID, files); !errors.Is(err, ErrNotRunning) {
+		t.Errorf("stopped container err = %v, want ErrNotRunning", err)
+	}
+	// Empty file list is a no-op that returns nil.
+	if err := f.CopyFilesToContainer(ctx, id, nil); err != nil {
+		t.Errorf("empty files err = %v, want nil", err)
+	}
+}
+
+// TestFakeCopyFileFromContainer verifies the read side: a written file comes
+// back with its bytes and declared size, a TypeOverride of tar.TypeDir
+// surfaces ErrFileIsDirectory, tar.TypeSymlink surfaces ErrFileIsSymlink, and
+// an unknown path is ErrNotFound. The Body reader always yields exactly Size
+// bytes.
+func TestFakeCopyFileFromContainer(t *testing.T) {
+	ctx := context.Background()
+	f := NewFake()
+	id, _ := f.Create(ctx, "img", CreateOptions{})
+	_ = f.Start(ctx, id)
+	if err := f.CopyFilesToContainer(ctx, id, []FileEntry{{Path: "/hello", Content: []byte("hi")}}); err != nil {
+		t.Fatalf("CopyFilesToContainer: %v", err)
+	}
+
+	res, err := f.CopyFileFromContainer(ctx, id, "/hello")
+	if err != nil {
+		t.Fatalf("CopyFileFromContainer: %v", err)
+	}
+	if res.Size != 2 {
+		t.Errorf("Size = %d, want 2", res.Size)
+	}
+	body, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "hi" {
+		t.Errorf("body = %q, want hi", body)
+	}
+
+	// TypeOverride drives the rejection paths without needing a real tar.
+	c, _ := f.Container(id)
+	c.Files["/hello"] = FakeFileEntry{Content: []byte("hi"), TypeOverride: tar.TypeDir}
+	if _, err := f.CopyFileFromContainer(ctx, id, "/hello"); !errors.Is(err, ErrFileIsDirectory) {
+		t.Errorf("TypeDir err = %v, want ErrFileIsDirectory", err)
+	}
+	c.Files["/hello"] = FakeFileEntry{Content: []byte("hi"), TypeOverride: tar.TypeSymlink}
+	if _, err := f.CopyFileFromContainer(ctx, id, "/hello"); !errors.Is(err, ErrFileIsSymlink) {
+		t.Errorf("TypeSymlink err = %v, want ErrFileIsSymlink", err)
+	}
+	c.Files["/hello"] = FakeFileEntry{Content: []byte("hi"), TypeOverride: tar.TypeFifo}
+	if _, err := f.CopyFileFromContainer(ctx, id, "/hello"); !errors.Is(err, ErrFileNotRegular) {
+		t.Errorf("TypeFifo err = %v, want ErrFileNotRegular", err)
+	}
+
+	// Unknown path is ErrNotFound.
+	if _, err := f.CopyFileFromContainer(ctx, id, "/missing"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing path err = %v, want ErrNotFound", err)
+	}
+	// Unknown container is ErrNotFound.
+	if _, err := f.CopyFileFromContainer(ctx, "nope", "/hello"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown container err = %v, want ErrNotFound", err)
+	}
+	// Stopped container is ErrNotRunning.
+	stoppedID, _ := f.Create(ctx, "img", CreateOptions{})
+	if _, err := f.CopyFileFromContainer(ctx, stoppedID, "/hello"); !errors.Is(err, ErrNotRunning) {
+		t.Errorf("stopped container err = %v, want ErrNotRunning", err)
+	}
 }
 
 // TestFakeCreateIsolationMechanism verifies the Fake resolves the isolation

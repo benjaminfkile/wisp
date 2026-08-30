@@ -154,6 +154,13 @@ type broker struct {
 	// from WISP_KILL_TIMEOUT_SECONDS via Daemon.SetKillTimeout.
 	killTimeout time.Duration
 
+	// maxFileReadBytes caps the size of a single file GET /contracts/{id}/files
+	// will stream back. A file larger than this is rejected with 413 and a
+	// clear file_too_large error body, never truncated silently. Defaults to
+	// defaultMaxFileReadBytes; set from WISP_MAX_FILE_READ_BYTES via
+	// Daemon.SetMaxFileReadBytes.
+	maxFileReadBytes int64
+
 	// now is the clock used to compute time remaining; injectable for tests.
 	now func() time.Time
 }
@@ -162,7 +169,7 @@ type broker struct {
 // and event bus. appToken gates contract creation and the bus; an empty value
 // disables that gate.
 func newBroker(store *contract.Store, rt runtime.Runtime, pol *policy.Config, b *bus.Bus, logger *slog.Logger, appToken string) *broker {
-	br := &broker{store: store, rt: rt, pol: pol, bus: b, logger: logger, appToken: appToken, killTimeout: defaultReleaseKillTimeout, now: time.Now}
+	br := &broker{store: store, rt: rt, pol: pol, bus: b, logger: logger, appToken: appToken, killTimeout: defaultReleaseKillTimeout, maxFileReadBytes: defaultMaxFileReadBytes, now: time.Now}
 	br.iso = br.detectIsolation(context.Background())
 	br.gpu = br.detectGPU(context.Background())
 	// Build the exclusive device allocator over the effective GPU inventory so the
@@ -306,6 +313,10 @@ func (b *broker) routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /contracts/{id}", b.release)
 	mux.HandleFunc("POST /contracts/{id}/exec", b.exec)
 	mux.HandleFunc("GET /contracts/{id}/shell", b.shell)
+	// GET /contracts/{id}/files streams a single file's bytes from the
+	// container's filesystem. Auth mirrors GET /contracts/{id}: the app token
+	// OR the contract's own bearer token authorizes it; see fileDownload.
+	mux.HandleFunc("GET /contracts/{id}/files", b.fileDownload)
 	mux.HandleFunc("POST /events", b.requireAppToken(b.publishEvent))
 	mux.HandleFunc("GET /events", b.subscribeEvents)
 }
@@ -400,6 +411,15 @@ type createRequest struct {
 	// at maxExternalIDLen so a malicious caller cannot smuggle an unbounded
 	// identifier into a container label.
 	ExternalID string `json:"external_id"`
+
+	// Files is the optional set of files to write into the container AFTER
+	// start and BEFORE userdata runs, so userdata scripts can read them. Each
+	// entry is {path, content_base64}; the caps are pinned across repos: at
+	// most 16 files, 1 MiB decoded total, absolute unix-style paths without
+	// backslash or ".." segments, at most 256 chars per path, unique per
+	// request, and each content_base64 must decode cleanly (bad base64 is a
+	// validation_error, never silently ignored). See validateAndDecodeFiles.
+	Files []fileEntry `json:"files"`
 }
 
 // Env injection limits. These cap the blast radius of the opaque env map so a
@@ -601,6 +621,16 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate and decode the optional files array up front, so a rejected
+	// batch turns into a clean 400 with no capacity reservation, GPU
+	// allocation, or store row created. Every cap breach is a rejection, never
+	// a silent clamp; see validateAndDecodeFiles for the pinned rules.
+	files, err := validateAndDecodeFiles(req.Files)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	// Cap the opaque external_id so a caller cannot smuggle an unbounded
 	// identifier into a container label. Empty is fine - the caller may omit it.
 	if len(req.ExternalID) > maxExternalIDLen {
@@ -684,7 +714,7 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 	// satellite can start watching for its contract.ready (see docs/DESIGN.md §6).
 	b.publishLifecycle(eventContractCreated, c)
 
-	c, err = b.provision(r.Context(), c, spec, req.Userdata)
+	c, err = b.provision(r.Context(), c, spec, req.Userdata, files)
 	if err != nil {
 		// An image whose OS does not match this host's container mode is a client
 		// choice we cannot validate up front, so it surfaces here as a clear 400
@@ -959,7 +989,7 @@ type gpuDeviceResponse struct {
 // stalled (the 224 s POST /contracts observed in the 2026-08-29 wisp log
 // carried no per-phase breakdown, which is what this log fixes). Every duration
 // is in milliseconds; a phase that did not run (e.g. empty userdata) reports 0.
-func (b *broker) provision(ctx context.Context, c contract.Contract, spec launchSpec, userdata string) (contract.Contract, error) {
+func (b *broker) provision(ctx context.Context, c contract.Contract, spec launchSpec, userdata string, files []runtime.FileEntry) (contract.Contract, error) {
 	if _, err := b.store.UpdateState(c.ID, contract.StateProvisioning); err != nil {
 		return c, err
 	}
@@ -969,6 +999,7 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, spec launch
 		imageMS    int64
 		createMS   int64
 		startMS    int64
+		filesMS    int64
 		userdataMS int64
 	)
 
@@ -1002,6 +1033,20 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, spec launch
 	}
 	startMS = b.now().Sub(startAt).Milliseconds()
 
+	// Write the caller-supplied files AFTER the container is running but BEFORE
+	// userdata runs, so a userdata script can read them. The caller has already
+	// validated shape and caps in the create handler, so any error here is a
+	// runtime failure (e.g. the daemon refused the archive PUT), which is
+	// terminal for this create just like a failed image ensure or start.
+	if len(files) > 0 {
+		filesStart := b.now()
+		if err := b.rt.CopyFilesToContainer(ctx, cid, files); err != nil {
+			b.fail(ctx, c.ID, cid)
+			return c, err
+		}
+		filesMS = b.now().Sub(filesStart).Milliseconds()
+	}
+
 	if userdata != "" {
 		udStart := b.now()
 		res, err := b.rt.ExecSync(ctx, cid, runtime.ShellCommand(b.rt.ContainerOS(), userdata))
@@ -1030,6 +1075,7 @@ func (b *broker) provision(ctx context.Context, c contract.Contract, spec launch
 		"image_ms", imageMS,
 		"create_ms", createMS,
 		"start_ms", startMS,
+		"files_ms", filesMS,
 		"userdata_ms", userdataMS,
 	)
 

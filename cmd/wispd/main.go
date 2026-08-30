@@ -72,6 +72,10 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, pol *policy
 	// WISP_KILL_TIMEOUT_SECONDS the reaper uses so the release path and the
 	// reaper's release-grace escape hatch share one kill bound end to end.
 	daemon.SetKillTimeout(cfg.KillTimeout)
+	// The GET /contracts/{id}/files download cap is threaded through the
+	// broker from WISP_MAX_FILE_READ_BYTES (default 16 MiB) so a file larger
+	// than the operator's ceiling is rejected with 413 file_too_large.
+	daemon.SetMaxFileReadBytes(cfg.MaxFileReadBytes)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

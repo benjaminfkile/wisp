@@ -282,7 +282,7 @@ func TestProvisionFailureFreesGPUs(t *testing.T) {
 	// Force the container create to fail so provision drives the contract through
 	// fail(), which must free the held device.
 	fake.CreateErr = context.DeadlineExceeded
-	if _, err := b.provision(ctx, c, launchSpec{image: "wisp-base", isolation: policy.IsolationShared}, ""); err == nil {
+	if _, err := b.provision(ctx, c, launchSpec{image: "wisp-base", isolation: policy.IsolationShared}, "", nil); err == nil {
 		t.Fatal("provision succeeded, want failure")
 	}
 	if got, _ := store.Get(c.ID); got.State != contract.StateExpired {

@@ -68,6 +68,10 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, pol *policy
 	// so the reconcile and the reaper below operate on the SAME GPU device
 	// allocator the create path allocates from (see server.NewDaemon).
 	daemon := server.NewDaemon(logger, store, rt, pol, eventBus, cfg.AppToken)
+	// The DELETE handler's detached kill is bounded by the same
+	// WISP_KILL_TIMEOUT_SECONDS the reaper uses so the release path and the
+	// reaper's release-grace escape hatch share one kill bound end to end.
+	daemon.SetKillTimeout(cfg.KillTimeout)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

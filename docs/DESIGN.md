@@ -101,21 +101,30 @@ requested → provisioning → ready → (in use) → expiring → releasing →
   once the contract reaches `releasing` or a terminal state do they return `409`.
 - **releasing**: the transient, **non-terminal** fence a `DELETE /contracts/:id` installs BEFORE
   killing the container so the reaper's TTL / container-died sweeps cannot race the release. The
-  reaper skips `releasing` contracts for a short release grace
-  (`WISP_RELEASE_GRACE_SECONDS`, default 30 s), and inside that window the DELETE handler is the
-  sole owner of the container kill and the terminal transition. Past the grace the release is
-  presumed stuck (the handler died mid-release, or its request was cancelled before it reached
-  the final mark-released transition) and the reaper expires the contract just like any other
-  non-terminal one, so the lease's capacity and GPUs return to the allocators instead of leaking
-  until restart; `expired` is therefore also a legal successor from `releasing`. A hung Docker
-  daemon on the reaper's own `Kill` is bounded separately by `WISP_KILL_TIMEOUT_SECONDS` and
-  runs off the tick in its own goroutine (see §13, "Reaper Kill is bounded and runs off the
-  tick"), not by this grace. Exec and shell are `409` against a `releasing` contract
-  (the container is being torn down). A `DELETE` against a contract already in `releasing` is an
-  idempotent success (200 echoing the current `releasing` status) so a concurrent second DELETE
-  does not double-kill or double-free. The state is internal to the release handler (it lives at
-  most for one container-kill call under normal conditions) and is excluded from `GET /contracts`
-  the same way `requested` is, so the list `status` enum stays `provisioning|ready|expiring`.
+  release handler runs the container kill under a **detached context** bounded by
+  `WISP_KILL_TIMEOUT_SECONDS` (see §13), so a client disconnect (or a request timeout during a
+  slow docker remove) does not cancel a kill in flight and falsely resolve the release as
+  successful. On a successful kill the handler completes the transition to `released`; on a
+  timeout or any error other than container-not-found the handler responds `200` with the
+  current `releasing` status (matching the DELETE-on-releasing echo below), the contract stays
+  in `releasing`, and the detached kill continues to observe its own bounded context in the
+  background so `srv.Shutdown` is not pinned to a stalled release. The reaper skips `releasing`
+  contracts for a short release grace (`WISP_RELEASE_GRACE_SECONDS`, default 30 s), and inside
+  that window the DELETE handler is the sole owner of the container kill and the terminal
+  transition. Past the grace the release is presumed stuck (the handler died mid-release, or
+  its request was cancelled before it reached the final mark-released transition, or its own
+  bounded kill timed out) and the reaper expires the contract just like any other non-terminal
+  one, so the lease's capacity and GPUs return to the allocators instead of leaking until
+  restart; `expired` is therefore also a legal successor from `releasing`. A hung Docker daemon
+  on the reaper's own `Kill` is bounded separately by `WISP_KILL_TIMEOUT_SECONDS` and runs off
+  the tick in its own goroutine (see §13, "Reaper Kill is bounded and runs off the tick"), not
+  by this grace. Exec and shell are `409` against a `releasing` contract (the container is
+  being torn down). A `DELETE` against a contract already in `releasing` is an idempotent
+  success (200 echoing the current `releasing` status) so a concurrent second DELETE does not
+  double-kill or double-free. The state is internal to the release handler (it lives at most
+  for one container-kill call under normal conditions, or until the reaper's grace elapses on
+  a stalled kill) and is excluded from `GET /contracts` the same way `requested` is, so the
+  list `status` enum stays `provisioning|ready|expiring`.
 - **released**: client called `DELETE /contracts/:id`. A `DELETE` against a contract that is
   already `released` or `expired` is an idempotent success (200 echoing the terminal status) and
   never frees capacity or GPUs a second time. A `DELETE` whose fence-installing transition finds
@@ -636,6 +645,21 @@ switches it**, it only serves whichever mode the host is in.
   so the DELETE handler path is unchanged and terminal side effects still happen exactly
   once even when a `DELETE` wins the race. On timeout the contract is left in place for a
   later kill attempt.
+- **Release-handler Kill is detached and bounded**, the DELETE handler's own container
+  kill runs under a context detached from the request (so a client disconnect or a
+  timing-out slow docker remove does NOT cancel it mid-tear-down) and bounded by the
+  same `WISP_KILL_TIMEOUT_SECONDS`. Before the detach, a Kill under `r.Context()`
+  returned `context.Canceled` on cancellation, which the handler silently treated as
+  success: the contract transitioned to `released` and its capacity + GPUs were freed
+  while the container kept running, and the next wispd restart's reconcile then adopted
+  the survivor as a fresh contract. With the detach in place, a successful kill still
+  completes the transition to `released`; a kill that times out or errors leaves the
+  contract in `releasing`, the handler responds `200` with the current `releasing`
+  status (matching the concurrent-release echo, so the caller knows the release is not
+  final), and the reaper's release-grace escape hatch owns the eventual expiry so the
+  lease's capacity and GPUs still return to the allocators exactly once. The detached
+  kill continues to observe its bounded context in the background, so `srv.Shutdown`
+  proceeds within its own budget rather than being pinned to a stalled release.
 
 ## 14. Open questions
 

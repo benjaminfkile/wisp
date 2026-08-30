@@ -79,6 +79,23 @@ const bytesPerMB = 1024 * 1024
 // this is a 409 conflict, not a 400 rejection.
 const errAtCapacity = "host at capacity: contract, cpu, or memory budget exhausted"
 
+// defaultReleaseKillTimeout is the DELETE handler's default bound on a single
+// container kill run under the detached kill context. It matches the reaper's
+// defaultKillTimeout so the release path and the reaper's release-grace escape
+// hatch share one bound end to end; production wispd overrides this from
+// WISP_KILL_TIMEOUT_SECONDS via Daemon.SetKillTimeout (see cmd/wispd).
+const defaultReleaseKillTimeout = 30 * time.Second
+
+// releaseKillDrainGrace is the small extra window the release handler waits
+// for the detached kill goroutine to observe its context deadline and return
+// after killTimeout has elapsed. A well-behaved Docker daemon returns
+// context.DeadlineExceeded almost immediately; the grace only exists so we
+// prefer the actual kill error (which we log) over the handler's own
+// "timed out" branch. If the daemon ignores its context (pathological), the
+// goroutine leaks past this handler and the reaper's release-grace path owns
+// the terminal transition.
+const releaseKillDrainGrace = 250 * time.Millisecond
+
 // broker wires the contract model to the Runtime over HTTP. It owns the
 // lifecycle of a contract: create + boot + run userdata on POST, report status
 // on GET, and release (kill + mark released) on DELETE.
@@ -126,6 +143,17 @@ type broker struct {
 	// read surface advertises its live usage (the /images "capacity" block).
 	cap *capacity.Allocator
 
+	// killTimeout bounds a single container kill launched by the DELETE handler
+	// under its detached kill context so a hung Docker daemon cannot stall the
+	// handler indefinitely. On timeout the release is NOT transitioned to
+	// released: the contract is left in StateReleasing and the reaper's
+	// release-grace expiry path owns the terminal transition (freeing capacity
+	// and GPUs) so a stalled release still frees its lease's reservations,
+	// while the detached kill goroutine continues to observe its own bounded
+	// context in the background. Defaults to defaultReleaseKillTimeout; set
+	// from WISP_KILL_TIMEOUT_SECONDS via Daemon.SetKillTimeout.
+	killTimeout time.Duration
+
 	// now is the clock used to compute time remaining; injectable for tests.
 	now func() time.Time
 }
@@ -134,7 +162,7 @@ type broker struct {
 // and event bus. appToken gates contract creation and the bus; an empty value
 // disables that gate.
 func newBroker(store *contract.Store, rt runtime.Runtime, pol *policy.Config, b *bus.Bus, logger *slog.Logger, appToken string) *broker {
-	br := &broker{store: store, rt: rt, pol: pol, bus: b, logger: logger, appToken: appToken, now: time.Now}
+	br := &broker{store: store, rt: rt, pol: pol, bus: b, logger: logger, appToken: appToken, killTimeout: defaultReleaseKillTimeout, now: time.Now}
 	br.iso = br.detectIsolation(context.Background())
 	br.gpu = br.detectGPU(context.Background())
 	// Build the exclusive device allocator over the effective GPU inventory so the
@@ -1168,15 +1196,35 @@ func (b *broker) list(w http.ResponseWriter, r *http.Request) {
 
 // release handles DELETE /contracts/:id. It fences the reaper off the contract
 // by transitioning it to StateReleasing BEFORE killing the container, then
-// kills the container, then completes the terminal transition to
-// StateReleased. Fencing first is what stops the release from racing the
-// reaper's TTL / container-died sweep: without it the reaper could see the
-// container die (as the release handler's Kill is stopping it), expire the
-// contract, log a spurious "removal already in progress" from its own Kill,
-// and then purge the contract from the store, leaving the release handler's
-// final UpdateState to fail "contract not found" and return 500 (the exact
+// kills the container under a DETACHED context bounded by killTimeout, and on
+// a successful kill completes the terminal transition to StateReleased.
+// Detaching the kill from r.Context() is what stops a client disconnect or a
+// timing-out slow docker remove from cancelling the kill mid-tear-down: the
+// bug the detach fixes is a Kill returning context.Canceled on a slow remove
+// while the container is still running, which the pre-detach code silently
+// treated as success and transitioned to released, freeing the lease's
+// capacity and GPUs while the container kept running. Fencing first is what
+// stops the release from racing the reaper's TTL / container-died sweep:
+// without it the reaper could see the container die (as the release handler's
+// Kill is stopping it), expire the contract, log a spurious "removal already
+// in progress" from its own Kill, and then purge the contract from the store,
+// leaving the release handler's final UpdateState to fail "contract not
+// found" and return 500 (the exact
 // 2026-08-29 wisp-log failure the fence was added for). With the fence in
 // place, the reaper's reap() skips StateReleasing and cannot win.
+//
+// A kill that either times out under killTimeout or returns any error other
+// than runtime.ErrNotFound leaves the contract in StateReleasing and returns
+// 200 with the current status (matching the concurrent-release DELETE-on-
+// releasing echo), so the caller knows the release is not yet final. The
+// reaper's release-grace escape hatch then owns the terminal transition:
+// past defaultReleaseGrace it expires a stuck-releasing contract like any
+// other non-terminal lease, freeing its capacity and GPUs exactly once via
+// the state-machine gate. The detached kill goroutine continues to observe
+// its own bounded context in the background, so a slow docker remove that
+// eventually succeeds still tears the container down even though the handler
+// has already returned; that also lets srv.Shutdown proceed within its own
+// budget rather than being pinned to a stalled release.
 //
 // Releasing an already-terminal contract is an IDEMPOTENT success (the
 // contract IS released in every sense the caller cares about) so a DELETE
@@ -1241,8 +1289,32 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if c.ContainerID != "" {
-		if err := b.rt.Kill(r.Context(), c.ContainerID); err != nil && !errors.Is(err, runtime.ErrNotFound) {
-			b.logger.Error("kill container on release", "contract_id", c.ID, "error", err)
+		killErr, timedOut := b.killForRelease(r.Context(), c.ContainerID)
+		if timedOut || (killErr != nil && !errors.Is(killErr, runtime.ErrNotFound)) {
+			// Do NOT transition. Leave the contract in StateReleasing so the reaper's
+			// release-grace escape hatch owns the terminal transition (freeing capacity
+			// and GPUs) once the grace elapses; the detached kill goroutine continues
+			// in the background under its own bounded context. Respond 200 with the
+			// current status so the caller knows the release is not yet final (matching
+			// the DELETE-on-releasing echo above).
+			if timedOut {
+				b.logger.Warn("release: container kill did not complete within timeout; leaving contract releasing",
+					"contract_id", c.ID, "container_id", c.ContainerID, "timeout", b.killTimeout)
+			} else {
+				b.logger.Error("release: kill container; leaving contract releasing",
+					"contract_id", c.ID, "container_id", c.ContainerID, "error", killErr)
+			}
+			cur, gerr := b.store.Get(c.ID)
+			if gerr != nil {
+				// The store no longer has this contract - the reaper's cleanup sweep
+				// after a past-grace expiry ran between our fence and this Get. Fall
+				// back to the pre-fence snapshot with the status forced to releasing
+				// so the wire shape stays consistent for the caller.
+				writeJSON(w, http.StatusOK, b.releasingStatusFor(c))
+				return
+			}
+			writeJSON(w, http.StatusOK, b.statusOf(cur))
+			return
 		}
 	}
 
@@ -1297,6 +1369,66 @@ func (b *broker) releasedStatusFor(c contract.Contract) statusResponse {
 		Gpus:                c.GPUDeviceIDs,
 		Meta:                c.Meta,
 		ExternalID:          c.ExternalID,
+	}
+}
+
+// releasingStatusFor synthesizes a releasing-status response for the pathological
+// case where the release handler's post-kill Get finds the contract has been
+// purged from the store between the fence and the timed-out kill (e.g. the
+// reaper's cleanup sweep after a past-grace expiry ran between them). The
+// pre-fence snapshot carries the id, gpus, meta, and external_id; the status is
+// forced to StateReleasing so the wire shape stays consistent with the DELETE-on-
+// releasing echo the caller is expecting from this branch.
+func (b *broker) releasingStatusFor(c contract.Contract) statusResponse {
+	return statusResponse{
+		ContractID:          c.ID,
+		Status:              string(contract.StateReleasing),
+		TTLSecondsRemaining: 0,
+		Gpus:                c.GPUDeviceIDs,
+		Meta:                c.Meta,
+		ExternalID:          c.ExternalID,
+	}
+}
+
+// killForRelease runs the container kill for a DELETE under a DETACHED context
+// bounded by killTimeout. Detaching from the request context is what stops a
+// client disconnect (or a request timeout) from cancelling a kill in flight and
+// turning a slow docker remove into a spurious context.Canceled that the caller
+// used to treat as success, transitioning the contract to released while the
+// container kept running (the bug this handler was rewritten to close). The kill
+// runs in its own goroutine so the handler can bail out and let srv.Shutdown
+// proceed within its own budget rather than being pinned to a stalled release;
+// the goroutine keeps observing its bounded killCtx in the background so a slow
+// docker remove that eventually succeeds still tears the container down.
+//
+// It returns the Kill's own error (nil on clean success or on runtime.ErrNotFound
+// so the release still resolves as a successful teardown) and a timedOut flag
+// set when the goroutine did not return within killTimeout plus a small drain
+// grace. A pathological Docker daemon that ignores its context leaves the
+// goroutine leaked past this return; the reaper's release-grace escape hatch
+// owns the eventual terminal transition in that case.
+func (b *broker) killForRelease(ctx context.Context, containerID string) (killErr error, timedOut bool) {
+	killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.killTimeout)
+	resultCh := make(chan error, 1)
+	go func() {
+		defer cancel()
+		resultCh <- b.rt.Kill(killCtx, containerID)
+	}()
+
+	select {
+	case err := <-resultCh:
+		return err, false
+	case <-killCtx.Done():
+		// The bounded kill context has fired. Give the goroutine a very short
+		// grace to observe the deadline and return - a well-behaved runtime
+		// will surface context.DeadlineExceeded almost immediately, which is
+		// nicer to log than the handler's own "timed out" branch.
+		select {
+		case err := <-resultCh:
+			return err, false
+		case <-time.After(releaseKillDrainGrace):
+			return nil, true
+		}
 	}
 }
 

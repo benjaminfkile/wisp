@@ -284,17 +284,28 @@ WS     /events                        subscribe, optional ?type=a,b filter      
   `releasing` is the transient (non-terminal) fence the release handler
   installs before killing the container. `DELETE` first transitions the
   contract to `releasing` to fence the reaper off it, then kills the
-  container, then completes the transition to `released`. `DELETE` of an
-  already `released` or `expired` contract is an **idempotent success** (200
-  echoing the terminal status; nothing is freed twice); `DELETE` of a
-  contract already in `releasing` (a concurrent release is in flight) is
-  likewise 200 echoing the current `releasing` status without a second
-  container kill or a double free. A `DELETE` whose fence-installing
-  transition finds the contract already purged, or whose final mark-released
-  finds the store has since purged it, also returns 200 with a `released`
-  status. Unknown ids are `404`. Terminal contracts are purged from the
-  store one reaper sweep after they become terminal, after which their id is
-  `404`.
+  container under a **detached context** bounded by
+  `WISP_KILL_TIMEOUT_SECONDS` (see below), then, on a successful kill,
+  completes the transition to `released`. Detaching from the request
+  context is what stops a client disconnect (or a request timeout) from
+  cancelling a kill mid-tear-down and falsely resolving the release as
+  successful. If the kill times out or returns any error other than
+  container-not-found, the DELETE responds `200` echoing the current
+  `releasing` status (matching the concurrent-release echo below) so the
+  caller knows the release is not yet final; the contract stays in
+  `releasing`, the detached kill continues in the background under its own
+  bounded context, and the reaper's release-grace escape hatch (see the
+  Lifecycle section) later expires the contract, freeing its capacity and
+  GPUs. `DELETE` of an already `released` or `expired` contract is an
+  **idempotent success** (200 echoing the terminal status; nothing is
+  freed twice); `DELETE` of a contract already in `releasing` (a
+  concurrent release is in flight) is likewise 200 echoing the current
+  `releasing` status without a second container kill or a double free. A
+  `DELETE` whose fence-installing transition finds the contract already
+  purged, or whose final mark-released finds the store has since purged
+  it, also returns 200 with a `released` status. Unknown ids are `404`.
+  Terminal contracts are purged from the store one reaper sweep after
+  they become terminal, after which their id is `404`.
 - `POST /contracts/:id/exec` runs the command through `/bin/sh -c` (or `cmd /c`
   on a Windows daemon) as a fresh process and returns
   `{stdout, stderr, exit_code}` (a non-zero exit is still `200`). It is `409`
@@ -337,7 +348,13 @@ sweep in its own goroutine, so a wedged container adds no latency to the tick;
 the state transition and capacity free apply in that goroutine's completion,
 the tick skips any contract with a kill in flight so the next sweep never
 double-kills it, and a timed-out contract is left in place for a later kill
-attempt while the sweep proceeds with the remaining contracts. The reaper sweeps every
+attempt while the sweep proceeds with the remaining contracts. The DELETE
+handler's own container kill uses the same `WISP_KILL_TIMEOUT_SECONDS`
+bound and runs under a detached context, so a client disconnect mid-release
+does not cancel the kill and a slow docker remove does not pin the handler
+(or `srv.Shutdown`) past that bound; on timeout the handler leaves the
+contract in `releasing` and the reaper's release-grace path owns the
+eventual terminal transition. The reaper sweeps every
 `WISP_REAP_INTERVAL_SECONDS`: a `ready` contract inside the
 `WISP_EXPIRING_LEAD_SECONDS` window becomes `expiring`; a contract past its TTL
 is killed and `expired`; and a `ready`/`expiring` contract whose container has

@@ -105,7 +105,11 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, pol *policy
 		ReleaseGPUs:     daemon.ReleaseGPUs,
 		ReleaseCapacity: daemon.ReleaseCapacity,
 	})
-	go rp.Run(ctx)
+	reaperDone := make(chan struct{})
+	go func() {
+		rp.Run(ctx)
+		close(reaperDone)
+	}()
 
 	errc := make(chan error, 1)
 	go func() {
@@ -124,6 +128,13 @@ func run(logger *slog.Logger, cfg config.Config, rt runtime.Runtime, pol *policy
 		logger.Info("shutting down")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		err := srv.Shutdown(shutdownCtx)
+		// Let the reaper drain any in-flight Kill goroutines before returning
+		// so a container the reaper is mid-killing on shutdown is not left in
+		// an inconsistent state. Run itself bounds this drain by KillTimeout
+		// (see Reaper.Run), so a Docker daemon that ignores cancellation
+		// cannot hang wispd past its shutdown budget.
+		<-reaperDone
+		return err
 	}
 }

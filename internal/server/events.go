@@ -207,7 +207,7 @@ func eventsBridge(conn *websocket.Conn, sub *bus.Subscription) {
 
 	// Reader pump: the subscribe stream is server→client only, but the client
 	// may still send control frames (ping/close). Any read error means the
-	// client is gone — close the subscription so the range loop below ends.
+	// client is gone - close the subscription so the range loop below ends.
 	go func() {
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {

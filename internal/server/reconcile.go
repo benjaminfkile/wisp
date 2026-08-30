@@ -15,7 +15,7 @@ import (
 
 // Reconcile rebuilds the in-memory contract store from the Docker labels of
 // containers a previous wispd process left behind, so a crash or restart does
-// not orphan leased containers — which would otherwise keep running with the
+// not orphan leased containers - which would otherwise keep running with the
 // consumer's secrets in their environment and no daemon to enforce their TTL.
 //
 // It queries the runtime for every container carrying the wisp.contract label
@@ -29,7 +29,7 @@ import (
 // the first sweep.
 //
 // A non-running container carrying the contract label is a dead lease from a
-// prior wispd — its process is no longer running and no capacity is truly held
+// prior wispd - its process is no longer running and no capacity is truly held
 // by it. Reconcile does NOT adopt it (which would reserve full capacity for a
 // container that isn't consuming any and could report the host at_capacity while
 // idle) and instead force-removes it (rt.Kill), so a `docker ps -a` after
@@ -40,7 +40,7 @@ import (
 // so it is unambiguously ours; leaving it running would be worse than removing it,
 // so Reconcile force-removes it with a clear warn log rather than skipping it and
 // letting an unaccounted-for container linger forever. A failure to even list
-// containers is logged and returns without adopting anything — a best-effort
+// containers is logged and returns without adopting anything - a best-effort
 // recovery must never keep the daemon from starting.
 //
 // alloc, when non-nil, is the exclusive GPU device allocator: for each adopted
@@ -128,7 +128,7 @@ func Reconcile(ctx context.Context, store *contract.Store, rt runtime.Runtime, a
 		}
 		// Rebuild allocator occupancy so a device a surviving lease still holds is
 		// never re-assigned. A device id the host no longer detects is logged and
-		// skipped — the reconcile must not crash on stale hardware.
+		// skipped - the reconcile must not crash on stale hardware.
 		if alloc != nil && len(gpuIDs) > 0 {
 			if unknown := alloc.Reserve(gpuIDs); len(unknown) > 0 {
 				logger.Warn("reconcile: lease references GPU device(s) no longer detected; skipping those",
@@ -138,7 +138,7 @@ func Reconcile(ctx context.Context, store *contract.Store, rt runtime.Runtime, a
 		// Rebuild aggregate capacity usage so a restarted wispd never oversubscribes
 		// the host: re-Reserve this lease's contract slot plus its post-clamp cpus and
 		// memory, unconditionally (a reconciled lease already holds its capacity, even
-		// if a since-lowered budget would now reject it — see capacity.Allocator.Reserve).
+		// if a since-lowered budget would now reject it - see capacity.Allocator.Reserve).
 		if cap != nil {
 			cap.Reserve(cpus, memoryMB)
 		}
@@ -199,7 +199,7 @@ func parseExpiresAt(v string) (time.Time, bool) {
 // parseReservedCPUs parses a wisp.cpus label value (a lease's post-clamp reserved
 // CPU as a decimal fraction of host cores) into a float. It reports ok=false for an
 // empty, non-numeric, or negative value so the reconcile can warn and re-Reserve 0
-// on that dimension rather than corrupt aggregate usage with a bad figure — the
+// on that dimension rather than corrupt aggregate usage with a bad figure - the
 // read half of the wisp.cpus round-trip create writes.
 func parseReservedCPUs(v string) (float64, bool) {
 	if v == "" {

@@ -2,7 +2,7 @@
 // inventory of GPU device IDs.
 //
 // GPUs are leased as WHOLE devices: two live contracts must never share a device
-// ID (see docs/DESIGN.md §7). Wisp owns the assignment — the marketplace above
+// ID (see docs/DESIGN.md §7). Wisp owns the assignment - the marketplace above
 // only ever asks for a COUNT, and the allocator turns that count into a set of
 // specific, currently-free device IDs, reserving them exclusively until the
 // owning contract reaches a terminal state and frees them.
@@ -10,7 +10,7 @@
 // The allocator is deliberately BACKEND-AGNOSTIC: it deals in opaque device ID
 // strings only and carries no runc/docker/VFIO assumptions. The same allocator
 // hands IDs to today's runc/DeviceRequests path and, later, to a Kata + VFIO
-// passthrough path — neither leaks into this package (the KATA-INTENT rule).
+// passthrough path - neither leaks into this package (the KATA-INTENT rule).
 package gpu
 
 import (
@@ -106,7 +106,7 @@ func (a *Allocator) Allocate(n int) ([]string, error) {
 }
 
 // Free returns the given device IDs to the free pool. It is idempotent: freeing
-// a device that is already free — or an ID this allocator never knew — is a
+// a device that is already free - or an ID this allocator never knew - is a
 // no-op, so a contract killed twice (e.g. released and then swept by the reaper)
 // never double-frees a device into a state that could be re-handed to two
 // leases.

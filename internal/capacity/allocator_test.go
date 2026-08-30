@@ -148,7 +148,7 @@ func TestReserveIsUnconditional(t *testing.T) {
 
 // Under concurrent single-slot reservations against a fixed contract budget the
 // allocator admits exactly the budget and rejects the rest, never oversubscribing
-// — the aggregate mirror of the GPU allocator's exclusivity race test.
+// - the aggregate mirror of the GPU allocator's exclusivity race test.
 func TestTryReserveConcurrentCannotOversubscribe(t *testing.T) {
 	const budget = 8
 	const goroutines = 64

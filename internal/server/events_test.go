@@ -58,7 +58,7 @@ func readEvent(t *testing.T, conn *websocket.Conn) wsEvent {
 }
 
 // TestEventsPublishSubscribe: an event POSTed to /events is delivered to a WS
-// /events subscriber verbatim — acceptance criterion "publish -> subscribe
+// /events subscriber verbatim - acceptance criterion "publish -> subscribe
 // delivery works".
 func TestEventsPublishSubscribe(t *testing.T) {
 	h, _, _ := testServer(t)
@@ -89,7 +89,7 @@ func TestEventsPublishSubscribe(t *testing.T) {
 }
 
 // TestEventsTypeFilterHonored: a subscriber with ?type= receives only matching
-// events — acceptance criterion "type filter honored".
+// events - acceptance criterion "type filter honored".
 func TestEventsTypeFilterHonored(t *testing.T) {
 	h, _, _ := testServer(t)
 	srv := httptest.NewServer(h)
@@ -171,7 +171,7 @@ func TestEventsSubscribeRequiresAppToken(t *testing.T) {
 }
 
 // TestLifecycleEventsEmitted: creating a contract emits contract.created then
-// contract.ready, and releasing it emits contract.released — acceptance
+// contract.ready, and releasing it emits contract.released - acceptance
 // criterion "lifecycle events emitted on create/ready/release".
 func TestLifecycleEventsEmitted(t *testing.T) {
 	h, _, _ := testServer(t)

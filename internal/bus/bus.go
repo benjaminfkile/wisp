@@ -6,7 +6,7 @@
 // The bus is deliberately separate from the live session layer (exec/shell):
 // per docs/DESIGN.md §2, the bus is async coordination between apps (control
 // plane) and is never what a contract's session is built on. It interprets
-// neither an event's type string nor its payload — both are opaque.
+// neither an event's type string nor its payload - both are opaque.
 //
 // Delivery is fire-and-forget in-process fan-out. Each subscriber has a
 // buffered channel; a subscriber that cannot keep up has events dropped rather

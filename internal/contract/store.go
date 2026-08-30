@@ -123,7 +123,7 @@ func (s *Store) Create(p CreateParams) (Contract, error) {
 }
 
 // AdoptParams carries the fields needed to rebuild a tracking entry for a
-// container that already exists at startup — one launched by a previous wispd
+// container that already exists at startup - one launched by a previous wispd
 // process whose in-memory state was lost on restart (see the Docker-label
 // reconcile). The id and expiry come from the container's labels; the store
 // fills in the remaining bookkeeping so the reaper can enforce the TTL.
@@ -165,7 +165,7 @@ type AdoptParams struct {
 // treats it like any live lease: still-valid ones keep being tracked, and ones
 // already past ExpiresAt are reaped (their container killed) on the reaper's
 // first sweep. It generates a FRESH bearer token so the reconciled contract can
-// be driven via exec/shell — the original token died with the prior wispd's
+// be driven via exec/shell - the original token died with the prior wispd's
 // memory, and re-issuing one here lets an authenticated local agent recovering
 // its lease map re-associate the container with a working credential (client
 // Meta did not survive the restart, so it is left nil). A no-op if the id is

@@ -266,7 +266,7 @@ func TestFakeUnknownContainer(t *testing.T) {
 // TestFakeInspect verifies Inspect reports LivenessRunning for a started
 // container, LivenessStopped for a created-but-not-started one and for a killed
 // one, and LivenessGone for an unknown id. InspectOverrides forces a specific
-// state regardless of the tracked flags — the seam that stands in for a
+// state regardless of the tracked flags - the seam that stands in for a
 // container that died out of band without the Fake having to model daemon-side
 // death. InspectErr, when set, surfaces the transport-error path.
 func TestFakeInspect(t *testing.T) {

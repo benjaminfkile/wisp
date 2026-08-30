@@ -7,7 +7,7 @@ import (
 
 // Isolation is an ordered isolation level: the strength of the boundary between
 // a leased container and the host (and other leases). Levels form a total order
-// by rank — shared < sandboxed < vm — so a policy can reason about "at least
+// by rank - shared < sandboxed < vm - so a policy can reason about "at least
 // this strong" and the runtime layer can pick the container runtime that
 // satisfies a level. It is modeled on how the network policy works (a gated,
 // operator-owned dimension of a lease).
@@ -52,8 +52,8 @@ var isolationRanks = map[Isolation]int{
 }
 
 // ParseIsolation parses a level string case-insensitively (leading/trailing
-// space trimmed) into an Isolation. It recognizes every known level — including
-// confidential, which Validate later rejects as not-yet-supported — so the spec
+// space trimmed) into an Isolation. It recognizes every known level - including
+// confidential, which Validate later rejects as not-yet-supported - so the spec
 // is forward-compatible; any other string is an error. An empty string is NOT
 // defaulted here: callers apply the policy default before parsing.
 func ParseIsolation(s string) (Isolation, error) {
@@ -79,7 +79,7 @@ func (i Isolation) Rank() int {
 // Validate reports whether the level is one Wisp can launch today: a known level
 // at or below vm is valid; confidential parses but is rejected as not yet
 // supported; anything else is unknown. It does NOT consult the operator's
-// allow-list — the create path checks membership separately, mirroring how the
+// allow-list - the create path checks membership separately, mirroring how the
 // network policy validates a name and then gates it against Limits.Networks.
 func (i Isolation) Validate() error {
 	if _, ok := isolationRanks[i]; !ok {

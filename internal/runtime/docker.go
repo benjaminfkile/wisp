@@ -125,7 +125,7 @@ func (d *DockerRuntime) DaemonInfo(ctx context.Context) (DaemonInfo, error) {
 
 // GPUs implements Runtime by enumerating the host's GPUs via nvidia-smi behind
 // the runtime's CommandRunner (see enumerateGPUs). It does not itself gate on the
-// daemon advertising the "nvidia" runtime — that daemon-side half of GPU support
+// daemon advertising the "nvidia" runtime - that daemon-side half of GPU support
 // is DaemonInfo.Runtimes, combined with these devices by policy.EffectiveGPU. On
 // a GPU-less host nvidia-smi is absent, so this returns an error the caller
 // degrades to "no GPU support".
@@ -171,8 +171,8 @@ func (d *DockerRuntime) EnsureImage(ctx context.Context, ref string) error {
 
 // IdleCommand returns the no-op command Wisp runs as a leased container's main
 // (PID 1) process to keep it alive for the whole contract, chosen for the
-// container OS. A Wisp container does no work of its own — clients drive it via
-// exec/shell — so its main process just blocks; without it a bare base image's
+// container OS. A Wisp container does no work of its own - clients drive it via
+// exec/shell - so its main process just blocks; without it a bare base image's
 // default command exits and the container stops before any exec can attach.
 //
 // On Linux `tail -f /dev/null` blocks forever and exits on SIGTERM, so release
@@ -242,7 +242,7 @@ func DefaultShell(os ContainerOS) []string {
 // also mean an ARCHITECTURE mismatch (e.g. an arm64-only image on an amd64
 // daemon) rather than strictly an OS mismatch; the higher layer keeps the mapped
 // message honest about that (see mapOSMismatch in internal/server/contracts.go).
-// This only classifies the error — it never switches the daemon's mode, which
+// This only classifies the error - it never switches the daemon's mode, which
 // the operator owns. A nil error is never a mismatch.
 func IsImageOSMismatch(err error) bool {
 	if err == nil {
@@ -380,7 +380,7 @@ func (d *DockerRuntime) Start(ctx context.Context, id string) error {
 // so the id is no longer valid afterwards. A "no such container" response from
 // the daemon maps to ErrNotFound so the reaper's expire path (which suppresses
 // only that sentinel via errors.Is) does not log a spurious ERROR every time it
-// reaps a container that was removed out of band — the exact LivenessGone case
+// reaps a container that was removed out of band - the exact LivenessGone case
 // the container-death detection was built for. A "removal already in progress"
 // response (409 conflict, the shape the daemon returns when two Kill calls race
 // on the same container, e.g. the release handler and the reaper's
@@ -405,12 +405,12 @@ func (d *DockerRuntime) Kill(ctx context.Context, id string) error {
 
 // Inspect implements Runtime by asking the daemon for the container's current
 // state. A "no such container" response from the daemon means the container was
-// removed out of band and maps to LivenessGone (not an error — that is an
+// removed out of band and maps to LivenessGone (not an error - that is an
 // ordinary observation the reaper acts on). Otherwise the daemon's live
 // State.Running flag decides between LivenessRunning and LivenessStopped: a
 // paused or restarting container keeps State.Running=true on the daemon side
 // (see the docker daemon's SetRestarting / pause.go), so both map to
-// LivenessRunning — the SAFE mapping (no false-positive reap of a container
+// LivenessRunning - the SAFE mapping (no false-positive reap of a container
 // that is only paused or bouncing), which is what the reaper wants; only
 // created, exited, dead, and removing (all State.Running=false) collapse into
 // LivenessStopped. Any other error (e.g. daemon unreachable) is wrapped and

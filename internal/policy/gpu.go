@@ -2,8 +2,8 @@ package policy
 
 // GPU capability detection. Wisp advertises GPU capability the same data-driven
 // way it advertises isolation capability (see capability.go): the runtime layer
-// reports plain facts — the daemon's registered runtimes and the enumerated
-// devices — and this file intersects them with the operator's GPU config to get
+// reports plain facts - the daemon's registered runtimes and the enumerated
+// devices - and this file intersects them with the operator's GPU config to get
 // the EFFECTIVE posture the read surface advertises (the /images "gpu" block) and
 // the create path enforces (see docs/DESIGN.md §7).
 //
@@ -49,7 +49,7 @@ type GPUHostCapabilities struct {
 	Devices []GPUDevice
 }
 
-// hasNVIDIARuntime reports whether the daemon advertises the NVIDIA runtime — the
+// hasNVIDIARuntime reports whether the daemon advertises the NVIDIA runtime - the
 // daemon-side half of GPU support. It scans the runtime names as plain strings,
 // mirroring how SupportedIsolations scans them for runsc / kata.
 func hasNVIDIARuntime(runtimes []string) bool {
@@ -65,12 +65,12 @@ func hasNVIDIARuntime(runtimes []string) bool {
 // attached to a lease AT THAT LEVEL on this host. This is DATA, not a hard-coded
 // check: the kata/vm slot is present in the map but currently false, so adding a
 // GPU passthrough backend later (e.g. Kata + VFIO for vm) is implementing that
-// backend and flipping its entry to true here — with ZERO call-site changes (the
+// backend and flipping its entry to true here - with ZERO call-site changes (the
 // KATA-INTENT rule; see docs/DESIGN.md §7).
 //
 // v1 ships exactly one GPU backend: runc/shared, which attaches devices via
 // Docker DeviceRequests. So shared is true whenever the host supports GPUs at
-// all, and vm — which would need a Kata + VFIO backend that does not exist yet —
+// all, and vm - which would need a Kata + VFIO backend that does not exist yet -
 // is present but always false. The advertised "isolations" list is the keys that
 // map to true (at most ["shared"] in v1).
 func gpuAttachByIsolation(supported bool) map[Isolation]bool {
@@ -116,7 +116,7 @@ func (g GPUCapabilities) MaxGPUs() int { return g.maxGPUs }
 func (g GPUCapabilities) Attach(level Isolation) bool { return g.attach[level] }
 
 // Isolations returns the isolation levels at which GPU attach is available on
-// this host — the attach map's true entries — in isolation-rank order (shared
+// this host - the attach map's true entries - in isolation-rank order (shared
 // before vm). The result is a fresh, non-nil slice; in v1 it is at most
 // ["shared"]. This is the wire contract's "isolations" list.
 func (g GPUCapabilities) Isolations() []Isolation {
@@ -132,7 +132,7 @@ func (g GPUCapabilities) Isolations() []Isolation {
 }
 
 // GPUDrop describes GPU capacity the operator's policy withheld from what the
-// host physically offers, so the caller can log it at startup — mirroring the
+// host physically offers, so the caller can log it at startup - mirroring the
 // dropped-levels warning EffectiveIsolation returns. A zero GPUDrop means the
 // operator withheld nothing (or the host has no GPUs to withhold).
 type GPUDrop struct {
@@ -158,7 +158,7 @@ type GPUDrop struct {
 // A host supports GPUs iff the daemon advertises the "nvidia" runtime AND at
 // least one device was enumerated; the operator may additionally disable leasing
 // outright (Limits.GPUsDisabled). When supported, the effective per-lease cap is
-// min(operator cap, detected count) — a zero operator cap (the unconfigured
+// min(operator cap, detected count) - a zero operator cap (the unconfigured
 // default) means "no operator cap", i.e. all detected devices. When unsupported,
 // the posture is the wire contract's empty shape (devices=[], max_gpus=0) and the
 // attach map is all-false. The per-isolation attach map is always present with

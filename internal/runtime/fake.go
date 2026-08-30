@@ -87,7 +87,7 @@ type Fake struct {
 	// InspectOverrides lets a test force Inspect to report a specific
 	// LivenessState for a given container id, regardless of the container's
 	// tracked Started/Killed flags. It is the seam for the "container died out
-	// of band" scenario a Fake otherwise can't reach — the reaper's liveness
+	// of band" scenario a Fake otherwise can't reach - the reaper's liveness
 	// sweep needs the runtime to report a container Wisp still thinks is alive
 	// as stopped or gone, so a test sets that mapping here. An entry mapping to
 	// LivenessGone stands in for a docker-rm.
@@ -175,7 +175,7 @@ func (f *Fake) DaemonInfo(ctx context.Context) (DaemonInfo, error) {
 }
 
 // GPUs implements Runtime, reporting the Fake's configured GPUDevices (or GPUErr
-// when set). It never shells out — tests model an enumerated GPU host by setting
+// when set). It never shells out - tests model an enumerated GPU host by setting
 // GPUDevices and a GPU-less or broken host by leaving it nil or setting GPUErr.
 func (f *Fake) GPUs(ctx context.Context) ([]GPUDevice, error) {
 	f.mu.Lock()
@@ -263,7 +263,7 @@ func (f *Fake) Start(ctx context.Context, id string) error {
 // Inspect implements Runtime. It reports LivenessRunning for a tracked
 // container that has been Started (and not Killed), LivenessStopped for a
 // tracked-but-not-started container, and LivenessGone for an unknown id. Tests
-// can override the reported state per id via InspectOverrides — the seam that
+// can override the reported state per id via InspectOverrides - the seam that
 // stands in for a container that died out of band (docker kill / rm) without
 // the Fake having to model daemon-side death itself. InspectErr, when set,
 // takes precedence and is returned so callers can exercise the transport-error

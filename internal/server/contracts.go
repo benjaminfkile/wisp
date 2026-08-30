@@ -41,8 +41,8 @@ const expiresAtLabel = runtime.ExpiresAtLabel
 const gpusLabel = runtime.GPUsLabel
 
 // cpusLabel and memoryMBLabel are the container labels carrying a lease's
-// POST-CLAMP reserved CPU and memory — exactly the amounts reserved in the
-// aggregate capacity allocator — written at create time next to contractLabel so
+// POST-CLAMP reserved CPU and memory - exactly the amounts reserved in the
+// aggregate capacity allocator - written at create time next to contractLabel so
 // a wispd restart can rebuild aggregate capacity usage from the container's labels
 // alone and never oversubscribe the host by under-counting a live lease (see
 // reconcile). Defined in the runtime package for the same reason as contractLabel.
@@ -75,7 +75,7 @@ const bytesPerMB = 1024 * 1024
 // total memory). It carries the stable "at capacity" token upstream matches on and
 // is deliberately DISTINCT from the GPU allocator's "no GPU devices currently
 // available" 409, so a caller can tell host-budget exhaustion from GPU exhaustion.
-// The ask itself was within the per-lease caps — the HOST is full — which is why
+// The ask itself was within the per-lease caps - the HOST is full - which is why
 // this is a 409 conflict, not a 400 rejection.
 const errAtCapacity = "host at capacity: contract, cpu, or memory budget exhausted"
 
@@ -97,15 +97,15 @@ type broker struct {
 	// the event bus. An empty value disables the gate (see docs/DESIGN.md §8).
 	appToken string
 
-	// iso is the host's effective isolation posture — the operator allow-list
-	// intersected with the levels the daemon can actually run — computed once at
+	// iso is the host's effective isolation posture - the operator allow-list
+	// intersected with the levels the daemon can actually run - computed once at
 	// construction (see detectIsolation). The create path validates a requested
 	// level against it so the host never accepts an isolation it cannot launch,
 	// and the read surface advertises it.
 	iso policy.IsolationCapabilities
 
-	// gpu is the host's effective GPU posture — the operator's GPU config
-	// intersected with the daemon's NVIDIA runtime and the enumerated devices —
+	// gpu is the host's effective GPU posture - the operator's GPU config
+	// intersected with the daemon's NVIDIA runtime and the enumerated devices -
 	// computed once at construction (see detectGPU). The read surface advertises it
 	// (the /images "gpu" block) and the create path enforces it (see allocateGPUs).
 	gpu policy.GPUCapabilities
@@ -165,7 +165,7 @@ func gpuDeviceIDs(devices []policy.GPUDevice) []string {
 // enforces and the read surface advertises. Any policy-allowed level the host
 // cannot run is dropped and logged as a startup WARNING. When NONE of the
 // configured levels are runnable and the allow-list explicitly excluded shared,
-// the host is treated as degraded — it logs an ERROR and advertises an empty
+// the host is treated as degraded - it logs an ERROR and advertises an empty
 // isolation set rather than silently downgrading to the weakest tier. Detection
 // is best-effort: if the daemon info call fails, it falls back to the levels
 // derivable from the already-detected container OS (shared always, plus vm on a
@@ -188,7 +188,7 @@ func (b *broker) detectIsolation(ctx context.Context) policy.IsolationCapabiliti
 	if len(dropped) > 0 && len(ic.Levels()) == 0 {
 		// All configured isolation levels are unavailable on this host and the
 		// allow-list explicitly excluded shared. Refuse to silently downgrade to
-		// the weakest tier — that is the opposite of the operator's security
+		// the weakest tier - that is the opposite of the operator's security
 		// intent. Advertise an empty isolation set (host degraded) so no images
 		// are offered under a weaker tier than the operator authorised.
 		b.logger.Error("configured isolation levels unavailable on this host; host will advertise no isolation for images (refusing silent downgrade to shared)",
@@ -207,7 +207,7 @@ func (b *broker) detectIsolation(ctx context.Context) policy.IsolationCapabiliti
 // data-driven way detectIsolation computes the isolation posture. GPU support has
 // two halves: the daemon advertising the NVIDIA runtime (from DaemonInfo) and
 // nvidia-smi enumerating at least one device (from Runtime.GPUs). Only when the
-// daemon reports the NVIDIA runtime does it bother enumerating — a GPU-less host
+// daemon reports the NVIDIA runtime does it bother enumerating - a GPU-less host
 // has no nvidia-smi, so a needless shell-out and scary log line are avoided; the
 // policy layer still re-derives support authoritatively from the runtimes+devices
 // data (see policy.EffectiveGPU). Detection is best-effort: any failure (daemon
@@ -284,7 +284,7 @@ func (b *broker) routes(mux *http.ServeMux) {
 
 // requireAppToken wraps next so it runs only when the request carries the
 // app-level bearer token (Authorization: Bearer <token>). When the configured
-// app token is empty the gate is disabled and every request passes through —
+// app token is empty the gate is disabled and every request passes through -
 // the localhost-friendly default (see docs/DESIGN.md §8). Otherwise a missing or
 // mismatched token is rejected with 401 before next runs. The comparison is
 // constant-time (see bearerMatches).
@@ -299,7 +299,7 @@ func (b *broker) requireAppToken(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // authorizedForContract reports whether r may act on a per-contract endpoint
-// (today: GET /contracts/{id} and DELETE /contracts/{id}) — the app token OR
+// (today: GET /contracts/{id} and DELETE /contracts/{id}) - the app token OR
 // the contract's own bearer token authorizes it, letting the local agent drive
 // any lease it created while a satellite that only holds a contract token can
 // still read/release its own. When the configured app token is empty the app
@@ -339,7 +339,7 @@ type resourcesRequest struct {
 
 // createRequest is the POST /contracts body (see docs/DESIGN.md §4, §7). The
 // client picks an allowed image and shapes the network / resources; userdata
-// owns the container's contents. There is no preset — wisp is domain-blind.
+// owns the container's contents. There is no preset - wisp is domain-blind.
 type createRequest struct {
 	TTLSeconds int              `json:"ttl_seconds"`
 	Image      string           `json:"image"`
@@ -398,7 +398,7 @@ type statusResponse struct {
 	TTLSecondsRemaining int    `json:"ttl_seconds_remaining"`
 
 	// Gpus is the whole GPU devices this contract was exclusively assigned, by
-	// their stable device IDs — the wire field name the dashboard reads. Omitted
+	// their stable device IDs - the wire field name the dashboard reads. Omitted
 	// when the lease holds no GPUs (a GPU-less lease carries no "gpus" key).
 	Gpus []string `json:"gpus,omitempty"`
 
@@ -456,7 +456,7 @@ type contractInfo struct {
 	Gpus []string `json:"gpus"`
 }
 
-// contractsListResponse is the GET /contracts response body — a single
+// contractsListResponse is the GET /contracts response body - a single
 // "contracts" array of contractInfo entries. The array is always present
 // (empty when no non-terminal contracts exist) so a consumer can decode
 // unconditionally.
@@ -540,9 +540,9 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve the isolation level: an omitted level selects the effective default;
 	// any other level must parse, be a level Wisp supports today (confidential is
-	// known but rejected), and be in the host's EFFECTIVE allowed set — the
+	// known but rejected), and be in the host's EFFECTIVE allowed set - the
 	// operator allow-list intersected with the levels this daemon can actually run
-	// (see detectIsolation) — else a client error (400), mirroring the
+	// (see detectIsolation) - else a client error (400), mirroring the
 	// image/network validation shape. The host never accepts a level it cannot
 	// launch, even if the operator allow-listed it. The empty-set (host-degraded)
 	// case is already rejected above with a 409 before we reach this point.
@@ -574,7 +574,7 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cap the opaque external_id so a caller cannot smuggle an unbounded
-	// identifier into a container label. Empty is fine — the caller may omit it.
+	// identifier into a container label. Empty is fine - the caller may omit it.
 	if len(req.ExternalID) > maxExternalIDLen {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("external_id too long (max %d bytes)", maxExternalIDLen))
 		return
@@ -596,20 +596,20 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Reserve host capacity against the aggregate budgets FIRST, then GPU devices.
-	// The reserved amounts are exactly spec.cpus / spec.memoryMB — the post-clamp
+	// The reserved amounts are exactly spec.cpus / spec.memoryMB - the post-clamp
 	// values applied to the container: a request that omits a dimension has already
 	// inherited the per-lease max when one is configured (ClampCPUs / ClampMemoryMB),
 	// or reserves 0 when that dimension has no per-lease cap, so an unbounded
 	// container on an unbudgeted dimension stays uncounted (it still takes one
-	// contract slot). An exhausted budget is a 409 — the ask was within the per-lease
-	// caps, the HOST is full — distinct from the 400 over-asks above.
+	// contract slot). An exhausted budget is a 409 - the ask was within the per-lease
+	// caps, the HOST is full - distinct from the 400 over-asks above.
 	if !b.cap.TryReserve(spec.cpus, spec.memoryMB) {
 		writeError(w, http.StatusConflict, errAtCapacity)
 		return
 	}
 
 	// Resolve GPUs: resources.gpus is a count of whole, exclusively-assigned GPUs.
-	// Unlike cpus/memory/pids it is REJECTED, never clamped — gpus is
+	// Unlike cpus/memory/pids it is REJECTED, never clamped - gpus is
 	// billing-meaningful upstream, so silently reducing the count would misprice a
 	// lease. A positive count is rejected with a 400 when the host supports no GPUs,
 	// when it exceeds the effective per-lease cap, or when GPU attach is not
@@ -690,7 +690,7 @@ func (b *broker) create(w http.ResponseWriter, r *http.Request) {
 // is billing-meaningful upstream, so silently reducing it would misprice a lease.
 // A positive count is a 400 when the host has no GPU support, when it exceeds the
 // effective per-lease cap (min of operator cap and detected devices), or when GPU
-// attach is unavailable at the resolved isolation level — the task-1 policy attach
+// attach is unavailable at the resolved isolation level - the task-1 policy attach
 // map, which advertises only shared in v1, so a GPU request at any stronger level
 // is rejected here rather than reaching the runtime's (unreachable-in-v1) vm attach
 // seam. Only after those checks does it consume capacity; an exhausted allocator
@@ -746,7 +746,7 @@ func (b *broker) images(w http.ResponseWriter, r *http.Request) {
 // capacityBlock renders the host's capacity posture as the /images "capacity"
 // block, field-for-field per the wire contract (see docs/DESIGN.md §7). The
 // budgets (max_contracts / total_cpus / total_memory_mb) come from the operator
-// policy — 0 means unlimited. used_cpus / used_memory_mb are the LIVE aggregates
+// policy - 0 means unlimited. used_cpus / used_memory_mb are the LIVE aggregates
 // the capacity allocator reserves across active leases. active_contracts is the
 // count of non-terminal contracts in the store, the authoritative registry (it
 // also covers leases rediscovered by the startup reconcile, which the capacity
@@ -774,7 +774,7 @@ func (b *broker) capacityBlock() capacityResponse {
 // ALWAYS present: an unsupported host advertises supported=false with an empty
 // devices array and max_gpus=0. devices and isolations are always non-nil so the
 // JSON carries arrays (never null). "isolations" is the levels at which GPU
-// attach is available — at most ["shared"] in v1, computed as data so a future
+// attach is available - at most ["shared"] in v1, computed as data so a future
 // vm/kata backend needs no change here (see policy.gpuAttachByIsolation).
 func gpuBlock(g policy.GPUCapabilities) gpuResponse {
 	devices := g.Devices()
@@ -814,9 +814,9 @@ type imagesResponse struct {
 	Default string         `json:"default"`
 	Limits  limitsResponse `json:"limits"`
 
-	// Isolation advertises the host's EFFECTIVE isolation posture — the levels it
+	// Isolation advertises the host's EFFECTIVE isolation posture - the levels it
 	// will actually accept (operator allow-list intersected with what the daemon
-	// can run) and the default applied when a create omits one — so an agent can
+	// can run) and the default applied when a create omits one - so an agent can
 	// report the host's real capabilities upward rather than the raw policy list.
 	Isolation isolationResponse `json:"isolation"`
 
@@ -826,9 +826,9 @@ type imagesResponse struct {
 	// GPU-less host (supported=false, devices=[], max_gpus=0).
 	GPU gpuResponse `json:"gpu"`
 
-	// Capacity advertises the host's aggregate capacity posture — the operator's
+	// Capacity advertises the host's aggregate capacity posture - the operator's
 	// host budgets (max_contracts / total_cpus / total_memory_mb) and current usage
-	// — so an agent can report and schedule against real host headroom rather than
+	// - so an agent can report and schedule against real host headroom rather than
 	// per-lease caps alone. The block is always present (see capacityResponse).
 	Capacity capacityResponse `json:"capacity"`
 }
@@ -845,16 +845,16 @@ type limitsResponse struct {
 // isolationResponse is the isolation section of the discovery document: the
 // effective set of levels this host accepts and the default level.
 type isolationResponse struct {
-	// Supported is the effective set of isolation levels this host will accept —
+	// Supported is the effective set of isolation levels this host will accept -
 	// the operator allow-list intersected with the levels the daemon can actually
-	// run — in the operator's configured order.
+	// run - in the operator's configured order.
 	Supported []string `json:"supported"`
 
 	// Default is the isolation level applied when a create omits one.
 	Default string `json:"default"`
 }
 
-// gpuResponse is the "gpu" section of the discovery document — the host's
+// gpuResponse is the "gpu" section of the discovery document - the host's
 // effective GPU posture, per the wire contract (authoritative across repos):
 // whether GPUs may be leased, the enumerated devices, the effective per-lease
 // cap (min of operator cap and detected count), and the isolation levels at which
@@ -875,7 +875,7 @@ type gpuResponse struct {
 	Isolations []string `json:"isolations"`
 }
 
-// capacityResponse is the "capacity" section of the discovery document — the
+// capacityResponse is the "capacity" section of the discovery document - the
 // host's aggregate capacity posture, per the wire contract (authoritative across
 // repos: wisp-agent forwards it verbatim, wisper-api consumes it). Field names
 // are snake_case and exact; keep them in lockstep with the other repos, exactly
@@ -1065,8 +1065,8 @@ func (e *userdataError) Error() string {
 // Wisp will not switch modes to run it.
 //
 // The daemon's "no matching manifest ... in the manifest list entries" rejection
-// (see runtime.IsImageOSMismatch) can also stem from an ARCHITECTURE mismatch —
-// e.g. an arm64-only image on an amd64 daemon — not strictly an OS mismatch, and
+// (see runtime.IsImageOSMismatch) can also stem from an ARCHITECTURE mismatch -
+// e.g. an arm64-only image on an amd64 daemon - not strictly an OS mismatch, and
 // Wisp does not parse the OS out of the daemon message. The wording is kept
 // deliberately general ("not compatible") rather than claiming an OS-only cause,
 // so it stays honest for both the OS-mode and the architecture case.
@@ -1082,7 +1082,7 @@ func (e *imageOSMismatchError) Error() string {
 // image for an OS/platform mismatch into a clear imageOSMismatchError naming this
 // host's container mode; any other error (including nil) is returned unchanged.
 // Wisp cannot know an arbitrary image's OS before launch, so this recognizes the
-// daemon's rejection after the fact rather than pre-validating — and never
+// daemon's rejection after the fact rather than pre-validating - and never
 // switches the daemon's mode (see docs/DESIGN.md §7).
 func (b *broker) mapOSMismatch(err error) error {
 	if runtime.IsImageOSMismatch(err) {
@@ -1123,7 +1123,7 @@ func (b *broker) get(w http.ResponseWriter, r *http.Request) {
 // observer catching a contract mid-flight would otherwise see a status outside
 // the documented list enum (provisioning|ready|expiring) that consumers were
 // built against. A requested contract has no container id yet either, so it is
-// useless to a resyncing agent — skipping it costs nothing.
+// useless to a resyncing agent - skipping it costs nothing.
 func (b *broker) list(w http.ResponseWriter, r *http.Request) {
 	all := b.store.List()
 	now := b.now()
@@ -1274,7 +1274,7 @@ func (b *broker) release(w http.ResponseWriter, r *http.Request) {
 	b.alloc.Free(c.GPUDeviceIDs)
 	// Return the lease's reserved host capacity now that the release is
 	// authoritative. The state-machine transition above serializes against a
-	// concurrent reaper expiry — only one side wins — so capacity frees exactly once
+	// concurrent reaper expiry - only one side wins - so capacity frees exactly once
 	// per contract (see internal/capacity.Allocator.Free).
 	b.cap.Free(c.ReservedCPUs, c.ReservedMemoryMB)
 	// contract.released announces the client-initiated teardown (see
@@ -1495,7 +1495,7 @@ func (b *broker) statusOf(c contract.Contract) statusResponse {
 // keepAliveCmd returns the command Wisp runs as a container's main (PID 1)
 // process, chosen for the daemon's container OS. A Wisp container is a
 // persistent sandbox that clients drive via exec/shell for the contract's
-// lifetime — the main process does no work, it just blocks so the container
+// lifetime - the main process does no work, it just blocks so the container
 // stays running. Without it, a bare base image's own default command (e.g.
 // Alpine's /bin/sh) exits immediately and the container stops before any exec
 // can attach, which surfaces as "container is not running". The Linux idle
@@ -1557,8 +1557,8 @@ func envList(m map[string]string) ([]string, error) {
 // carry the POST-CLAMP reserved capacity so the restart's reconcile re-Reserves the
 // same aggregate usage (see reconcile). Every leased container is hardened
 // with no-new-privileges so a process inside it cannot escalate via setuid
-// binaries. It always sets the keep-alive command — chosen for the daemon's
-// container OS — so the container outlives its provisioning step. WorkingDir,
+// binaries. It always sets the keep-alive command - chosen for the daemon's
+// container OS - so the container outlives its provisioning step. WorkingDir,
 // entrypoint, and user are left unset so each OS uses its own container default
 // (Linux the image default, Windows C:\ with the image's user); no POSIX-only
 // default is imposed.
@@ -1578,8 +1578,8 @@ func createOptions(spec launchSpec, c contract.Contract, os runtime.ContainerOS)
 	if v := gpusLabelValue(c.GPUDeviceIDs); v != "" {
 		labels[gpusLabel] = v
 	}
-	// Record the POST-CLAMP reserved cpus / memory — exactly what was reserved in
-	// the capacity allocator — so the startup reconcile can re-Reserve the same
+	// Record the POST-CLAMP reserved cpus / memory - exactly what was reserved in
+	// the capacity allocator - so the startup reconcile can re-Reserve the same
 	// aggregate usage from this container's labels alone and never oversubscribe the
 	// host by under-counting this live lease (see reconcile). Always written (even a
 	// "0" reservation on an unbudgeted dimension) so the round-trip restores exactly

@@ -22,11 +22,11 @@ import (
 // New builds the root http.Handler for the daemon, registering all routes. The
 // contract lifecycle endpoints are wired to store and rt; rt is the container
 // backend (the real Docker runtime in production, the fake in tests). pol is the
-// operator's launch policy — the image allow-list, default image, and limits a
+// operator's launch policy - the image allow-list, default image, and limits a
 // create request is validated and clamped against (see docs/DESIGN.md §7).
 //
 // appToken is the app-level bearer credential gating contract creation (see
-// docs/DESIGN.md §8). An empty appToken disables that gate — the
+// docs/DESIGN.md §8). An empty appToken disables that gate - the
 // localhost-friendly default. Contract-scoped calls (/exec, /shell) are always
 // gated by the per-contract token regardless of appToken.
 //
@@ -42,8 +42,8 @@ func New(logger *slog.Logger, store *contract.Store, rt runtime.Runtime, pol *po
 }
 
 // Daemon bundles the HTTP handler with the stateful pieces the wispd process
-// must share across its background workers — the contract store, the container
-// runtime, and the exclusive GPU device allocator — so the startup reconcile and
+// must share across its background workers - the contract store, the container
+// runtime, and the exclusive GPU device allocator - so the startup reconcile and
 // the TTL reaper operate on the SAME allocator the HTTP create path allocates
 // from. That single shared allocator is what makes the whole-device exclusivity
 // guarantee hold end to end: a device freed by a released or reaped lease is

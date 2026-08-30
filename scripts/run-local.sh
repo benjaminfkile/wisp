@@ -11,7 +11,7 @@
 # Environment overrides:
 #   WISP_ADDR    listen address           (default 127.0.0.1:8090)
 #   WISP_CONFIG  image allow-list + limits (default examples/wisp.config.json)
-#   WISP_APP_TOKEN  app-level bearer token (default unset — open, localhost only)
+#   WISP_APP_TOKEN  app-level bearer token (default unset - open, localhost only)
 #
 # Requires: Docker running, Go toolchain. Once wispd is up:
 #   curl -s "http://$WISP_ADDR/healthz"   # {"status":"ok"}

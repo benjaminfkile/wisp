@@ -45,6 +45,7 @@ Configuration (environment):
 | `WISP_APP_TOKEN`              | (unset)          | App-level bearer token gating contract creation, the contract list, and the event bus. Unset means open (localhost default). |
 | `WISP_REAP_INTERVAL_SECONDS`  | `1`              | How often the TTL reaper sweeps (positive integer). |
 | `WISP_EXPIRING_LEAD_SECONDS`  | `60`             | How long before the TTL a ready contract moves to `expiring` (positive integer). |
+| `WISP_RELEASE_GRACE_SECONDS`  | `30`             | How long the reaper skips a contract sitting in `releasing` before expiring it as a stuck release (positive integer). |
 
 `wispd` needs a reachable Docker daemon (ambient `DOCKER_HOST` etc.) and exits at
 startup if the client cannot be built or the config fails to load or validate.
@@ -321,13 +322,17 @@ or exits to `expired` from any active state. `released` (client `DELETE`) and
 and destroy the container. The `releasing` state is the transient,
 **non-terminal** fence a `DELETE` installs BEFORE killing the container so the
 reaper cannot expire (and then purge) the contract from under the handler: the
-reaper skips `releasing` contracts for a short release grace (30 s), so within
-that window the DELETE handler is the sole owner of the container kill and the
-terminal transition to `released`. Past the grace the release is presumed
-stuck (the handler crashed mid-release, or its `Kill` hung) and the reaper
-expires the contract like any other non-terminal one, killing the container if
-needed and returning its capacity and GPUs to the allocators rather than
-leaking them until restart. The reaper sweeps every
+reaper skips `releasing` contracts for a short release grace
+(`WISP_RELEASE_GRACE_SECONDS`, default 30 s), so within that window the DELETE
+handler is the sole owner of the container kill and the terminal transition
+to `released`. Past the grace the release is presumed stuck (the handler died
+mid-release, or its request was cancelled before it reached the final
+mark-released transition) and the reaper expires the contract like any other
+non-terminal one, killing the container if needed and returning its capacity
+and GPUs to the allocators rather than leaking them until restart. A hung
+Docker daemon on the reaper's own `Kill` is bounded separately: each reaper
+`Kill` runs under a 30 s timeout, so one wedged container cannot stall the
+sweep, and a timed-out contract is left in place for the next tick to retry. The reaper sweeps every
 `WISP_REAP_INTERVAL_SECONDS`: a `ready` contract inside the
 `WISP_EXPIRING_LEAD_SECONDS` window becomes `expiring`; a contract past its TTL
 is killed and `expired`; and a `ready`/`expiring` contract whose container has

@@ -36,10 +36,18 @@ const (
 	// defaultReleaseGrace is how long a contract may sit in StateReleasing
 	// before the reaper stops skipping it. Inside the window the DELETE handler
 	// owns the tear down (see reap); past it the release is presumed stuck (the
-	// handler crashed mid-release, or its Kill hung) and the reaper expires the
-	// contract so its capacity and GPUs return to the allocators instead of
-	// leaking until restart.
+	// handler died mid-release or its request was cancelled before it reached
+	// the final mark-released transition), and the reaper expires the contract
+	// so its capacity and GPUs return to the allocators instead of leaking
+	// until restart. A hung Docker daemon on the release-handler side is
+	// bounded separately by defaultKillTimeout (see expire), not by this grace.
 	defaultReleaseGrace = 30 * time.Second
+
+	// defaultKillTimeout bounds a single reaper Kill call so a hung Docker
+	// daemon cannot stall the tick: on timeout the contract is left in place
+	// for the next tick and the sweep continues with the remaining contracts,
+	// so one wedged container never freezes reaping for the whole store.
+	defaultKillTimeout = 30 * time.Second
 )
 
 // Reason categorises WHY the reaper drove a contract into a particular state,
@@ -91,10 +99,18 @@ type Options struct {
 
 	// ReleaseGrace bounds how long a contract may sit in StateReleasing before
 	// the reaper stops skipping it. Inside the window the DELETE handler owns
-	// the tear down; past it the release is presumed stuck and the reaper
-	// expires the contract like any other non-terminal one so its capacity and
-	// GPUs return to the allocators. Defaults to defaultReleaseGrace.
+	// the tear down; past it the release is presumed stuck (the handler died
+	// mid-release or its request was cancelled before the final mark-released
+	// transition) and the reaper expires the contract like any other
+	// non-terminal one so its capacity and GPUs return to the allocators.
+	// Defaults to defaultReleaseGrace.
 	ReleaseGrace time.Duration
+
+	// KillTimeout bounds a single reaper Kill call so a hung Docker daemon
+	// cannot stall the tick. On timeout the contract is left in place and the
+	// reaper moves on to the remaining contracts; the next tick tries again.
+	// Defaults to defaultKillTimeout.
+	KillTimeout time.Duration
 
 	// Now is the injectable clock. Defaults to time.Now. Tests set this to make
 	// transitions deterministic without real sleeping.
@@ -133,6 +149,7 @@ type Reaper struct {
 	lead         time.Duration
 	interval     time.Duration
 	releaseGrace time.Duration
+	killTimeout  time.Duration
 	now          func() time.Time
 	logger       *slog.Logger
 
@@ -159,6 +176,9 @@ func New(store *contract.Store, rt runtime.Runtime, opts Options) *Reaper {
 	if opts.ReleaseGrace <= 0 {
 		opts.ReleaseGrace = defaultReleaseGrace
 	}
+	if opts.KillTimeout <= 0 {
+		opts.KillTimeout = defaultKillTimeout
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
@@ -171,6 +191,7 @@ func New(store *contract.Store, rt runtime.Runtime, opts Options) *Reaper {
 		lead:            opts.Lead,
 		interval:        opts.Interval,
 		releaseGrace:    opts.ReleaseGrace,
+		killTimeout:     opts.KillTimeout,
 		now:             opts.Now,
 		logger:          opts.Logger,
 		notify:          opts.Notify,
@@ -248,10 +269,12 @@ func (r *Reaper) Tick(ctx context.Context) {
 // container, so touching it here would double-kill the container ("removal
 // already in progress"), expire-and-purge it from under the handler, and turn
 // the DELETE into a 500 (the 2026-08-29 wisp-log failure the fence was added
-// for). Past the grace the release is presumed stuck (the handler crashed
-// mid-release, or its Kill hung), and the reaper expires the contract like any
+// for). Past the grace the release is presumed stuck (the handler died
+// mid-release or its request was cancelled before it reached the final
+// mark-released transition), and the reaper expires the contract like any
 // other non-terminal one so its capacity and GPUs return to the allocators
-// rather than leaking until restart.
+// rather than leaking until restart. A hung Docker daemon on the reaper's own
+// Kill is bounded by killTimeout in expire, not by this grace.
 func (r *Reaper) reap(ctx context.Context, c contract.Contract) {
 	if c.State.Terminal() {
 		return
@@ -312,10 +335,34 @@ func (r *Reaper) containerDied(ctx context.Context, c contract.Contract) bool {
 // already gone. reason categorises WHY the reaper is expiring the contract (TTL
 // vs container death) and rides through to the fired Event so the bus can
 // republish it on contract.expired.
+//
+// The Kill is bounded by killTimeout so a hung Docker daemon (a wedged
+// ContainerRemove) cannot stall the tick. On timeout the contract is left in
+// its current state for the next tick to retry, and the sweep proceeds with the
+// remaining contracts; without the bound the whole reaper loop would block on
+// the wedged container and no other contract would be reaped, no capacity or
+// GPUs freed, until the daemon eventually responded. Kill's own return-value
+// error (a real not-found or any other daemon reply) is a normal observation
+// and does not stop the expire: not-found is treated as already-gone, and
+// anything else is logged and the transition still runs so capacity is freed.
 func (r *Reaper) expire(ctx context.Context, c contract.Contract, now time.Time, reason string) {
 	if c.ContainerID != "" {
-		if err := r.rt.Kill(ctx, c.ContainerID); err != nil && !errors.Is(err, runtime.ErrNotFound) {
-			r.logger.Error("reaper: kill container", "contract_id", c.ID, "error", err)
+		killCtx, cancel := context.WithTimeout(ctx, r.killTimeout)
+		err := r.rt.Kill(killCtx, c.ContainerID)
+		cancel()
+		if err != nil {
+			// A killCtx deadline that fired means the daemon has not answered
+			// within killTimeout. Leave the contract in place so the next tick
+			// retries the kill, and move on to the remaining contracts so one
+			// wedged container never freezes the whole sweep.
+			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				r.logger.Error("reaper: kill container timed out; leaving for next tick",
+					"contract_id", c.ID, "container_id", c.ContainerID, "timeout", r.killTimeout)
+				return
+			}
+			if !errors.Is(err, runtime.ErrNotFound) {
+				r.logger.Error("reaper: kill container", "contract_id", c.ID, "error", err)
+			}
 		}
 	}
 	// Reclaim any whole GPU devices the lease held so an expired lease's devices

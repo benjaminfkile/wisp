@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -178,7 +179,7 @@ func TestReaperExpiryFreesCapacity(t *testing.T) {
 		ReleaseGPUs:     b.alloc.Free,
 		ReleaseCapacity: func(c contract.Contract) { b.cap.Free(c.ReservedCPUs, c.ReservedMemoryMB) },
 	})
-	rp.Tick(nil)
+	rp.Tick(context.Background())
 
 	if got, _ := store.Get(created.ContractID); got.State != contract.StateExpired {
 		t.Fatalf("state after reaper = %q, want expired", got.State)
@@ -226,9 +227,9 @@ func TestReaperReapsDeadContainerFreesCapacityAndImagesReflects(t *testing.T) {
 	// state-machine gate on the winning expired transition must keep ReleaseCapacity
 	// firing EXACTLY ONCE across all three, so used cpus/memory land at zero — not
 	// underflow — and stay there.
-	rp.Tick(nil)
-	rp.Tick(nil)
-	rp.Tick(nil)
+	rp.Tick(context.Background())
+	rp.Tick(context.Background())
+	rp.Tick(context.Background())
 
 	// After three ticks the contract has been expired (first tick) and then
 	// cleaned up (a terminal-at-start tick removes it), so a subsequent Get

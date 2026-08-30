@@ -96,6 +96,7 @@ func TestLoadInvalidPort(t *testing.T) {
 func TestLoadReaperDefaults(t *testing.T) {
 	t.Setenv("WISP_REAP_INTERVAL_SECONDS", "")
 	t.Setenv("WISP_EXPIRING_LEAD_SECONDS", "")
+	t.Setenv("WISP_RELEASE_GRACE_SECONDS", "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -107,11 +108,15 @@ func TestLoadReaperDefaults(t *testing.T) {
 	if cfg.ExpiringLead != defaultExpiringLead {
 		t.Errorf("ExpiringLead = %v, want %v", cfg.ExpiringLead, defaultExpiringLead)
 	}
+	if cfg.ReleaseGrace != defaultReleaseGrace {
+		t.Errorf("ReleaseGrace = %v, want %v", cfg.ReleaseGrace, defaultReleaseGrace)
+	}
 }
 
 func TestLoadReaperOverride(t *testing.T) {
 	t.Setenv("WISP_REAP_INTERVAL_SECONDS", "5")
 	t.Setenv("WISP_EXPIRING_LEAD_SECONDS", "120")
+	t.Setenv("WISP_RELEASE_GRACE_SECONDS", "45")
 
 	cfg, err := Load()
 	if err != nil {
@@ -123,14 +128,18 @@ func TestLoadReaperOverride(t *testing.T) {
 	if cfg.ExpiringLead != 120*time.Second {
 		t.Errorf("ExpiringLead = %v, want 120s", cfg.ExpiringLead)
 	}
+	if cfg.ReleaseGrace != 45*time.Second {
+		t.Errorf("ReleaseGrace = %v, want 45s", cfg.ReleaseGrace)
+	}
 }
 
 func TestLoadInvalidReaperEnv(t *testing.T) {
-	for _, name := range []string{"WISP_REAP_INTERVAL_SECONDS", "WISP_EXPIRING_LEAD_SECONDS"} {
+	for _, name := range []string{"WISP_REAP_INTERVAL_SECONDS", "WISP_EXPIRING_LEAD_SECONDS", "WISP_RELEASE_GRACE_SECONDS"} {
 		for _, val := range []string{"notanint", "0", "-3"} {
 			t.Run(name+"="+val, func(t *testing.T) {
 				t.Setenv("WISP_REAP_INTERVAL_SECONDS", "")
 				t.Setenv("WISP_EXPIRING_LEAD_SECONDS", "")
+				t.Setenv("WISP_RELEASE_GRACE_SECONDS", "")
 				t.Setenv(name, val)
 				if _, err := Load(); err == nil {
 					t.Fatalf("Load() error = nil, want error for %s=%q", name, val)
